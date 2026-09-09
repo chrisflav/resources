@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lean:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: leanprover/lean-action@v1
+        with:
+          test: true
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: leanprover/lean-action@v1
+        with:
+          test: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install web dependencies
+        run: npm ci --prefix web || npm install --prefix web
+      # The generated types must match what the Lean encoders produce; a stale
+      # checked-in copy fails the type check rather than surfacing at runtime.
+      - name: Regenerate API types
+        run: .lake/build/bin/resources gen-types --out web/src/types.ts
+      - name: Fail if the generated types are out of date
+        run: git diff --exit-code web/src/types.ts
+      - name: Build the web client
+        run: npm run build --prefix web

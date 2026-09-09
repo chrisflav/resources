@@ -1,0 +1,1340 @@
+import Cli
+import Resources.Cli.Client
+import Resources.Api.Server
+import Resources.Api.TsGen
+
+/-!
+# Command line
+
+Every command is a thin shell over `Backend.call`, so `resources tx list` does
+exactly what `GET /api/v1/transactions` does, whether it is talking to the local
+database or to a server over HTTP.
+-/
+
+open Lean Cli
+
+namespace Resources
+namespace Cli
+
+/-! ## Output helpers -/
+
+/-- A flag's string value, if it was given. -/
+def flagStr? (p : Parsed) (name : String) : Option String :=
+  (p.flag? name).map (fun f => f.as! String)
+
+/-- A flag's string value, or a default. -/
+def flagStr (p : Parsed) (name : String) (dflt : String) : String :=
+  (flagStr? p name).getD dflt
+
+/-- A repeated flag's values. -/
+def flagList (p : Parsed) (name : String) : List String :=
+  match p.flag? name with
+  | some f => (f.as! (Array String)).toList
+  | none => []
+
+/-- A required positional argument. -/
+def argStr (p : Parsed) (name : String) : String :=
+  p.positionalArg! name |>.as! String
+
+/-- A field of a JSON object rendered as text; numbers and booleans included. -/
+def jstr (j : Json) (key : String) : String :=
+  match j.getObjVal? key with
+  | .ok (.str s) => s
+  | .ok (.num n) => toString n
+  | .ok (.bool b) => toString b
+  | _ => ""
+
+/-- A nested field. -/
+def jobj (j : Json) (key : String) : Json :=
+  (j.getObjVal? key).toOption.getD Json.null
+
+/-- A JSON array as a list. -/
+def jarr (j : Json) : Array Json :=
+  match j with
+  | .arr a => a
+  | _ => #[]
+
+/-- Prints a table with aligned columns. -/
+def printTable (headers : Array String) (rows : Array (Array String))
+    (rightAlign : Array Nat := #[]) : IO Unit := do
+  if rows.isEmpty then
+    IO.println "(nothing)"
+    return
+  let n := headers.size
+  let mut widths := headers.map (·.length)
+  for row in rows do
+    for i in [0:n] do
+      let w := (row[i]?.getD "").length
+      if w > widths[i]! then widths := widths.set! i w
+  let pad (i : Nat) (s : String) : String :=
+    if rightAlign.contains i then Str.padLeft s widths[i]! else Str.padRight s widths[i]!
+  let line (cells : Array String) : String :=
+    String.intercalate "  " ((List.range n).map (fun i => pad i (cells[i]?.getD "")))
+  IO.println (line headers)
+  IO.println (String.ofList (List.replicate
+    ((widths.foldl (· + ·) 0) + 2 * (n - 1)) '-'))
+  for row in rows do
+    IO.println (line row)
+
+/-- Opens the configured backend and runs an action, reporting errors on stderr. -/
+def withBackend (f : Backend → IO Unit) : IO UInt32 := do
+  try
+    let cfg ← ClientConfig.load
+    let b ← Backend.open? cfg
+    f b
+    return 0
+  catch e =>
+    IO.eprintln s!"error: {e}"
+    return 1
+
+/-- Opens the local store directly; used by commands that cannot go over HTTP. -/
+def withLocal (f : Ctx → IO Unit) : IO UInt32 := do
+  try
+    let cfg ← ClientConfig.load
+    let storeCfg ←
+      match cfg.dataDir with
+      | some d => pure (Config.atDir (System.FilePath.mk d))
+      | none => Config.default
+    f (← Ctx.open storeCfg)
+    return 0
+  catch e =>
+    IO.eprintln s!"error: {e}"
+    return 1
+
+/--
+The figure a person recognises. The server nets the postings per account, so a
+purchase merged with its fee shows one combined amount rather than either leg.
+-/
+private def headlineAmount (t : Json) : String :=
+  let amt := jobj (jobj t "headline") "amount"
+  let text := jstr amt "text"
+  if text.isEmpty then "" else text ++ " " ++ jstr amt "commodity"
+
+private def accountsOf (t : Json) : String :=
+  String.intercalate " / " ((jarr (jobj t "postings")).toList.map (fun p => jstr p "account"))
+
+/-! ## Transactions -/
+
+/-- Handler for `tx list`. -/
+def runTxList (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["transactions"]
+    [("filter", flagStr p "filter" ""), ("sort", flagStr p "sort" "-date"),
+     ("limit", flagStr p "limit" "50"), ("offset", flagStr p "offset" "0")])
+  if p.hasFlag "json" then
+    IO.println j.pretty
+    return
+  let items := jarr (jobj j "items")
+  printTable #["date", "payee", "narration", "amount", "accounts", "id"]
+    (items.map fun t => #[
+      jstr t "date", Str.clamp (jstr t "payee") 24, Str.clamp (jstr t "narration") 34,
+      headlineAmount t, Str.clamp (accountsOf t) 46, jstr t "id"])
+    (rightAlign := #[3])
+  let total := ((j.getObjValAs? Int "total").toOption).getD 0
+  IO.println s!"\n{items.size} of {total} matching {jstr j "filter"}"
+
+/-- Handler for `tx add`. -/
+def runTxAdd (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let amountStr := flagStr p "amount" ""
+  if amountStr.isEmpty then throw <| IO.userError "--amount is required"
+  let amount ← IO.ofExcept (Amount.parse amountStr)
+  let from_ := flagStr p "from" ""
+  if from_.isEmpty then throw <| IO.userError "--from is required"
+  let to_ := flagStr? p "to"
+  let today ← Date.today
+  let date :=
+    match flagStr? p "date" with
+    | some "today" => today.toIso
+    | some d => d
+    | none => today.toIso
+  let posting (account : String) (a : Amount) : Json :=
+    Json.mkObj [("account", account), ("minor", Json.num (JsonNumber.fromInt a.minor)),
+                ("commodity", a.commodity.code)]
+  let postings :=
+    match to_ with
+    | some t => #[posting from_ (-amount), posting t amount]
+    | none => #[posting from_ (-amount)]
+  let mut body := Json.mkObj [
+    ("date", date), ("payee", flagStr p "payee" ""), ("narration", flagStr p "narration" ""),
+    ("labels", Json.arr ((flagList p "label").map Json.str).toArray),
+    ("postings", Json.arr postings)]
+  if to_.isNone then
+    body := body.setObjVal! "balanceInto" (Json.str (flagStr p "into" "Expenses.Unclassified"))
+  let j ← b.json (Call.post ["transactions"] body)
+  IO.println s!"{jstr j "id"}  {jstr j "date"}  {headlineAmount j}"
+
+/-- Handler for `tx show`. -/
+def runTxShow (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["transactions", argStr p "id"])
+  if p.hasFlag "json" then IO.println j.pretty; return
+  IO.println s!"{jstr j "date"}  {jstr j "payee"}"
+  IO.println s!"  {jstr j "narration"}"
+  IO.println s!"  source: {jstr j "source"}"
+  for post in jarr (jobj j "postings") do
+    let amt := jobj post "amount"
+    let acc := Str.padRight (jstr post "account") 34
+    let text := Str.padLeft (jstr amt "text") 12
+    IO.println s!"  {acc} {text} {jstr amt "commodity"}"
+  let labels := (jarr (jobj j "labels")).map (fun l => l.getStr?.toOption.getD "")
+  if !labels.isEmpty then IO.println s!"  labels: {String.intercalate ", " labels.toList}"
+  let atts := (jarr (jobj j "attachments")).map (fun l => l.getStr?.toOption.getD "")
+  for a in atts do
+    IO.println s!"  receipt: {a}"
+
+/-- Handler for `tx edit`: changes the date, payee or narration in place. -/
+def runTxEdit (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let id := argStr p "id"
+  let fields := [("date", "date"), ("payee", "payee"), ("narration", "narration")].filterMap
+    fun (flag, key) => (flagStr? p flag).map (fun v => (key, Json.str v))
+  if fields.isEmpty then
+    throw <| IO.userError "give at least one of --date, --payee or --narration"
+  let body := Json.mkObj fields
+  let j ← b.json (Call.patch ["transactions", id] body)
+  IO.println s!"{jstr j "date"}  {jstr j "payee"}  {jstr j "narration"}"
+
+/--
+Handler for `tx move`: rebooks a posting from one account to another. This is
+how a transaction gets recategorised — the amounts do not change, only which
+account the leg lands in, so the transaction stays balanced by construction.
+-/
+def runTxMove (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let id := argStr p "id"
+  let target := argStr p "to"
+  let current ← b.json (Call.get ["transactions", id])
+  let postings := jarr (jobj current "postings")
+  let source := flagStr? p "from"
+  -- Without --from, move the leg that is not on a balance-sheet account: the
+  -- category side, which is the one anybody actually wants to change.
+  let onSourceLeg (post : Json) : Bool :=
+    match source with
+    | some acc => jstr post "account" == acc
+    | none => jstr post "kind" != "asset" && jstr post "kind" != "liability"
+  let hits := postings.filter onSourceLeg
+  if hits.isEmpty then
+    throw <| IO.userError <|
+      match source with
+      | some acc => s!"no posting in {acc}; this transaction touches " ++
+          String.intercalate ", " (postings.toList.map (fun x => jstr x "account"))
+      | none => "every posting is on a balance-sheet account; say which with --from"
+  if hits.size > 1 && source.isNone then
+    throw <| IO.userError "more than one posting could move; say which with --from"
+  let rewritten := postings.map fun post =>
+    if onSourceLeg post then
+      Json.mkObj [("account", target),
+                  ("minor", Json.num (JsonNumber.fromInt
+                    (((jobj post "amount").getObjValAs? Int "minor").toOption.getD 0))),
+                  ("commodity", jstr (jobj post "amount") "commodity"),
+                  ("note", Json.str (jstr post "note"))]
+    else
+      Json.mkObj [("account", jstr post "account"),
+                  ("minor", Json.num (JsonNumber.fromInt
+                    (((jobj post "amount").getObjValAs? Int "minor").toOption.getD 0))),
+                  ("commodity", jstr (jobj post "amount") "commodity"),
+                  ("note", Json.str (jstr post "note"))]
+  let j ← b.json (Call.patch ["transactions", id]
+    (Json.mkObj [("postings", Json.arr rewritten)]))
+  for post in jarr (jobj j "postings") do
+    IO.println s!"  {jstr post "account"}  {jstr (jobj post "amount") "text"}"
+
+/-- Handler for `tx label`: adds or removes labels, leaving the rest alone. -/
+def runTxLabel (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let id := argStr p "id"
+  let add := flagList p "add"
+  let remove := flagList p "rm"
+  if add.isEmpty && remove.isEmpty then
+    throw <| IO.userError "give at least one --add or --rm"
+  let current ← b.json (Call.get ["transactions", id])
+  let existing := (jarr (jobj current "labels")).toList.map (fun l => l.getStr?.toOption.getD "")
+  let kept := existing.filter (fun l => !remove.contains l)
+  let final := kept ++ add.filter (fun l => !kept.contains l)
+  let j ← b.json (Call.patch ["transactions", id]
+    (Json.mkObj [("labels", Json.arr (final.map Json.str).toArray)]))
+  let now := (jarr (jobj j "labels")).toList.map (fun l => l.getStr?.toOption.getD "")
+  IO.println (if now.isEmpty then "(no labels)" else String.intercalate ", " now)
+
+/--
+Handler for `tx merge`: combines several transactions into one.
+
+Balance is preserved by construction — the result's postings are the sources'
+postings concatenated — so this can never leave the ledger inconsistent.
+-/
+def runTxMerge (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let ids := p.variableArgsAs! String
+  if ids.size < 2 then throw <| IO.userError "give at least two transaction ids"
+  let mut body := Json.mkObj [("ids", Json.arr (ids.map Json.str))]
+  match flagStr? p "narration" with
+  | some n => body := body.setObjVal! "narration" (Json.str n)
+  | none => pure ()
+  match flagStr? p "payee" with
+  | some n => body := body.setObjVal! "payee" (Json.str n)
+  | none => pure ()
+  let cancel := flagList p "cancel"
+  if !cancel.isEmpty then
+    body := body.setObjVal! "cancelIn" (Json.arr (cancel.map Json.str).toArray)
+  let j ← b.json (Call.post ["transactions", "merge"] body)
+  IO.println s!"{jstr j "id"}  {jstr j "date"}  {headlineAmount j}"
+  for post in jarr (jobj j "postings") do
+    let amount := Str.padLeft (jstr (jobj post "amount") "text") 12
+    IO.println s!"  {Str.padRight (jstr post "account") 34} {amount}"
+
+/-- Handler for `tx unmerge`: splits a merged transaction back into its sources. -/
+def runTxUnmerge (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.post ["transactions", argStr p "id", "unmerge"] (Json.mkObj []))
+  for t in jarr j do
+    IO.println s!"{jstr t "id"}  {jstr t "date"}  {headlineAmount t}"
+
+/--
+Handler for `tx link`: finds fee transactions already in the ledger that belong
+with a purchase, and combines them. Prints what it would do unless `--apply`.
+-/
+def runTxLink (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let proposals ← b.json (Call.get ["transactions", "link-proposals"])
+  let items := jarr proposals
+  if items.isEmpty then
+    IO.println "nothing looks like a split event"
+    return
+  printTable #["confidence", "date", "purchase", "amount", "fee", "why"]
+    (items.map fun x =>
+      let parent := jobj x "parent"
+      let child := jobj x "child"
+      #[jstr x "confidence", jstr parent "date",
+        Str.clamp (jstr parent "payee") 26,
+        jstr (jobj (jobj parent "headline") "amount") "text",
+        jstr (jobj (jobj child "headline") "amount") "text",
+        Str.clamp (jstr x "reason") 46])
+    (rightAlign := #[3, 4])
+  if !p.hasFlag "apply" then
+    IO.println s!"\n{items.size} pair(s) would be combined. Re-run with --apply to do it."
+    return
+  let body := match flagStr? p "confidence" with
+    | some c => Json.mkObj [("confidence", Json.str c)]
+    | none => Json.mkObj []
+  let j ← b.json (Call.post ["transactions", "link"] body)
+  let n := jstr j "merged"
+  IO.println s!"\ncombined {n} pair(s); undo any of them with resources tx unmerge <id>"
+
+/--
+Handler for `claim`: books transactions as somebody else's spending.
+
+The same verb covers both directions. An outlay's expense leg moves into their
+purse, raising what they owe; a reimbursement's income leg moves into the same
+purse, reducing it. When the two balance you are square — and because the purse
+belongs to them, none of it was ever counted as yours.
+-/
+def runClaim (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let who := argStr p "who"
+  let ids := p.variableArgsAs! String
+  let body :=
+    if ids.isEmpty then
+      match flagStr? p "filter" with
+      | some f => Json.mkObj [("who", Json.str who), ("filter", Json.str f)]
+      | none => panic! "unreachable"
+    else Json.mkObj [("who", Json.str who), ("ids", Json.arr (ids.map Json.str))]
+  if ids.isEmpty && (flagStr? p "filter").isNone then
+    throw <| IO.userError "give transaction ids, or a --filter selecting them"
+  let j ← b.json (Call.post ["transactions", "claim"] body)
+  IO.println s!"moved {jstr j "count"} transactions into {jstr j "into"}"
+
+/-- Handler for `invoice mail`: hands a cost overview to whoever owes it. -/
+def runInvoiceMail (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["invoices", argStr p "id", "mailto"])
+  let url := jstr j "mailto"
+  if p.hasFlag "open" then
+    discard <| IO.Process.output { cmd := "xdg-open", args := #[url] }
+    IO.println "opened in your mail client"
+  else
+    IO.println url
+
+/-- Handler for `party import`: reads contacts out of a vCard file. -/
+def runPartyImport (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let bytes ← IO.FS.readBinFile (argStr p "file")
+  let j ← b.json
+    { method := "POST", path := ["parties", "import"], body := bytes
+      headers := [("content-type", "text/vcard")] }
+  IO.println s!"read {jstr j "read"} contact(s): {jstr j "created"} new, {jstr j "updated"} updated"
+
+/--
+Handler for `report people`.
+
+What passes between you and everybody else. Their own accounts carry the figure
+and its sign says which way it runs; what is outstanding is the claims, each of
+which names one specific thing rather than being aged against the oldest outlay.
+-/
+def runReportPeople (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["reports", "people"])
+  let rows := jarr j
+  let rows := if p.hasFlag "open" then rows.filter (fun x => jstr x "net" != "0") else rows
+  if rows.isEmpty then
+    IO.println "nothing passes between you and anybody"
+    return
+  printTable #["person", "net", "outstanding claims"]
+    (rows.map fun x => #[
+      jstr x "name", jstr x "netText",
+      toString (jarr (jobj x "claims")).size])
+    (rightAlign := #[1, 2])
+  IO.println "\na positive net is money they owe you; negative is money you owe them"
+  if p.hasFlag "items" then
+    for x in rows do
+      let claims := jarr (jobj x "claims")
+      if claims.isEmpty then continue
+      IO.println s!"\n{jstr x "name"} — outstanding:"
+      printTable #["due", "from", "to", "amount", "what"]
+        (claims.map fun c => #[
+          jstr c "due", jstr c "from", jstr c "to",
+          jstr (jobj c "amount") "text", Str.clamp (jstr c "narration") 40])
+        (rightAlign := #[3])
+
+/-- Handler for `tag fees`. -/
+def runTagFees (_p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.post ["postings", "tag-fees"] (Json.mkObj []))
+  IO.println s!"tagged {jstr j "tagged"} postings as fees"
+
+/--
+Handler for `split`: shares costs across a group of people.
+
+Takes transaction ids or a filter, so a weekend's worth of receipts is one
+command rather than one per receipt.
+-/
+def runSplit (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let among := flagList p "among"
+  let group := flagStr? p "group"
+  if among.isEmpty && group.isNone then
+    throw <| IO.userError "say who to split with: --among anna,ben or --group hut-crew"
+  let ids := p.variableArgsAs! String
+  let filter := flagStr? p "filter"
+  if ids.isEmpty && filter.isNone then
+    throw <| IO.userError "give transaction ids, or a --filter selecting them"
+  let mut body := Json.mkObj [("keepShare", Json.bool (!p.hasFlag "all-theirs"))]
+  match group with
+  | some g => body := body.setObjVal! "group" (Json.str g)
+  | none => body := body.setObjVal! "among" (Json.arr (among.map Json.str).toArray)
+  if ids.isEmpty then
+    body := body.setObjVal! "filter" (Json.str (filter.getD ""))
+  else
+    body := body.setObjVal! "ids" (Json.arr (ids.map Json.str))
+  let j ← b.json (Call.post ["transactions", "split"] body)
+  let people := (jarr (jobj j "among")).toList.map (fun x => x.getStr?.toOption.getD "")
+  IO.println s!"split {jstr j "count"} transaction(s) with {String.intercalate ", " people}"
+  IO.println ""
+  printTable #["date", "payee", "each share goes to", "amount"]
+    ((jarr (jobj j "items")).flatMap fun t =>
+      ((jarr (jobj t "postings")).filter fun post =>
+        jstr post "mine" != "true").map fun post =>
+          #[jstr t "date", Str.clamp (jstr t "payee") 26,
+            jstr post "owner", jstr (jobj post "amount") "text"])
+    (rightAlign := #[3])
+
+/-- Handler for `move`: gathers selected spending into one account. -/
+def runMove (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let ids := p.variableArgsAs! String
+  let filter := flagStr? p "filter"
+  if ids.isEmpty && filter.isNone then
+    throw <| IO.userError "give transaction ids, or a --filter selecting them"
+  let mut body := Json.mkObj [("into", Json.str (argStr p "into")),
+                              ("funding", Json.bool (p.hasFlag "fund"))]
+  if ids.isEmpty then body := body.setObjVal! "filter" (Json.str (filter.getD ""))
+  else body := body.setObjVal! "ids" (Json.arr (ids.map Json.str))
+  let j ← b.json (Call.post ["transactions", "move"] body)
+  IO.println s!"moved {jstr j "count"} transaction(s) into {jstr j "into"}"
+
+/-- Reads one `name=account` or `name=account*weight` spec. -/
+private def bearerSpec (spec : String) : Json :=
+  let (who, rest) :=
+    match spec.splitOn "=" with
+    | [one] => ("", one)
+    | who :: more => (who, String.intercalate "=" more)
+    | [] => ("", "")
+  let (account, weight) :=
+    match rest.splitOn "*" with
+    | [a, w] => (a, (w.toNat?).getD 1)
+    | _ => (rest, 1)
+  Json.mkObj [("name", Json.str who.trimAscii.toString),
+              ("account", Json.str account.trimAscii.toString),
+              ("weight", Json.num (JsonNumber.fromNat weight))]
+
+/-- Handler for `budget new`. -/
+def runBudgetNew (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let ids := flagList p "txn"
+  let among := (flagList p "among").map bearerSpec
+  let mut body := Json.mkObj [("name", Json.str (argStr p "name"))]
+  if !among.isEmpty then
+    body := body.setObjVal! "among" (Json.arr among.toArray)
+  match flagStr? p "note" with
+  | some n => body := body.setObjVal! "note" (Json.str n)
+  | none => pure ()
+  if !ids.isEmpty then
+    body := body.setObjVal! "transactions" (Json.arr (ids.map Json.str).toArray)
+  let j ← b.json (Call.post ["budgets"] body)
+  IO.println s!"{jstr j "name"} — lent {jstr j "lent"} cost(s)"
+
+/-- Handler for `budget list`. -/
+def runBudgetList (_p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["budgets"])
+  printTable #["budget", "state", "costs", "undivided", "divided", "outstanding"]
+    ((jarr j).map fun g => #[jstr g "shortName",
+      (if jstr g "closed" == "true" then "closed" else "open"), jstr g "costs",
+      jstr (jobj g "outstanding") "text", jstr (jobj g "allocated") "text",
+      toString ((jarr (jobj g "claims")).filter (fun c => jstr c "state" == "pending")).size])
+    (rightAlign := #[2, 3, 4, 5])
+
+/-- Prints where everybody stands and what has been asked of them. -/
+private def printDivision (g : Json) : IO Unit := do
+  let standings := jarr (jobj g "standings")
+  if !standings.isEmpty then
+    -- Positive is what they still have to find; negative is what they fronted
+    -- above their own share, which is what the group owes them.
+    printTable #["person", "borne less put in", "position"]
+      (standings.map fun st => #[
+        jstr st "name", jstr (jobj st "amount") "text",
+        if jstr (jobj st "amount") "minor" == "0" then "square"
+        else if jstr st "owes" == "true" then "owes the others"
+        else "is owed"])
+      (rightAlign := #[1])
+  let claims := (jarr (jobj g "claims")).filter fun c => jstr c "state" == "pending"
+  if claims.isEmpty then
+    IO.println "\nnothing outstanding"
+  else
+    IO.println ""
+    printTable #["due", "from", "to", "amount", "claim"]
+      (claims.map fun c => #[
+        jstr c "due", jstr c "from", jstr c "to", jstr (jobj c "amount") "text", jstr c "id"])
+      (rightAlign := #[3])
+
+/-- Handler for `budget show`. -/
+def runBudgetShow (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["budgets", argStr p "name"])
+  let g := jobj j "budget"
+  IO.println s!"{jstr g "name"}  ({if jstr g "closed" == "true" then "closed" else "open"})"
+  IO.println s!"  undivided  {jstr (jobj g "outstanding") "text"}"
+  IO.println s!"  divided    {jstr (jobj g "allocated") "text"}"
+  IO.println ""
+  printTable #["date", "what", "paid from", "amount"]
+    ((jarr (jobj j "items")).map fun t => #[
+      jstr t "date", Str.clamp (if (jstr t "payee").isEmpty then jstr t "narration"
+                                else jstr t "payee") 34,
+      jstr (jobj t "headline") "account", jstr (jobj (jobj t "headline") "amount") "text"])
+    (rightAlign := #[3])
+  IO.println ""
+  printDivision g
+
+/--
+Handler for `budget among`: records once who a budget is divided among.
+
+Nothing is divided here. Dividing is what closing does, and closing is
+deliberate — until then costs simply accumulate in the account, which is the
+whole reason the account exists.
+-/
+def runBudgetAmong (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let among := (p.variableArgsAs! String).toList.map bearerSpec
+  if among.isEmpty then
+    throw <| IO.userError "say who shares it, as name=account"
+  let j ← b.json (Call.post ["budgets", argStr p "name", "among"]
+    (Json.mkObj [("among", Json.arr among.toArray)]))
+  let who := (jarr (jobj j "among")).toList.map fun x =>
+    (if jstr x "mine" == "true" then "me" else jstr x "name") ++
+      (if jstr x "weight" == "1" then "" else "×" ++ jstr x "weight")
+  IO.println s!"{jstr j "budget"} is shared between {String.intercalate ", " who}"
+  let waiting := jstr (jobj j "undivided") "text"
+  IO.println s!"{waiting} is waiting; `budget close {argStr p "name"}` divides it"
+
+/--
+Handler for `budget close`: divides everything waiting and asks for the rest.
+
+Closing again after reopening writes a new division covering only what came in
+since; the earlier ones stand, because somebody was told what they owed on the
+strength of them.
+-/
+def runBudgetClose (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let among := (p.variableArgsAs! String).toList.map bearerSpec
+  let mut body := Json.mkObj [("commodity", Json.str (flagStr p "commodity" "EUR"))]
+  if !among.isEmpty then body := body.setObjVal! "among" (Json.arr among.toArray)
+  match flagStr? p "through" with
+  | some h => body := body.setObjVal! "through" (Json.str h)
+  | none => pure ()
+  let j ← b.json (Call.post ["budgets", argStr p "name", "close"] body)
+  if (jstr j "division").isEmpty then
+    IO.println s!"{jstr j "budget"} closed; there was nothing left to divide"
+  else
+    IO.println s!"{jstr j "budget"} closed and divided"
+  IO.println ""
+  printDivision (jobj (← b.json (Call.get ["budgets", argStr p "name"])) "budget")
+
+/-- Handler for `budget reopen`. -/
+def runBudgetReopen (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.post ["budgets", argStr p "name", "reopen"] (Json.mkObj []))
+  IO.println s!"{jstr j "budget"} is open again; every division already made still stands"
+
+/-- Handler for `budget lend`. -/
+def runBudgetLend (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let mut body := Json.mkObj []
+  let ids := flagList p "txn"
+  if !ids.isEmpty then
+    body := body.setObjVal! "transactions" (Json.arr (ids.map Json.str).toArray)
+  match flagStr? p "filter" with
+  | some f => body := body.setObjVal! "filter" (Json.str f)
+  | none => pure ()
+  let j ← b.json (Call.post ["budgets", argStr p "name", "lend"] body)
+  IO.println s!"lent {jstr j "lent"} cost(s) into {jstr j "budget"}"
+
+/--
+Handler for `budget contribute`: records a cost somebody else paid for.
+
+Their money account is credited and the budget is debited, exactly as `lend`
+does for one of yours. Nothing of yours moves, and nothing of theirs is counted
+as yours: the account belongs to them.
+-/
+def runBudgetContribute (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let mut body := Json.mkObj [
+    ("who", Json.str (flagStr p "who" "")),
+    ("amount", Json.str (flagStr p "amount" "")),
+    ("narration", Json.str (flagStr p "for" ""))]
+  for (k, v) in [("account", flagStr? p "account"), ("date", flagStr? p "date"),
+                 ("commodity", flagStr? p "commodity"), ("payee", flagStr? p "payee")] do
+    match v with
+    | some x => body := body.setObjVal! k (Json.str x)
+    | none => pure ()
+  discard <| b.json (Call.post ["budgets", argStr p "name", "contribute"] body)
+  IO.println s!"recorded {flagStr p "amount" ""} paid by {flagStr p "who" ""}"
+
+/--
+Handler for `budget allocate`.
+
+A participant is written `name=account`, or `name=account*weight` when the
+shares are not equal. A bare `=account` is your own share, and the account you
+give is where money you actually consumed goes — which is the whole reason your
+share is a posting rather than an implicit subtraction. Everybody else's share
+lands in an account of their own, their purse unless you name another.
+-/
+def runBudgetAllocate (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let among := (p.variableArgsAs! String).toList.map bearerSpec
+  let mut body := Json.mkObj [("among", Json.arr among.toArray),
+                              ("commodity", Json.str (flagStr p "commodity" "EUR"))]
+  match flagStr? p "through" with
+  | some h => body := body.setObjVal! "through" (Json.str h)
+  | none => pure ()
+  let j ← b.json (Call.post ["budgets", argStr p "name", "allocate"] body)
+  IO.println s!"divided up; {(jarr (jobj j "claims")).size} payment(s) raised"
+  IO.println ""
+  printDivision (jobj (← b.json (Call.get ["budgets", argStr p "name"])) "budget")
+
+/-- Handler for `budget settle`: raises the claims that would square a budget. -/
+def runBudgetSettle (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let mut body := Json.mkObj [("commodity", Json.str (flagStr p "commodity" "EUR"))]
+  match flagStr? p "through" with
+  | some h => body := body.setObjVal! "through" (Json.str h)
+  | none => pure ()
+  let j ← b.json (Call.post ["budgets", argStr p "name", "settle"] body)
+  let raised := (jarr (jobj j "claims")).size
+  IO.println (if raised == 0 then "nothing more to ask for" else s!"{raised} payment(s) raised")
+  IO.println ""
+  printDivision (jobj (← b.json (Call.get ["budgets", argStr p "name"])) "budget")
+
+/-! ## Claims -/
+
+/-- Handler for `claims list`. -/
+def runClaimList (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let query :=
+    (match flagStr? p "filter" with | some f => [("filter", f)] | none => [])
+      ++ (if p.hasFlag "all" then [("all", "1")] else [])
+  let j ← b.json (Call.get ["claims"] query)
+  let rows := jarr j
+  if rows.isEmpty then
+    IO.println "nothing outstanding"
+    return
+  printTable #["due", "from", "to", "amount", "state", "what", "id"]
+    (rows.map fun c => #[
+      jstr c "due", jstr c "from", jstr c "to", jstr (jobj c "amount") "text",
+      jstr c "state", Str.clamp (jstr c "narration") 34, jstr c "id"])
+    (rightAlign := #[3])
+
+/-- Handler for `claims candidates`: what in the ledger could have met a claim. -/
+def runClaimCandidates (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["claims", argStr p "id", "candidates"])
+  let rows := jarr j
+  if rows.isEmpty then
+    IO.println "nothing in the ledger looks like it met this claim"
+    return
+  printTable #["date", "payee", "amount", "id"]
+    (rows.map fun t => #[
+      jstr t "date", Str.clamp (jstr t "payee") 34,
+      jstr (jobj (jobj t "headline") "amount") "text", jstr t "id"])
+    (rightAlign := #[2])
+
+/--
+Handler for `claims resolve`: meets a claim against the entry that performed it.
+
+The claim does not become that entry. The bank line already exists, with the
+fingerprint that reconciles it against the statement; what the claim adds is the
+counterparty, which the importer could only guess at.
+-/
+def runClaimResolve (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.post ["claims", argStr p "id", "resolve"]
+    (Json.mkObj [("transaction", Json.str (argStr p "transaction"))]))
+  if jstr j "state" == "settled" then
+    IO.println s!"settled — {jstr j "from"} → {jstr j "to"}"
+  else
+    IO.println s!"part paid; {jstr (jobj j "amount") "text"} still outstanding"
+
+/-- Handler for `claims void`: retires a claim that will never be performed. -/
+def runClaimVoid (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let mut body := Json.mkObj []
+  match flagStr? p "write-off" with
+  | some a => body := body.setObjVal! "writeOffTo" (Json.str a)
+  | none => pure ()
+  let j ← b.json (Call.post ["claims", argStr p "id", "void"] body)
+  IO.println s!"voided {jstr (jobj j "amount") "text"} from {jstr j "from"}"
+  match flagStr? p "write-off" with
+  | some a => IO.println s!"and booked the loss to {a}"
+  | none => IO.println "their account still says they owe it; --write-off records the loss"
+
+/-- Handler for `group new`. -/
+def runGroupNew (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.post ["groups"] (Json.mkObj [
+    ("name", Json.str (argStr p "name")),
+    ("members", Json.arr ((flagList p "members").map Json.str).toArray)]))
+  let members := (jarr (jobj j "members")).toList.map (fun x => x.getStr?.toOption.getD "")
+  IO.println s!"{jstr j "name"}: {String.intercalate ", " members}"
+
+/-- Handler for `group list`. -/
+def runGroupList (_p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["groups"])
+  printTable #["group", "members"]
+    ((jarr j).map fun g => #[jstr g "name",
+      String.intercalate ", " ((jarr (jobj g "members")).toList.map
+        (fun x => x.getStr?.toOption.getD ""))])
+
+/-- Handler for `group rm`. -/
+def runGroupRm (p : Parsed) : IO UInt32 := withBackend fun b => do
+  discard <| b.json (Call.delete ["groups", argStr p "name"])
+  IO.println "deleted"
+
+/-- Handler for `trip new`. -/
+def runTripNew (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.post ["trips"] (Json.mkObj [
+    ("name", argStr p "name"), ("starts", flagStr p "from" ""),
+    ("ends", flagStr p "to" ""), ("payer", flagStr p "payer" "")]))
+  IO.println s!"{jstr j "name"}  labelled {jstr j "label"}  spent from {jstr j "purse"}"
+
+/-- Handler for `trip list`. -/
+def runTripList (_p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["trips"])
+  printTable #["trip", "from", "to", "payer", "items", "cost so far"]
+    ((jarr j).map fun t => #[jstr t "name", jstr t "starts", jstr t "ends", jstr t "payer",
+                            jstr t "members", jstr (jobj t "total") "text"])
+    (rightAlign := #[4, 5])
+
+/-- Handler for `trip suggest`: what else in the window looks like part of it. -/
+def runTripSuggest (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let name := argStr p "name"
+  let j ← b.json (Call.get ["trips", name, "suggest"])
+  let items := jarr j
+  if items.isEmpty then
+    IO.println "nothing else in that window looks like part of this trip"
+    return
+  printTable #["date", "payee", "amount", "account", "id"]
+    (items.map fun t => #[
+      jstr t "date", Str.clamp (jstr t "payee") 30,
+      jstr (jobj (jobj t "headline") "amount") "text",
+      Str.clamp (String.intercalate "/" ((jarr (jobj t "postings")).toList.map
+        (fun x => jstr x "account"))) 40,
+      jstr t "id"])
+    (rightAlign := #[2])
+  if p.hasFlag "all" then
+    let ids := items.map (fun t => Json.str (jstr t "id"))
+    let r ← b.json (Call.post ["trips", name, "add"] (Json.mkObj [("ids", Json.arr ids)]))
+    IO.println s!"\nadded {jstr r "added"} to {name}"
+  else
+    IO.println s!"\nadd the ones that belong: resources trip add {name} <ids>   (or --all)"
+
+/-- Handler for `trip add`. -/
+def runTripAdd (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let ids := (p.variableArgsAs! String).map Json.str
+  let j ← b.json (Call.post ["trips", argStr p "name", "add"]
+    (Json.mkObj [("ids", Json.arr ids)]))
+  IO.println s!"added {jstr j "added"} transactions"
+
+/-- Handler for `trip drop`. -/
+def runTripDrop (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let ids := (p.variableArgsAs! String).map Json.str
+  let j ← b.json (Call.post ["trips", argStr p "name", "drop"]
+    (Json.mkObj [("ids", Json.arr ids)]))
+  IO.println s!"dropped {jstr j "dropped"} transactions"
+
+/-- Handler for `receipt scan`: reads a stored receipt. -/
+def runReceiptScan (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let explicit := p.variableArgsAs! String
+  let shas ←
+    if explicit.isEmpty then do
+      let inbox ← b.json (Call.get ["receipts"])
+      pure ((jarr inbox).map (fun s => jstr s "sha256"))
+    else pure explicit
+  if shas.isEmpty then
+    IO.println "no unattached receipts to read"
+    return
+  for sha in shas do
+    try
+      let j ← b.json (Call.post ["receipts", sha, "extract"] (Json.mkObj []))
+      let total := Str.padLeft (jstr (jobj j "total") "text") 10
+      let who := Str.clamp (jstr j "merchant") 34
+      IO.println s!"  {Str.clamp sha 12}  {jstr j "date"}  {total}  {who}  [{jstr j "extractor"}]"
+    catch e =>
+      IO.eprintln s!"  {Str.clamp sha 12}  {e}"
+
+/-- Handler for `receipt inbox`: receipts not attached to anything. -/
+def runReceiptInbox (_p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["receipts"])
+  printTable #["sha256", "date", "total", "merchant", "file"]
+    ((jarr j).map fun s => #[
+      Str.clamp (jstr s "sha256") 12, jstr s "date",
+      jstr (jobj s "total") "text", Str.clamp (jstr s "merchant") 30, jstr s "origName"])
+    (rightAlign := #[2])
+
+/-- Handler for `receipt match`: which transaction each scanned receipt belongs to. -/
+def runReceiptMatch (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["receipts", "proposals"])
+  let items := jarr j
+  if items.isEmpty then
+    IO.println "no receipt matches a transaction yet; try 'resources receipt scan' first"
+    return
+  printTable #["confidence", "receipt", "goes with", "amount", "why"]
+    (items.map fun m => #[
+      jstr m "confidence", Str.clamp (jstr m "sha256") 12,
+      Str.clamp (jstr (jobj m "txn") "payee") 26,
+      jstr (jobj (jobj (jobj m "txn") "headline") "amount") "text",
+      Str.clamp (jstr m "reason") 44])
+    (rightAlign := #[3])
+  if !p.hasFlag "apply" then
+    IO.println s!"\n{items.size} proposal(s). Re-run with --apply to attach them."
+    return
+  for m in items do
+    discard <| b.json (Call.post ["transactions", jstr (jobj m "txn") "id", "attachments"]
+      (Json.mkObj [("sha256", Json.str (jstr m "sha256"))]))
+  IO.println s!"\nattached {items.size} receipt(s)"
+
+/-- Handler for `receipt cash`: turns a receipt into the cash transaction it stands for. -/
+def runReceiptCash (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.post ["receipts", argStr p "sha", "cash"] (Json.mkObj [
+    ("from", Json.str (flagStr p "from" "Assets.Cash")),
+    ("into", Json.str (flagStr p "into" "Expenses.Unclassified"))]))
+  let amount := jstr (jobj (jobj j "headline") "amount") "text"
+  IO.println s!"{jstr j "id"}  {jstr j "date"}  {amount}  {jstr j "payee"}"
+
+/-- Handler for `contacts books`: what the desktop contact store holds. -/
+def runContactBooks (_p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["contacts", "books"])
+  if (jarr j).isEmpty then
+    IO.println "no desktop address books found"
+    return
+  printTable #["address book", "contacts"]
+    ((jarr j).map fun x => #[jstr x "name", jstr x "contacts"]) (rightAlign := #[1])
+
+/-- Handler for `contacts use`: chooses where contacts come from. -/
+def runContactsUse (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let kind := argStr p "kind"
+  let rest := p.variableArgsAs! String
+  let mut body := Json.mkObj [("kind", Json.str kind)]
+  match kind with
+  | "eds" => pure ()
+  | "files" =>
+    let some path := rest[0]? | throw <| IO.userError "give the directory of vCards"
+    body := body.setObjVal! "path" (Json.str path)
+  | "carddav" =>
+    let some url := rest[0]? | throw <| IO.userError "give the collection URL"
+    let some user := rest[1]? | throw <| IO.userError "give the username"
+    body := body.setObjVal! "url" (Json.str url)
+    body := body.setObjVal! "user" (Json.str user)
+    let cmd := (flagStr p "password-command" "").splitOn " " |>.filter (!·.isEmpty)
+    body := body.setObjVal! "passwordCommand" (Json.arr (cmd.map Json.str).toArray)
+  | other => throw <| IO.userError s!"unknown source: {other} (eds, files or carddav)"
+  let j ← b.json (Call.post ["contacts", "source"] body)
+  IO.println s!"contacts now come from {jstr j "source"}"
+
+/-- Handler for `tx rm`. -/
+def runTxRm (p : Parsed) : IO UInt32 := withBackend fun b => do
+  discard <| b.json (Call.delete ["transactions", argStr p "id"])
+  IO.println "deleted"
+
+/-- Handler for `tx history`. -/
+def runTxHistory (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["transactions", argStr p "id", "revisions"])
+  printTable #["seq", "at", "actor", "kind"]
+    ((jarr j).map fun r => #[toString (((r.getObjValAs? Int "seq").toOption).getD 0),
+                            jstr r "at", jstr r "actor", jstr r "kind"])
+
+/-! ## Accounts, labels, parties -/
+
+/-- Handler for `acc list`. -/
+def runAccList (_p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["accounts"])
+  printTable #["name", "kind", "owner", "commodity", "iban", "id"]
+    ((jarr j).map fun a => #[jstr a "name", jstr a "kind",
+                            (if jstr a "mine" == "true" then "" else jstr a "ownerName"),
+                            jstr a "commodity", jstr a "iban", jstr a "id"])
+
+/-- Handler for `acc add`. -/
+def runAccAdd (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let mut body := Json.mkObj [("name", argStr p "name")]
+  for (k, v) in [("kind", flagStr? p "kind"), ("iban", flagStr? p "iban"),
+                 ("commodity", flagStr? p "commodity"), ("note", flagStr? p "note"),
+                 ("owner", flagStr? p "owner")] do
+    match v with
+    | some x => body := body.setObjVal! k (Json.str x)
+    | none => pure ()
+  let j ← b.json (Call.post ["accounts"] body)
+  let whose := if jstr j "mine" == "true" then "" else s!"  owned by {jstr j "ownerName"}"
+  IO.println s!"{jstr j "name"}  ({jstr j "kind"}){whose}  {jstr j "id"}"
+
+/-- Handler for `acc merge`: folds one account into another. -/
+def runAccMerge (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.post ["accounts", "merge"]
+    (Json.mkObj [("from", argStr p "from"), ("into", argStr p "into")]))
+  IO.println s!"moved {jstr j "moved"} transactions from {jstr j "from"} into {jstr j "into"}"
+
+/-- Handler for `acc balance`. -/
+def runAccBalance (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let query := match flagStr? p "at" with | some d => [("at", d)] | none => []
+  match (p.variableArgsAs! String)[0]? with
+  | some name =>
+    let j ← b.json (Call.get ["accounts", name, "balance"] query)
+    printTable #["account", "balance", "commodity"]
+      ((jarr j).map fun e => #[jstr e "account", jstr e "text", jstr e "commodity"])
+      (rightAlign := #[1])
+  | none =>
+    let j ← b.json (Call.get ["reports", "balances"] query)
+    printTable #["account", "balance", "commodity"]
+      ((jarr j).map fun e => #[jstr e "account", jstr e "text", jstr e "commodity"])
+      (rightAlign := #[1])
+
+/-- Handler for `label list`. -/
+def runLabelList (_p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["labels"])
+  printTable #["name", "id"] ((jarr j).map fun l => #[jstr l "name", jstr l "id"])
+
+/-- Handler for `label add`. -/
+def runLabelAdd (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.post ["labels"] (Json.mkObj [("name", argStr p "name")]))
+  IO.println s!"{jstr j "name"}  {jstr j "id"}"
+
+/-- Handler for `party list`. -/
+def runPartyList (_p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["parties"])
+  printTable #["counterparty", "iban", "email"]
+    ((jarr j).map fun x => #[jstr x "name", jstr x "iban", jstr x "email"])
+  IO.println "\n(counterparties seen in the ledger; people live in your address book —"
+  IO.println " see resources contacts)"
+
+/-- Handler for `contacts`: what your address book offers. -/
+def runContacts (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["contacts"])
+  IO.println s!"source: {jstr j "source"}"
+  let items := jarr (jobj j "items")
+  if jstr j "configured" != "true" then
+    IO.println ""
+    IO.println ""
+    IO.println "No address book was found. This machine has no desktop contact store,"
+    IO.println "so point it somewhere with one of:"
+    IO.println ""
+    IO.println "  resources contacts use files <directory of vCards>"
+    IO.println "  resources contacts use carddav <url> <user> --password-command 'pass show dav'"
+    IO.println ""
+    IO.println "Nothing is copied here; your address book stays the only copy."
+    return
+  IO.println ""
+  let shown :=
+    match flagStr? p "search" with
+    | some needle => items.filter fun c => Str.containsCI (jstr c "name") needle
+    | none => items
+  printTable #["name", "email", "iban"]
+    (shown.map fun c => #[jstr c "name", jstr c "email", jstr c "iban"])
+
+/-! ## Imports -/
+
+/-- Handler for `import file`. -/
+def runImportFile (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let file := argStr p "file"
+  let account := flagStr p "account" ""
+  if account.isEmpty then throw <| IO.userError "--account names the bank account to import into"
+  let bytes ← IO.FS.readBinFile file
+  let j ← b.json
+    { method := "POST", path := ["imports"], body := bytes
+      query := [("account", account), ("profile", flagStr p "profile" "auto"),
+                ("filename", (System.FilePath.mk file).fileName.getD file)]
+      headers := [("content-type", "text/csv")] }
+  let batch := jobj j "batch"
+  let staged := jarr (jobj j "staged")
+  IO.println s!"profile {jstr j "profile"}, batch {jstr batch "id"}"
+  let dups := jstr batch "duplicates"
+  IO.println s!"  {jstr batch "total"} rows read, {staged.size} new, {dups} already known"
+  for prob in jarr (jobj j "problems") do
+    IO.eprintln s!"  warning: {prob.getStr?.toOption.getD ""}"
+  if p.hasFlag "promote" || p.hasFlag "auto-merge" then
+    let promoteBody :=
+      if p.hasFlag "auto-merge" then Json.mkObj [("merge", Json.str "auto")] else Json.mkObj []
+    let r ← b.json (Call.post ["imports", jstr batch "id", "promote"] promoteBody)
+    IO.println s!"  promoted {(jarr (jobj r "created")).size} transactions"
+    for inv in jarr (jobj r "settledInvoices") do
+      IO.println s!"  invoice {inv.getStr?.toOption.getD ""} settled"
+  else
+    printTable #["date", "payee", "purpose", "amount", "id"]
+      (staged.map fun e => #[
+        jstr e "date", Str.clamp (jstr e "payee") 24, Str.clamp (jstr e "purpose") 40,
+        jstr (jobj e "amount") "text", jstr e "id"])
+      (rightAlign := #[3])
+    IO.println s!"\nreview, then: resources import promote {jstr batch "id"}"
+
+/-- Handler for `import proposals`: shows rows that look like one event. -/
+def runImportProposals (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["imports", argStr p "batch", "proposals"])
+  printTable #["confidence", "date", "main", "with", "why"]
+    ((jarr j).map fun x =>
+      let parent := jobj x "parent"
+      let child := jobj x "child"
+      #[jstr x "confidence", jstr parent "date",
+        Str.clamp (jstr (jobj parent "payee") "" ++ jstr parent "payee") 24
+          ++ " " ++ jstr (jobj parent "amount") "text",
+        jstr (jobj child "amount") "text",
+        Str.clamp (jstr x "reason") 52])
+  IO.println "\npromote them as single transactions with:"
+  IO.println "  resources import promote <batch> --auto-merge"
+
+/-- Handler for `import list`. -/
+def runImportList (_p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["imports"])
+  printTable #["at", "profile", "file", "rows", "dups", "id"]
+    ((jarr j).map fun x => #[jstr x "at", jstr x "profile", jstr x "filename",
+                            toString (((x.getObjValAs? Int "total").toOption).getD 0),
+                            toString (((x.getObjValAs? Int "duplicates").toOption).getD 0),
+                            jstr x "id"])
+
+/-- Handler for `import staged`. -/
+def runImportStaged (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let batch := argStr p "batch"
+  let query := match flagStr? p "state" with | some s => [("state", s)] | none => []
+  let j ← b.json (Call.get ["imports", batch, "staged"] query)
+  printTable #["date", "payee", "purpose", "amount", "state", "id"]
+    ((jarr j).map fun e => #[
+      jstr e "date", Str.clamp (jstr e "payee") 22, Str.clamp (jstr e "purpose") 36,
+      jstr (jobj e "amount") "text", jstr e "state", jstr e "id"])
+    (rightAlign := #[3])
+
+/-- Handler for `import suggest`: routes a staged row before it is promoted. -/
+def runImportSuggest (p : Parsed) : IO UInt32 := withBackend fun b => do
+  discard <| b.json (Call.post ["staged", argStr p "id", "suggest"]
+    (Json.mkObj [("account", argStr p "account")]))
+  IO.println s!"{argStr p "id"} will be booked into {argStr p "account"}"
+
+/-- Handler for `import promote`. -/
+def runImportPromote (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let batch := argStr p "batch"
+  let ids := flagList p "id"
+  let mut body :=
+    if ids.isEmpty then Json.mkObj []
+    else Json.mkObj [("ids", Json.arr (ids.map Json.str).toArray)]
+  if p.hasFlag "auto-merge" then body := body.setObjVal! "merge" (Json.str "auto")
+  else if p.hasFlag "as-one" then body := body.setObjVal! "merge" (Json.str "true")
+  let j ← b.json (Call.post ["imports", batch, "promote"] body)
+  let merged := ((j.getObjValAs? Int "merged").toOption).getD 0
+  let note := if merged > 0 then s!" ({merged} of them merged from several rows)" else ""
+  IO.println (s!"promoted {(jarr (jobj j "created")).size} transactions" ++ note)
+  for inv in jarr (jobj j "settledInvoices") do
+    IO.println s!"invoice {inv.getStr?.toOption.getD ""} settled"
+
+/-- Handler for `import ignore`. -/
+def runImportIgnore (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let ids := p.variableArgsAs! String
+  discard <| b.json (Call.post ["staged", "ignore"]
+    (Json.mkObj [("ids", Json.arr (ids.map Json.str))]))
+  IO.println s!"ignored {ids.size}"
+
+/-! ## Rules -/
+
+/-- Handler for `rule list`. -/
+def runRuleList (_p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["rules"])
+  printTable #["priority", "name", "filter", "account", "labels", "id"]
+    ((jarr j).map fun r => #[
+      toString (((r.getObjValAs? Int "priority").toOption).getD 0), jstr r "name",
+      jstr r "filter", jstr r "setAccount",
+      String.intercalate "," ((jarr (jobj r "addLabels")).toList.map
+        (fun l => l.getStr?.toOption.getD "")),
+      jstr r "id"])
+
+/-- Handler for `rule add`. -/
+def runRuleAdd (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let body := Json.mkObj [
+    ("name", argStr p "name"), ("filter", argStr p "filter"),
+    ("setAccount", Json.str (flagStr p "account" "")),
+    ("addLabels", Json.arr ((flagList p "label").map Json.str).toArray),
+    ("priority", Json.num (JsonNumber.fromNat ((flagStr p "priority" "0").toNat?.getD 0)))]
+  let j ← b.json (Call.post ["rules"] body)
+  IO.println s!"{jstr j "name"}  {jstr j "id"}"
+
+/--
+Handler for `rule apply`: runs the rules over transactions already in the
+ledger. Shows what would change unless `--apply` is given.
+-/
+def runRuleApply (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let commit := p.hasFlag "apply"
+  let j ← b.json (Call.post ["rules", "apply"] (Json.mkObj [("commit", Json.bool commit)]))
+  let items := jarr (jobj j "items")
+  if items.isEmpty then
+    IO.println "no uncategorised transaction matches a rule"
+    return
+  let byRule := items.foldl (init := ([] : List (String × Nat))) fun acc x =>
+    let key := jstr x "rule" ++ "  ->  " ++ jstr x "account"
+    match acc.lookup key with
+    | some n => acc.filter (fun kv => kv.1 != key) ++ [(key, n + 1)]
+    | none => acc ++ [(key, 1)]
+  printTable #["rule", "matched"]
+    (byRule.toArray.map fun (k, n) => #[k, toString n]) (rightAlign := #[1])
+  if commit then
+    IO.println s!"\ncategorised {items.size} transactions"
+  else
+    IO.println s!"\n{items.size} transactions would be categorised. Re-run with --apply."
+
+/-- Handler for `rule rm`. -/
+def runRuleRm (p : Parsed) : IO UInt32 := withBackend fun b => do
+  discard <| b.json (Call.delete ["rules", argStr p "id"])
+  IO.println "deleted"
+
+/-! ## Receipts -/
+
+/-- Handler for `receipt add`. -/
+def runReceiptAdd (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let file := argStr p "file"
+  let bytes ← IO.FS.readBinFile file
+  let name := (System.FilePath.mk file).fileName.getD "receipt"
+  let j ← b.json
+    { method := "PUT", path := ["attachments"], body := bytes
+      query := [("filename", name)]
+      headers := [("content-type", Blobs.mimeOfExtension name)] }
+  let sha := jstr j "sha256"
+  IO.println s!"{sha}  {jstr j "bytes"} bytes"
+  match flagStr? p "txn" with
+  | some id =>
+    discard <| b.json (Call.post ["transactions", id, "attachments"]
+      (Json.mkObj [("sha256", sha)]))
+    IO.println s!"attached to {id}"
+  | none => pure ()
+
+/-- Handler for `receipt list`. -/
+def runReceiptList (_p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["attachments"])
+  printTable #["sha256", "mime", "bytes", "name"]
+    ((jarr j).map fun a => #[Str.clamp (jstr a "sha256") 16, jstr a "mime",
+                            toString (((a.getObjValAs? Int "bytes").toOption).getD 0),
+                            jstr a "origName"])
+    (rightAlign := #[2])
+
+/-- Handler for `receipt gc`. -/
+def runReceiptGc (_p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.post ["attachments", "gc"] (Json.mkObj []))
+  IO.println s!"removed {jstr j "removed"} unreferenced receipts"
+
+/-! ## Invoices -/
+
+/-- Handler for `invoice new`. -/
+def runInvoiceNew (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let today ← Date.today
+  let issued := flagStr p "issued" today.toIso
+  let due := flagStr p "due" ((today.plusDays 14).toIso)
+  let mut body := Json.mkObj [
+    ("budget", Json.str (argStr p "budget")), ("issued", issued), ("due", due),
+    ("commodity", flagStr p "commodity" "EUR")]
+  match flagStr? p "link" with
+  | some url => body := body.setObjVal! "paymentLink" (Json.str url)
+  | none =>
+    body := body.setObjVal! "beneficiary" (Json.str (flagStr p "beneficiary" ""))
+    body := body.setObjVal! "iban" (Json.str (flagStr p "iban" ""))
+    match flagStr? p "bic" with
+    | some bic => body := body.setObjVal! "bic" (Json.str bic)
+    | none => pure ()
+  match flagStr? p "note" with
+  | some n => body := body.setObjVal! "note" (Json.str n)
+  | none => pure ()
+  let j ← b.json (Call.post ["invoices"] body)
+  IO.println s!"raised from {jstr j "budget"}"
+  IO.println ""
+  printTable #["number", "to", "total", "reference"]
+    ((jarr (jobj j "items")).map fun i =>
+      #[jstr i "number", Str.clamp (jstr i "payerName") 28, jstr i "totalText",
+        jstr i "reference"])
+    (rightAlign := #[2])
+
+/-- Handler for `invoice list`. -/
+def runInvoiceList (_p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["invoices"])
+  printTable #["number", "issued", "due", "payer", "total", "status", "reference"]
+    ((jarr j).map fun i => #[jstr i "number", jstr i "issued", jstr i "due",
+                            Str.clamp (jstr i "payerName") 24, jstr i "totalText",
+                            jstr i "status", jstr i "reference"])
+    (rightAlign := #[4])
+
+/-- Handler for `invoice show`. -/
+def runInvoiceShow (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["invoices", argStr p "id"])
+  if p.hasFlag "json" then IO.println j.pretty; return
+  IO.println s!"invoice {jstr j "number"}  ({jstr j "status"})"
+  IO.println s!"  to        {jstr j "payerName"}"
+  IO.println s!"  issued    {jstr j "issued"}   due {jstr j "due"}"
+  IO.println s!"  reference {jstr j "reference"}"
+  IO.println s!"  payable   {jstr j "payment"}"
+  for l in jarr (jobj j "lines") do
+    IO.println s!"    {Str.padRight (jstr l "description") 34} {Str.padLeft (jstr l "quantity") 8}"
+  IO.println s!"  total     {jstr j "totalText"}"
+
+/-- Handler for `invoice status`. -/
+def runInvoiceStatus (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.post ["invoices", argStr p "id", "status"]
+    (Json.mkObj [("status", argStr p "status")]))
+  IO.println s!"{jstr j "invoice"} is now {jstr j "status"}"
+
+/-- Handler for `invoice delete`. -/
+def runInvoiceDelete (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.delete ["invoices", argStr p "id"])
+  IO.println s!"deleted {jstr j "deleted"}"
+
+/-- Handler for `invoice qr`. -/
+def runInvoiceQr (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let art ← b.bytes (Call.get ["invoices", argStr p "id", "qr.txt"])
+  IO.print ((String.fromUTF8? art).getD "")
+
+/-- Handler for `invoice pdf`. -/
+def runInvoicePdf (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let id := argStr p "id"
+  let bytes ← b.bytes (Call.get ["invoices", id, "pdf"])
+  let out := flagStr p "out" s!"invoice-{id}.pdf"
+  IO.FS.writeBinFile out bytes
+  IO.println s!"wrote {out} ({bytes.size} bytes)"
+
+/-- Handler for `invoice html`. -/
+def runInvoiceHtml (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let id := argStr p "id"
+  let bytes ← b.bytes (Call.get ["invoices", id, "html"])
+  match flagStr? p "out" with
+  | some out => do IO.FS.writeBinFile out bytes; IO.println s!"wrote {out}"
+  | none => IO.print ((String.fromUTF8? bytes).getD "")
+
+/-- Handler for `invoice reconcile`. -/
+def runInvoiceReconcile (_p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.post ["invoices", "reconcile"] (Json.mkObj []))
+  if (jarr j).isEmpty then IO.println "nothing to settle"
+  else
+    for x in jarr j do
+      IO.println s!"invoice {jstr x "invoice"} settled by {jstr x "txn"}"
+
+/-! ## Reports and tokens -/
+
+/-- Handler for `report trial`. -/
+def runReportTrial (_p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["reports", "trial"])
+  let rows := (jarr j).map fun e => #[jstr e "commodity", jstr e "text"]
+  printTable #["commodity", "total"] rows (rightAlign := #[1])
+  let bad := (jarr j).filter fun e => (((e.getObjValAs? Int "minor").toOption).getD 0) != 0
+  if bad.isEmpty then IO.println "\ntrial balance is zero in every commodity"
+  else IO.eprintln "\nTRIAL BALANCE IS NOT ZERO — the store is inconsistent"
+
+/-- Handler for `report monthly`. -/
+def runReportMonthly (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["reports", "monthly"]
+    [("account", flagStr p "account" "Expenses"), ("commodity", flagStr p "commodity" "EUR")])
+  let commodity := Commodity.ofCode (flagStr p "commodity" "EUR")
+  printTable #["month", "total"]
+    ((jarr j).map fun r => #[jstr r "month",
+      (Amount.mk commodity (((r.getObjValAs? Int "minor").toOption).getD 0)).digits])
+    (rightAlign := #[1])
+
+/--
+Handler for `token create`.
+
+With `--budget` and `--for` this mints a share link instead: a token that speaks
+for one person on one budget. Its scopes are not what confines it — the guest
+route table is — so they are not asked for.
+-/
+def runTokenCreate (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let mut body := Json.mkObj [("name", argStr p "name"), ("scopes", flagStr p "scopes" "read")]
+  for (k, v) in [("budget", flagStr? p "budget"), ("for", flagStr? p "for"),
+                 ("expires", flagStr? p "expires")] do
+    match v with
+    | some x => body := body.setObjVal! k (Json.str x)
+    | none => pure ()
+  let j ← b.json (Call.post ["tokens"] body)
+  let tok := jobj j "token"
+  let link := jstr j "link"
+  if link.isEmpty then
+    IO.println s!"token {jstr tok "name"} created with scopes {jstr tok "scopes"}"
+    IO.println ""
+    IO.println (jstr j "secret")
+    IO.println ""
+    IO.println "This is the only time the secret is shown. Store it now."
+  else
+    IO.println s!"share link for {flagStr p "for" ""} on {flagStr p "budget" ""}"
+    IO.println ""
+    IO.println s!"  {link}"
+    IO.println ""
+    IO.println "Append that to wherever the web client is served from. The secret \
+lives in the fragment, so it never reaches a server log or a Referer header, and \
+it is shown once. Revoke it with `resources token revoke`."
+
+/-- Handler for `token list`. -/
+def runTokenList (_p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["tokens"])
+  printTable #["name", "scopes", "created", "last used", "id"]
+    ((jarr j).map fun t => #[jstr t "name", jstr t "scopes", jstr t "createdAt",
+                            jstr t "lastUsedAt", jstr t "id"])
+
+/-- Handler for `token revoke`. -/
+def runTokenRevoke (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.delete ["tokens", argStr p "id"])
+  IO.println (if jstr j "revoked" == "true" then "revoked" else "revoked")
+
+/-! ## Server, status and the escape hatch -/
+
+/-- Handler for `serve`. -/
+def runServe (p : Parsed) : IO UInt32 := withLocal fun ctx => do
+  Api.serve ctx
+    { host := flagStr p "host" "127.0.0.1"
+      port := ((flagStr p "port" "8087").toNat?.getD 8087).toUInt16
+      webRoot := (flagStr? p "web").map System.FilePath.mk }
+
+/-- Handler for `status`. -/
+def runStatus (_p : Parsed) : IO UInt32 := withBackend fun b => do
+  IO.println s!"backend   {b.describe}"
+  let j ← b.json (Call.get ["health"])
+  IO.println s!"schema    {jstr j "schema"}"
+  IO.println s!"actor     {jstr j "actor"}  (scopes {jstr j "scopes"})"
+  let accounts ← b.json (Call.get ["accounts"])
+  let txns ← b.json (Call.get ["transactions"] [("limit", "1")])
+  IO.println s!"accounts  {(jarr accounts).size}"
+  IO.println s!"txns      {jstr txns "total"}"
+  IO.println s!"qrencode  {if ← Qr.available then "available" else "NOT FOUND"}"
+
+/-- Handler for `api`, the escape hatch onto any route. -/
+def runApi (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let method := (argStr p "method").toUpper
+  let path := ((argStr p "path").splitOn "/").filter (fun s => !s.isEmpty)
+  let query := (flagList p "query").filterMap fun kv =>
+    (Str.splitOnce kv '=')
+  let body := match flagStr? p "data" with
+    | some d => d.toUTF8
+    | none => ByteArray.empty
+  match ← b.call { method, path, query, body,
+                   headers := [("content-type", "application/json")] } with
+  | .json _ payload => IO.println payload.pretty
+  | .bytes _ _ data _ => IO.println ((String.fromUTF8? data).getD s!"<{data.size} bytes>")
+
+/-- Handler for `gen-types`. -/
+def runGenTypes (p : Parsed) : IO UInt32 := do
+  match flagStr? p "out" with
+  | some out => do
+    IO.FS.writeFile out Api.TsGen.module
+    IO.println s!"wrote {out}"
+  | none => IO.print Api.TsGen.module
+  return 0
+
+/-- Handler for `migrate`. -/
+def runMigrate (_p : Parsed) : IO UInt32 := withLocal fun ctx => do
+  let v ← Schema.currentVersion ctx.db
+  IO.println s!"schema version {v} at {ctx.cfg.dbPath}"
+
+end Cli
+end Resources
