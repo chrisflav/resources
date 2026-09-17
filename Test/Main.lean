@@ -1050,6 +1050,38 @@ private def receiptTests (r : Report) : Report := Id.run do
     (Receipts.guessMerchant text) (some "Cabane du Trient CAS")
   r := check r "a page with no amounts yields no total"
     (Receipts.guessTotal Commodity.eur "nothing here").isNone
+  -- Line items, over the shapes Swiss and French tills actually print. The
+  -- summary block underneath must not read as items, or a bill would appear to
+  -- contain its own total.
+  let chf := Commodity.ofCode "CHF"
+  let hut := " 2 Haslikuchen             6.00     12.00 A\n" ++
+    " 1 Panaché 0,5                       7.00 A\n" ++
+    "-1 Panaché 0,5                      -7.00 A\n" ++
+    " 1 Tegernseer Hell 5 dl               8,00 C\n" ++
+    "18 FORFAIT 1/2 PENSION à 68.00    1224.00\n" ++
+    "Gesamt: 642.00 CHF\n" ++
+    " 0.00% A   642.00    0.00   642.00\n" ++
+    "Barzahlung 642.00   Kurs 1.00   Gesamt 642.00\n"
+  let its := Receipts.guessItems chf hut
+  r := checkEq r "only the priced lines are items" its.length 5
+  r := checkEq r "a unit price the count implies is dropped"
+    ((its[0]?).map (·.description)) (some "Haslikuchen")
+  r := checkEq r "the line total wins over the unit price"
+    ((its[0]?).map (·.amount.minor)) (some 1200)
+  r := checkEq r "a size in the name is not a unit price"
+    ((its[1]?).map (·.description)) (some "Panaché 0,5")
+  r := checkEq r "a correction keeps its sign"
+    ((its[2]?).map (·.amount.minor)) (some (-700))
+  r := checkEq r "a correction keeps its count"
+    ((its[2]?).bind (·.qty)) (some (-1))
+  r := checkEq r "a bare line total is read"
+    ((its[3]?).map (·.amount.minor)) (some 800)
+  r := checkEq r "the multiplier mark is trimmed off the name"
+    ((its[4]?).map (·.description)) (some "FORFAIT 1/2 PENSION")
+  r := checkEq r "the count is kept" ((its[4]?).bind (·.qty)) (some 18)
+  -- The lines are not obliged to reach the total, and must not be padded to it.
+  r := checkEq r "lines stand for themselves, not for the total"
+    ((its.map (·.amount.minor)).sum) (1200 + 700 - 700 + 800 + 122400)
   -- vCards, including the folded lines real address books emit.
   -- (Kind handling is checked against the store below.)
   let vcf := "BEGIN:VCARD\nVERSION:3.0\nFN:Ada Lovelace\n" ++
@@ -1062,6 +1094,161 @@ private def receiptTests (r : Report) : Report := Id.run do
   r := checkEq r "spaces are stripped from the IBAN"
     (contacts[0]!).iban (some "DE02120300000000202051")
   r := checkEq r "a card without FN falls back to N" (contacts[1]!).name "Marius Klein"
+  return r
+
+/--
+Dividing a payment by the lines on its receipt.
+
+The property that matters is that dividing cannot invent money: whatever the
+parts book, and wherever they book it, together they must still take exactly
+what the original took out of the account the money left. The remainder is the
+normal ending, because the lines on a scanned receipt hardly ever reach the
+total -- a fold in the paper is enough.
+-/
+private def divideTests (ctx : Ctx) (r : Report) : IO Report := do
+  let mut r := r
+  let chf := Commodity.ofCode "CHF"
+  let sha := "00feed00feed00feed00feed00feed00feed00feed00feed00feed00feed0000"
+  let cash ← Accounts.ensure ctx "Assets.Cash.Hut" (kind := some .asset)
+  let rest ← Accounts.ensure ctx "Expenses.Hut.Unclassified" (kind := some .expense)
+  Db.exec ctx.db s!"INSERT OR IGNORE INTO attachment (sha256, mime, bytes, created_at)
+                    VALUES ({Db.lit sha}, 'application/pdf', 1, '2026-08-06T00:00:00')"
+  Receipts.record ctx sha
+    { merchant := some "Bächlitalhütte SAC", date := Date.ofIso? "2026-08-06"
+      total := some ⟨chf, 64200⟩
+      items := [{ description := "Haslikuchen", qty := some 2, amount := ⟨chf, 1200⟩ },
+                { description := "Panaché 0,5", qty := some 1, amount := ⟨chf, 700⟩ },
+                { description := "Hüttewurst mit Brot", qty := some 1, amount := ⟨chf, 900⟩ }]
+      extractor := "test" }
+  let stored ← Receipts.items ctx sha
+  r := checkEq r "the lines come back in order" (stored.map (·.amount.minor)) #[1200, 700, 900]
+  r := checkEq r "the count survives the round trip" ((stored[0]?).bind (·.qty)) (some 2)
+  let id ← freshId
+  let fixture : Transaction :=
+    { id := ⟨id⟩, date := (Date.ofIso? "2026-08-06").get!
+      payee := some "Bächlitalhütte SAC", narration := "cash receipt"
+      postings := [{ account := cash.id, amount := ⟨chf, -64200⟩ },
+                   { account := rest.id, amount := ⟨chf, 64200⟩ }]
+      attachments := [sha] }
+  match fixture.validate with
+  | .error e => return check r s!"the fixture balances ({e})" false
+  | .ok bt => Txns.put ctx bt "test" "fixture"
+  let parts ← Receipts.divideByItems ctx ⟨id⟩
+    [{ items := [{ line := 1 }, { line := 3 }], into := "Expenses.Hut.Food" }] "test"
+  r := checkEq r "a claimed group and a remainder come back" parts.size 2
+  let food ← Accounts.ensure ctx "Expenses.Hut.Food" (kind := some .expense)
+  let netIn (t : Transaction) (a : AccountId) : Int := t.netIn a "CHF"
+  r := checkEq r "the group is worth exactly the lines it claimed"
+    ((parts[0]?).map (fun t => netIn t food.id)) (some 2100)
+  r := checkEq r "the group takes its share from the account the money left"
+    ((parts[0]?).map (fun t => netIn t cash.id)) (some (-2100))
+  r := checkEq r "the remainder keeps what no line claimed"
+    ((parts[1]?).map (fun t => netIn t rest.id)) (some 62100)
+  r := checkEq r "dividing takes the same money out in total"
+    ((parts.map (fun t => netIn t cash.id)).foldl (· + ·) 0) (-64200)
+  r := check r "the receipt rides along on every part"
+    (parts.all (fun t => t.attachments == [sha]))
+  r := check r "the payment it was divided from is gone"
+    ((← Txns.get? ctx ⟨id⟩)).isNone
+  -- Read the parts back rather than trusting what came out of the call: a part
+  -- that is returned but never lands leaves the money it was carrying nowhere,
+  -- and the returned value looks perfectly correct either way.
+  let mut landed := 0
+  for part in parts do
+    if (← Txns.get? ctx part.id).isSome then landed := landed + 1
+  r := checkEq r "every part is in the store afterwards" landed parts.size
+  let cashAfter ← Db.scalarInt ctx.db
+    s!"SELECT COALESCE(SUM(minor), 0) FROM posting
+       WHERE account_id = {Db.lit cash.id.val} AND commodity = 'CHF'"
+  r := checkEq r "dividing leaves the account the money left untouched" cashAfter (-64200)
+  -- The two ways of asking for the impossible.
+  let twice ← try
+    let _ ← Receipts.divideByItems ctx (parts[0]!).id
+      [{ items := [{ line := 1 }, { line := 1 }], into := "Expenses.Hut.Food" }] "test"
+    pure false
+  catch _ => pure true
+  r := check r "a single-unit line cannot be claimed twice" twice
+  let tooMuch ← try
+    let _ ← Receipts.divideByItems ctx (parts[1]!).id
+      [{ items := [{ line := 9 }], into := "Expenses.Hut.Food" }] "test"
+    pure false
+  catch _ => pure true
+  r := check r "a line that is not on the receipt is refused" tooMuch
+  -- Editing the lines by hand, for the ones a scan could not read. The lines
+  -- may fall short of the total, but never overrun it.
+  r := checkEq r "headroom is what the lines leave of the total"
+    ((← Receipts.headroom ctx sha).map (·.minor)) (some 61400)
+  let _ ← Receipts.addItem ctx sha "Suppe" (some 1) "9.50"
+  r := checkEq r "an added line takes up headroom"
+    ((← Receipts.headroom ctx sha).map (·.minor)) (some 60450)
+  let overrun ← try
+    let _ ← Receipts.addItem ctx sha "Zu teuer" none "9999.00"
+    pure false
+  catch _ => pure true
+  r := check r "a line that would overrun the total is refused" overrun
+  r := checkEq r "the refused line was not stored" (← Receipts.items ctx sha).size 4
+  let _ ← Receipts.removeItem ctx sha 2
+  let after ← Receipts.items ctx sha
+  r := checkEq r "removing a line renumbers the rest"
+    ((after[1]?).map (·.description)) (some "Hüttewurst mit Brot")
+  r := checkEq r "removing a line gives its money back to the headroom"
+    ((← Receipts.headroom ctx sha).map (·.minor)) (some 61150)
+  let gone ← try
+    let _ ← Receipts.removeItem ctx sha 99
+    pure false
+  catch _ => pure true
+  r := check r "removing a line that is not there is refused" gone
+
+  -- A line covering several units is divisible too: eighteen half-boards on one
+  -- printed line may belong to several people. The awkward case is a line whose
+  -- total does not divide evenly, where the units must still add back exactly.
+  let sha2 := "00beef0000beef0000beef0000beef0000beef0000beef0000beef0000beef00"
+  let bunk ← Accounts.ensure ctx "Assets.Cash.Bunk" (kind := some .asset)
+  let pot ← Accounts.ensure ctx "Expenses.Bunk.Unclassified" (kind := some .expense)
+  Db.exec ctx.db s!"INSERT OR IGNORE INTO attachment (sha256, mime, bytes, created_at)
+                    VALUES ({Db.lit sha2}, 'application/pdf', 1, '2026-08-01T00:00:00')"
+  Receipts.record ctx sha2
+    { total := some ⟨chf, 132400⟩
+      items := [{ description := "FORFAIT 1/2 PENSION", qty := some 18, amount := ⟨chf, 122400⟩ },
+                { description := "TAXE DE SEJOUR", qty := some 3, amount := ⟨chf, 10000⟩ }]
+      extractor := "test" }
+  let id2 ← freshId
+  let fixture2 : Transaction :=
+    { id := ⟨id2⟩, date := (Date.ofIso? "2026-08-01").get!
+      payee := some "Cabane", narration := "hut bill"
+      postings := [{ account := bunk.id, amount := ⟨chf, -132400⟩ },
+                   { account := pot.id, amount := ⟨chf, 132400⟩ }]
+      attachments := [sha2] }
+  match fixture2.validate with
+  | .error e => return check r s!"the second fixture balances ({e})" false
+  | .ok bt => Txns.put ctx bt "test" "fixture"
+  let split ← Receipts.divideByItems ctx ⟨id2⟩
+    [{ items := [{ line := 1, qty := some 10 }, { line := 2, qty := some 1 }]
+       into := "Expenses.Bunk.Mine" },
+     { items := [{ line := 1, qty := some 8 }, { line := 2, qty := some 2 }]
+       into := "Expenses.Bunk.Theirs" }] "test"
+  let mine ← Accounts.ensure ctx "Expenses.Bunk.Mine" (kind := some .expense)
+  let theirs ← Accounts.ensure ctx "Expenses.Bunk.Theirs" (kind := some .expense)
+  let net (t : Transaction) (a : AccountId) : Int := t.netIn a "CHF"
+  -- 10 of 18 nights at 68.00, plus a third of a 100.00 tax that does not divide
+  -- evenly. `splitParts` puts the odd cent on the last unit, so one third is
+  -- 33.33 and the other two are 33.33 + 33.34: 680.00 + 33.33 here.
+  r := checkEq r "ten units of a line, plus a share of one that divides unevenly"
+    ((split[0]?).map (fun t => net t mine.id)) (some 71333)
+  r := checkEq r "the other eight units, and the odd cent with them"
+    ((split[1]?).map (fun t => net t theirs.id)) (some 61067)
+  r := checkEq r "the units of a line add back to the line"
+    (((split[0]?).map (fun t => net t mine.id)).getD 0 +
+     ((split[1]?).map (fun t => net t theirs.id)).getD 0) 132400
+  r := checkEq r "claiming every unit leaves no remainder" split.size 2
+  r := checkEq r "the narration says how many units it took"
+    ((split[0]?).map (·.narration)) (some "10 × FORFAIT 1/2 PENSION, 1 × TAXE DE SEJOUR")
+  let overclaim ← try
+    let _ ← Receipts.divideByItems ctx (split[0]!).id
+      [{ items := [{ line := 1, qty := some 99 }], into := "Expenses.Bunk.Mine" }] "test"
+    pure false
+  catch _ => pure true
+  r := check r "claiming more units than a line covers is refused" overclaim
   return r
 
 /--
@@ -1362,6 +1549,7 @@ def main : IO UInt32 := do
     r ← invoiceFromTxnTests ctx r
     r ← splitAndTripTests ctx r
     r := receiptTests r
+    r ← divideTests ctx r
     r ← workflowTests ctx r
     r ← contactTests ctx r
     for failure in r.failed do

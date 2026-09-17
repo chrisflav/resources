@@ -121,6 +121,12 @@ export interface Attachment {
   sha256: string
 }
 
+export interface LineItem {
+  amount: Amount
+  description: string
+  qty: number
+}
+
 export interface Rule {
   addLabels: string[]
   filter: string

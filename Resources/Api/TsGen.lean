@@ -157,6 +157,9 @@ def module : String :=
     interfaceOf "StagedEntry" (Wire.stagedJson sampleStaged) [("amount", "Amount")],
     interfaceOf "ImportBatch" (Wire.batchJson sampleBatch),
     interfaceOf "Attachment" (Wire.attachmentJson sampleAttachment),
+    interfaceOf "LineItem"
+      (Wire.lineItemJson { description := "Haslikuchen", qty := some 2
+                           amount := ⟨sampleCommodity, 1200⟩ }) [("amount", "Amount")],
     interfaceOf "Rule" (Wire.ruleJson sampleRule),
     interfaceOf "ApiToken" (Wire.tokenJson sampleToken),
     interfaceOf "Revision" (Wire.revisionJson sampleRevision),

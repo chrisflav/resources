@@ -389,6 +389,25 @@ CREATE TABLE budget_participant (
   account TEXT NOT NULL,
   weight INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (budget_id, idx));
+"),
+  (15, "
+-- The lines printed on a receipt, kept as read.
+--
+-- A bill is one payment but rarely one thing: a hut evening is beds, a round of
+-- drinks and a tourist tax, and only the payment reaches the bank. Storing the
+-- lines lets the parts be booked where they belong without pretending the bank
+-- told you about them. Amounts are signed, because tills print corrections as
+-- negative lines, and they are not required to sum to the total -- a service
+-- charge, a fold in the paper or a torn corner all leave a remainder, which is
+-- the normal case and not an error.
+CREATE TABLE attachment_item (
+  sha256 TEXT NOT NULL REFERENCES attachment(sha256) ON DELETE CASCADE,
+  idx INTEGER NOT NULL,
+  description TEXT NOT NULL,
+  qty INTEGER,
+  minor INTEGER NOT NULL,
+  commodity TEXT NOT NULL,
+  PRIMARY KEY (sha256, idx));
 ")
 ]
 

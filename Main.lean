@@ -127,6 +127,22 @@ def txRmCmd := `[Cli|
     id : String; "Transaction id."
 ]
 
+def txDivideCmd := `[Cli|
+  divide VIA runTxDivide;
+  "Divides a payment into the things it paid for, reading them off its receipt. \
+   Each group becomes its own transaction against the account the money left; \
+   whatever no group claims stays behind as a remainder, which is the usual \
+   ending, since lines are read off paper and paper folds."
+
+  FLAGS:
+    g, group : Array String; "Lines and where they belong, as '1+2=Account', comma \
+                              separated. A line covering several units can be \
+                              divided too: '3:10' takes ten of what line 3 covers."
+
+  ARGS:
+    id : String; "Transaction id."
+]
+
 def txHistoryCmd := `[Cli|
   history VIA runTxHistory;
   "Shows the audit trail of a transaction."
@@ -141,7 +157,7 @@ def txCmd := `[Cli|
 
   SUBCOMMANDS:
     txListCmd; txAddCmd; txShowCmd; txEditCmd; txMoveCmd; txLabelCmd;
-    txMergeCmd; txUnmergeCmd; txLinkCmd; txRmCmd; txHistoryCmd
+    txMergeCmd; txUnmergeCmd; txDivideCmd; txLinkCmd; txRmCmd; txHistoryCmd
 ]
 
 /-! ## Accounts, labels, parties -/
@@ -477,6 +493,37 @@ def receiptAddCmd := `[Cli|
     file : String; "File to store."
 ]
 
+def receiptItemsCmd := `[Cli|
+  items VIA runReceiptItems;
+  "Shows the priced lines read off a receipt, numbered for 'tx divide'."
+
+  ARGS:
+    sha : String; "Receipt hash."
+]
+
+def receiptItemAddCmd := `[Cli|
+  "item-add" VIA runReceiptItemAdd;
+  "Adds a line a scan could not read. The lines may fall short of the receipt \
+   total, but never overrun it."
+
+  FLAGS:
+    q, qty : String; "How many, when the line says so."
+
+  ARGS:
+    sha : String;         "Receipt hash."
+    description : String; "What the line is, e.g. 'Rivella rot 1.5 L'."
+    amount : String;      "What it cost, e.g. 12.00 or -7.00 for a correction."
+]
+
+def receiptItemRmCmd := `[Cli|
+  "item-rm" VIA runReceiptItemRm;
+  "Drops a line, renumbering the ones after it."
+
+  ARGS:
+    sha : String;  "Receipt hash."
+    line : String; "Line number, as 'receipt items' shows it."
+]
+
 def receiptListCmd := `[Cli| list VIA runReceiptList; "Lists stored receipts." ]
 
 def receiptGcCmd := `[Cli| gc VIA runReceiptGc; "Deletes receipts no transaction references." ]
@@ -486,7 +533,8 @@ def receiptCmd := `[Cli|
   "Receipts."
 
   SUBCOMMANDS:
-    receiptAddCmd; receiptInboxCmd; receiptScanCmd; receiptMatchCmd;
+    receiptAddCmd; receiptInboxCmd; receiptScanCmd; receiptItemsCmd;
+    receiptItemAddCmd; receiptItemRmCmd; receiptMatchCmd;
     receiptCashCmd; receiptListCmd; receiptGcCmd
 ]
 

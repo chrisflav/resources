@@ -706,6 +706,52 @@ def unmerge (ctx : Ctx) (id : TxId) (actor : String) : IO (Array Transaction) :=
                         WHERE fingerprint = {Db.lit origin}"
   return checked.map (·.val)
 
+/--
+Replaces one transaction with the parts it was divided into.
+
+Dividing is not unmerging: the parts may book their spending wherever they
+belong, which is the whole point, so what they own is allowed to differ from
+what the original said. What may not differ is the funding. Together the parts
+must take exactly what the original took, out of exactly the accounts it took it
+from -- otherwise a division could quietly invent money, and the ledger would
+still balance while being wrong.
+
+The staged row that produced the original follows the first part, so the bank
+line stays promoted rather than reverting to unimported.
+-/
+def replaceWith (ctx : Ctx) (id : TxId) (parts : List Transaction) (actor : String)
+    (kind : String := "split") : IO (Array Transaction) := do
+  let some t ← get? ctx id | throw <| IO.userError s!"no such transaction: {id.val}"
+  let some first := parts.head?
+    | throw <| IO.userError "a division has to leave something behind"
+  let mut checked : Array { t : Transaction // t.Balanced } := #[]
+  for part in parts do
+    -- A part carrying the original's id would be written and then deleted again
+    -- by the retirement below, taking its money out of the ledger silently.
+    if part.id == id then
+      throw <| IO.userError "a part cannot reuse the id of the transaction being divided"
+    match part.validate with
+    | .error e => throw <| IO.userError s!"a part does not balance: {e}"
+    | .ok bt => checked := checked.push bt
+  let codes := (t.commodityCodes ++ parts.flatMap (·.commodityCodes)).eraseDups
+  let accounts := ((t.postings ++ parts.flatMap (·.postings)).map (·.account)).eraseDups
+  for c in codes do
+    for a in accounts do
+      let before := t.netIn a c
+      let after := (parts.map (fun p => p.netIn a c)).sum
+      if (before < 0 || after < 0) && before != after then
+        throw <| IO.userError
+          s!"the parts do not take the same money out of {a.val} as the original did"
+  ctx.transaction do
+    for bt in checked do
+      writeRows ctx bt.val
+      recordRevision ctx bt.val.id actor kind (toJson bt.val)
+    recordRevision ctx id actor s!"{kind}-away" (toJson t)
+    Db.exec ctx.db s!"DELETE FROM txn WHERE id = {Db.lit id.val}"
+    Db.exec ctx.db s!"UPDATE staged_entry SET txn_id = {Db.lit first.id.val}
+                      WHERE txn_id = {Db.lit id.val}"
+  return checked.map (·.val)
+
 /-- One entry of a transaction's audit trail. -/
 structure Revision where
   seq : Int

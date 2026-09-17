@@ -810,6 +810,85 @@ def runReceiptMatch (p : Parsed) : IO UInt32 := withBackend fun b => do
       (Json.mkObj [("sha256", Json.str (jstr m "sha256"))]))
   IO.println s!"\nattached {items.size} receipt(s)"
 
+/-- Prints a receipt's lines, and what the total still leaves room for. -/
+private def showItems (b : Backend) (sha : String) : IO Unit := do
+  let j ← b.json (Call.get ["receipts", sha])
+  let items := jarr (jobj j "items")
+  printTable #["#", "qty", "line", "amount"]
+    ((Array.range items.size).map fun i =>
+      let it := items[i]!
+      #[toString (i + 1), jstr it "qty", Str.clamp (jstr it "description") 44,
+        jstr (jobj it "amount") "text"])
+    (rightAlign := #[0, 1, 3])
+  let left := jstr (jobj j "headroom") "text"
+  if !left.isEmpty then
+    IO.println s!"\n{left} of {jstr (jobj j "total") "text"} is not on any line."
+
+/-- Handler for `receipt items`: shows the priced lines read off a receipt. -/
+def runReceiptItems (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let sha := argStr p "sha"
+  let j ← b.json (Call.get ["receipts", sha, "items"])
+  if (jarr j).isEmpty then
+    IO.println "no lines were read off this receipt; run 'resources receipt scan' on it first"
+    return
+  showItems b sha
+
+/-- Handler for `receipt item-add`: adds a line a scan could not read. -/
+def runReceiptItemAdd (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let sha := argStr p "sha"
+  let body := Json.mkObj [
+    ("description", Json.str (argStr p "description")),
+    ("total", Json.str (argStr p "amount"))]
+  let body := match (flagStr? p "qty").bind (·.toInt?) with
+    | some q => body.setObjVal! "qty" (Json.num (JsonNumber.fromInt q))
+    | none => body
+  let _ ← b.json (Call.post ["receipts", sha, "items"] body)
+  showItems b sha
+
+/-- Handler for `receipt item-rm`: drops a line by its position. -/
+def runReceiptItemRm (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let sha := argStr p "sha"
+  let _ ← b.json (Call.delete ["receipts", sha, "items", argStr p "line"])
+  showItems b sha
+
+/--
+Handler for `tx divide`: divides a payment into the things it paid for.
+
+The groups are written as `1+2=Account` rather than with commas, because the
+flag itself is comma separated and a line list inside one would be ambiguous.
+-/
+def runTxDivide (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let specs := flagList p "group"
+  if specs.isEmpty then
+    throw <| IO.userError
+      "say which lines go together, e.g. --group 1+2=Expenses.Food.EatingOut"
+  let mut groups : Array Json := #[]
+  for spec in specs do
+    match spec.splitOn "=" with
+    | [lhs, into] =>
+      -- `3` is all of line 3; `3:10` is ten of what line 3 covers.
+      let shares := (lhs.splitOn "+").filterMap fun tok =>
+        match tok.trimAscii.toString.splitOn ":" with
+        | [n] => n.toNat?.map fun i =>
+            Json.mkObj [("line", Json.num (JsonNumber.fromInt (Int.ofNat i)))]
+        | [n, q] => do
+            let i ← n.toNat?
+            let k ← q.toNat?
+            some (Json.mkObj [("line", Json.num (JsonNumber.fromInt (Int.ofNat i))),
+                              ("qty", Json.num (JsonNumber.fromInt (Int.ofNat k)))])
+        | _ => none
+      if shares.isEmpty then throw <| IO.userError s!"no line numbers in '{spec}'"
+      if into.trimAscii.toString.isEmpty then
+        throw <| IO.userError s!"no account in '{spec}'"
+      groups := groups.push (Json.mkObj [
+        ("items", Json.arr shares.toArray),
+        ("into", Json.str into.trimAscii.toString)])
+    | _ => throw <| IO.userError s!"expected lines=account, got '{spec}'"
+  let j ← b.json (Call.post ["transactions", argStr p "id", "divide"]
+    (Json.mkObj [("groups", Json.arr groups)]))
+  for t in jarr j do
+    IO.println s!"{jstr t "id"}  {jstr t "date"}  {headlineAmount t}  {jstr t "narration"}"
+
 /-- Handler for `receipt cash`: turns a receipt into the cash transaction it stands for. -/
 def runReceiptCash (p : Parsed) : IO UInt32 := withBackend fun b => do
   let j ← b.json (Call.post ["receipts", argStr p "sha", "cash"] (Json.mkObj [

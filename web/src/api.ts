@@ -8,6 +8,7 @@ import type {
   Invoice,
   Label,
   Party,
+  LineItem,
   Revision,
   Rule,
   Budget,
@@ -428,6 +429,25 @@ export const api = {
       'GET',
       'receipts/proposals',
     ),
+  receiptItems: (sha: string) => request<LineItem[]>('GET', `receipts/${sha}/items`),
+  receipt: (sha: string) =>
+    request<{
+      sha256: string
+      total: Amount | null
+      headroom: Amount | null
+      items: LineItem[]
+    }>('GET', `receipts/${sha}`),
+  addReceiptItem: (sha: string, body: { description: string; qty?: number; total: string }) =>
+    request<LineItem[]>('POST', `receipts/${sha}/items`, { body }),
+  removeReceiptItem: (sha: string, line: number) =>
+    request<LineItem[]>('DELETE', `receipts/${sha}/items/${line}`),
+  divideTransaction: (
+    id: string,
+    groups: { items: { line: number; qty?: number }[]; into: string }[],
+  ) =>
+    request<Transaction[]>('POST', `transactions/${id}/divide`, {
+      body: { groups },
+    }),
   receiptToCash: (sha: string, from: string, into: string) =>
     request<Transaction>('POST', `receipts/${sha}/cash`, {
       body: { from, into },

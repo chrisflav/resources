@@ -545,6 +545,27 @@ def handle (ctx : Ctx) (caller : Caller) (r : Req) : IO Reply := do
     let sha := (j.getObjValAs? String "sha256").toOption.getD ""
     Blobs.attach ctx ⟨id⟩ sha
     ok (Json.mkObj [("txn", id), ("sha256", sha)])
+  | "POST", ["transactions", id, "divide"] => do
+    needs .write
+    let j ← bodyJson r.body
+    -- A share is either a bare line number, meaning all of that line, or an
+    -- object saying how many of its units to take.
+    let share? (x : Json) : Option Receipts.ItemShare :=
+      match x.getNat?.toOption with
+      | some n => some { line := n }
+      | none => (x.getObjValAs? Nat "line").toOption.map fun n =>
+          { line := n, qty := (x.getObjValAs? Nat "qty").toOption }
+    let groups := match (j.getObjVal? "groups").toOption with
+      | some (.arr xs) => xs.toList.filterMap fun g =>
+          match (g.getObjVal? "items").toOption with
+          | some (.arr is) =>
+            some { items := is.toList.filterMap share?
+                   into := (g.getObjValAs? String "into").toOption.getD "" : Receipts.ItemGroup }
+          | _ => none
+      | _ => []
+    let parts ← Receipts.divideByItems ctx ⟨id⟩ groups caller.actor
+    let env ← Wire.NameEnv.load ctx
+    ok (Json.arr (parts.map (Wire.txnJson env)))
   | "DELETE", ["transactions", id, "attachments", sha] => do
     needs .write
     Blobs.detach ctx ⟨id⟩ sha
@@ -708,7 +729,25 @@ def handle (ctx : Ctx) (caller : Caller) (r : Req) : IO Reply := do
       ("sha256", sha), ("merchant", jopt e.merchant),
       ("date", jopt (e.date.map (·.toIso))),
       ("total", match e.total with | some a => Wire.amountJson a | none => Json.null),
-      ("extractor", e.extractor), ("textLength", jint e.rawText.length)])
+      ("extractor", e.extractor), ("textLength", jint e.rawText.length),
+      ("items", Json.arr (e.items.map Wire.lineItemJson).toArray)])
+  | "GET", ["receipts", sha, "items"] => do
+    needs .read
+    ok (Json.arr ((← Receipts.items ctx sha).map Wire.lineItemJson))
+  | "POST", ["receipts", sha, "items"] => do
+    needs .write
+    let j ← bodyJson r.body
+    let amount := match (j.getObjValAs? Int "totalMinor").toOption with
+      | some m => toString m
+      | none => (j.getObjValAs? String "total").toOption.getD ""
+    let _ ← Receipts.addItem ctx sha
+      ((j.getObjValAs? String "description").toOption.getD "")
+      ((j.getObjValAs? Int "qty").toOption) amount
+    ok (Json.arr ((← Receipts.items ctx sha).map Wire.lineItemJson))
+  | "DELETE", ["receipts", sha, "items", n] => do
+    needs .write
+    let _ ← Receipts.removeItem ctx sha (n.toNat?.getD 0)
+    ok (Json.arr ((← Receipts.items ctx sha).map Wire.lineItemJson))
   | "GET", ["receipts", "proposals"] => do
     needs .read
     let env ← Wire.NameEnv.load ctx
@@ -723,6 +762,20 @@ def handle (ctx : Ctx) (caller : Caller) (r : Req) : IO Reply := do
       ((j.getObjValAs? String "into").toOption.getD "Expenses.Unclassified")
       caller.actor
     created (Wire.txnJson (← Wire.NameEnv.load ctx) t)
+
+  -- After `receipts/proposals`, so that the literal route is not swallowed here.
+  | "GET", ["receipts", sha] => do
+    needs .read
+    let its ← Receipts.items ctx sha
+    ok (Json.mkObj [
+      ("sha256", sha),
+      ("total", match ← Receipts.total? ctx sha with
+                | some a => Wire.amountJson a
+                | none => Json.null),
+      ("headroom", match ← Receipts.headroom ctx sha with
+                   | some a => Wire.amountJson a
+                   | none => Json.null),
+      ("items", Json.arr (its.map Wire.lineItemJson))])
 
   /- ## Rules -/
   | "GET", ["rules"] => do

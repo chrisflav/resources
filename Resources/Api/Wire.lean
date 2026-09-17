@@ -1,6 +1,7 @@
 import Resources.Import.Staging
 import Resources.Invoice.Render
 import Resources.Store.Blob
+import Resources.Store.Receipts
 import Resources.Store.Tokens
 
 /-!
@@ -157,6 +158,12 @@ def batchJson (b : ImportBatch) : Json :=
 def attachmentJson (a : Attachment) : Json :=
   Json.mkObj [("sha256", a.sha256), ("mime", a.mime), ("bytes", jint a.bytes),
               ("origName", jopt a.origName), ("createdAt", a.createdAt)]
+
+/-- One priced line read off a receipt. -/
+def lineItemJson (i : LineItem) : Json :=
+  Json.mkObj [("description", i.description),
+              ("qty", match i.qty with | some q => jint q | none => Json.null),
+              ("amount", amountJson i.amount)]
 
 /-- A rule. -/
 def ruleJson (r : Rule) : Json :=
