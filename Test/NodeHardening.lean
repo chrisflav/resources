@@ -578,7 +578,9 @@ def nodeHardeningTests (r : Report) : IO Report := do
       VALUES ('tok-1', 'a link', 'h', 1, 'x', 'p-bo', 'b-hut')"
     r := checkEq r "a store written before the five rebuilds stops one short of them"
       (← Schema.currentVersion pre) 25
-    r := checkEq r "and all five run when it is opened" (← Schema.migrate pre) 5
+    -- The five, and whatever has been appended since they shipped.
+    r := checkEq r "and all five run when it is opened"
+      (← Schema.migrate pre) (Schema.targetVersion - 25)
     r := checkEq r "leaving it at the version this binary expects"
       (← Schema.currentVersion pre) Schema.targetVersion
     r := checkEq r "a party comes through the rebuild with every column it had"

@@ -94,7 +94,8 @@ private def txn : Transaction :=
     state := .pending,
     postings := [posting, { account := ⟨"acc-food"⟩, amount := ⟨eur, 4990⟩ }],
     labels := [⟨"lab-trip"⟩], source := .imported ⟨"batch-7"⟩ "fp-abc",
-    attachments := ["sha-1", "sha-2"] }
+    attachments := ["sha-1", "sha-2"],
+    items := some [{ description := "half of dinner", qty := some 1, amount := ⟨eur, 4990⟩ }] }
 
 private def filter : Filter :=
   .and (.or (.account "Assets") (.not (.label "private")))
@@ -284,6 +285,11 @@ def encodeTests (r : Report) : Report := Id.run do
   r := trip r "Provenance derived" (Provenance.derived ⟨"rule-1"⟩)
   r := trip r "TxnState" TxnState.pending
   r := trip r "Transaction" txn
+  -- The three answers a transaction can give about what it paid for, which the
+  -- bytes have to keep apart: these lines, no printed line at all, and nothing
+  -- said either way.
+  r := trip r "Transaction paying for no printed line" { txn with items := some [] }
+  r := trip r "Transaction that was never divided" { txn with items := none }
 
   /- ## Filters -/
   r := trip r "Filter all" Filter.all

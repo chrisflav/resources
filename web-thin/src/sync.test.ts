@@ -112,6 +112,7 @@ const cost: Transaction = {
   labels: [],
   source: { kind: 'manual', actor: 'test' },
   attachments: [],
+  items: null,
 }
 
 const putCost: Op = { tag: 15, kind: 'putTransaction', txn: cost }

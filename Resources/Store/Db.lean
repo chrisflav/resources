@@ -1020,6 +1020,32 @@ INSERT INTO invoice_source (invoice_id, txn_id, idx)
 DROP TABLE invoice_rebuild;
 DROP TABLE invoice_line_rebuild;
 DROP TABLE invoice_source_rebuild;
+"),
+  (31, "
+-- Which of a receipt's printed lines a transaction paid for.
+--
+-- Dividing a bill by its lines leaves several transactions hanging on the same
+-- page, and each of them paid for only some of what it says: the parts what
+-- they claimed, the remainder what they left. The lines stay on the receipt as
+-- read -- that is a fact about the paper -- and what each transaction took is
+-- written here.
+--
+-- `items_known` is the difference between a transaction nothing has been said
+-- about, which paid for whatever its receipt says and all of it, and a
+-- remainder whose siblings claimed every printed line and which therefore paid
+-- for nothing that was printed. Both have no rows here, and without the flag a
+-- further division of the second would be offered the lines the first one
+-- already spent.
+CREATE TABLE txn_item (
+  txn_id TEXT NOT NULL REFERENCES txn(id) ON DELETE CASCADE,
+  idx INTEGER NOT NULL,
+  description TEXT NOT NULL,
+  qty INTEGER,
+  minor INTEGER NOT NULL,
+  commodity TEXT NOT NULL,
+  PRIMARY KEY (txn_id, idx));
+
+ALTER TABLE txn ADD COLUMN items_known INTEGER NOT NULL DEFAULT 0;
 ")
 ]
 

@@ -184,6 +184,11 @@ export function mergeWith(t: Transaction, u: Transaction): Transaction {
     postings: [...t.postings, ...u.postings],
     labels: [...t.labels, ...u.labels.filter((l) => !t.labels.includes(l))],
     attachments: [...t.attachments, ...u.attachments.filter((a) => !t.attachments.includes(a))],
+    // Both sides' receipts come along, so both sides' lines do. One side that
+    // says nothing specific — that it paid for all of whatever its receipt says
+    // — makes the merge say nothing specific either, because the lines it would
+    // have to name are the ones that were never written down.
+    items: t.items === null || u.items === null ? null : [...t.items, ...u.items],
   }
 }
 

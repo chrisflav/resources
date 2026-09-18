@@ -64,6 +64,7 @@ export interface Transaction {
   date: string
   headline: Headline | null
   id: string
+  items: LineItem[] | null
   labels: string[]
   narration: string
   origins: string[]

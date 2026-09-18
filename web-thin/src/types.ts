@@ -118,6 +118,17 @@ export interface Transaction {
   labels: string[]
   source: Provenance
   attachments: string[]
+  /**
+   * Which of the lines printed on its receipt this transaction paid for.
+   *
+   * `null` is a transaction that has never been divided: whatever its receipt
+   * says, it paid for all of it. A part of a division says what it took and the
+   * remainder what the parts left, because after the division the receipt is
+   * still one page and each part is only some of it. `[]` is therefore a real
+   * answer: a remainder that keeps a service charge no line covers paid for
+   * nothing that was printed.
+   */
+  items: LineItem[] | null
 }
 
 /** `Resources.Filter`, tagged in declaration order. */

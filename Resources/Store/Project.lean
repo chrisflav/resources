@@ -38,16 +38,18 @@ statement that cannot go stale.
 def writeTxn (db : SQLite) (t : Transaction) : IO Unit := do
   let now ← nowStamp
   Db.exec db
-    s!"INSERT INTO txn (id, date, payee, narration, state, source, created_at, updated_at)
+    s!"INSERT INTO txn (id, date, payee, narration, state, source, items_known,
+                        created_at, updated_at)
     VALUES ({Db.lit t.id.val}, {Db.lit t.date.toIso}, {Db.litOpt t.payee},
             {Db.lit t.narration}, {Db.lit t.state.toString}, {Db.lit t.source.encode},
-            {Db.lit now}, {Db.lit now})
+            {if t.items.isSome then 1 else 0}, {Db.lit now}, {Db.lit now})
     ON CONFLICT(id) DO UPDATE SET date = excluded.date, payee = excluded.payee,
       narration = excluded.narration, state = excluded.state, source = excluded.source,
-      updated_at = excluded.updated_at"
+      items_known = excluded.items_known, updated_at = excluded.updated_at"
   Db.exec db s!"DELETE FROM posting_all WHERE txn_id = {Db.lit t.id.val}"
   Db.exec db s!"DELETE FROM txn_label WHERE txn_id = {Db.lit t.id.val}"
   Db.exec db s!"DELETE FROM txn_attachment WHERE txn_id = {Db.lit t.id.val}"
+  Db.exec db s!"DELETE FROM txn_item WHERE txn_id = {Db.lit t.id.val}"
   for (p, i) in t.postings.zipIdx do
     Db.exec db s!"INSERT INTO posting_all
       (txn_id, idx, account_id, minor, commodity, party_id, note, origin, tag)
@@ -60,6 +62,11 @@ def writeTxn (db : SQLite) (t : Transaction) : IO Unit := do
   for (a, i) in t.attachments.zipIdx do
     Db.exec db s!"INSERT OR IGNORE INTO txn_attachment (txn_id, sha256, idx)
                   VALUES ({Db.lit t.id.val}, {Db.lit a}, {i})"
+  for (it, i) in (t.items.getD []).zipIdx do
+    Db.exec db s!"INSERT INTO txn_item (txn_id, idx, description, qty, minor, commodity)
+                  VALUES ({Db.lit t.id.val}, {i}, {Db.lit it.description},
+                          {(it.qty.map toString).getD "NULL"}, {it.amount.minor},
+                          {Db.lit it.amount.commodity.code})"
 
 /-! ## The rest of the entities -/
 
@@ -282,7 +289,7 @@ which throws the projection away and computes it again, and the pull path, which
 does the same thing when an event carries a whole state.
 -/
 def projected : List String :=
-  ["txn_label", "txn_attachment", "posting_all", "txn", "invoice_line", "invoice_source",
+  ["txn_label", "txn_attachment", "txn_item", "posting_all", "txn", "invoice_line", "invoice_source",
    "invoice", "budget_participant", "budget", "attachment_item", "attachment",
    "realm_member", "member", "rule", "trip", "party_group", "label", "account", "party",
    "realm", "counter"]

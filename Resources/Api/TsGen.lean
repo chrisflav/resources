@@ -165,7 +165,8 @@ def module : String :=
       (((Wire.txnJson sampleEnv sampleTxn).getObjVal? "headline").toOption.getD Json.null)
       [("amount", "Amount")],
     interfaceOf "Transaction" (Wire.txnJson sampleEnv sampleTxn)
-      [("postings", "Posting[]"), ("headline", "Headline | null")],
+      [("postings", "Posting[]"), ("headline", "Headline | null"),
+       ("items", "LineItem[] | null")],
     interfaceOf "TransactionPage" samplePage [("items", "Transaction[]")],
     interfaceOf "Balance"
       (Wire.balanceJson { account := "Assets", commodity := "EUR", minor := 0 }),

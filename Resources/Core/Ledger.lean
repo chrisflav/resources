@@ -301,6 +301,19 @@ instance : FromJson TxnState := ⟨fun j => do
 
 end TxnState
 
+/--
+One priced line printed on a receipt.
+
+Amounts are signed: a till prints a correction as a negative line, and dropping
+the sign would make the lines add up to something that was never charged.
+-/
+structure LineItem where
+  description : String
+  /-- How many, when the line opens with a count. -/
+  qty : Option Int := none
+  amount : Amount
+  deriving Repr, Inhabited, ToJson, FromJson
+
 /-- A dated, balanced set of postings. -/
 structure Transaction where
   id : TxId
@@ -320,6 +333,18 @@ structure Transaction where
   source : Provenance := .manual "system"
   /-- Attached receipts, by content hash. -/
   attachments : List String := []
+  /--
+  Which of the lines printed on its receipt this transaction paid for.
+
+  `none` is a transaction that has never been divided: whatever its receipt
+  says, it paid for all of it. A part of a division says what it took, and the
+  remainder says what the parts left, because after the division the receipt is
+  still one page and each part is only some of it — listing the whole bill
+  against every part would misdescribe all of them, and would offer the same
+  line to a second division. `some []` is therefore a real answer: a remainder
+  that keeps a service charge no line covers paid for nothing that was printed.
+  -/
+  items : Option (List LineItem) := none
   deriving Repr, Inhabited, ToJson, FromJson
 
 /-! ## Balance -/
@@ -421,7 +446,14 @@ def mergeWith (t u : Transaction) : Transaction :=
   { t with
     postings := t.postings ++ u.postings
     labels := t.labels ++ u.labels.filter (fun l => !t.labels.contains l)
-    attachments := t.attachments ++ u.attachments.filter (fun a => !t.attachments.contains a) }
+    attachments := t.attachments ++ u.attachments.filter (fun a => !t.attachments.contains a)
+    -- Both sides' receipts come along, so both sides' lines do. One side that
+    -- says nothing specific — that it paid for all of whatever its receipt says
+    -- — makes the merge say nothing specific either, because the lines it would
+    -- have to name are the ones that were never written down.
+    items := match t.items, u.items with
+      | some a, some b => some (a ++ b)
+      | _, _ => none }
 
 @[simp] theorem net_mergeWith (t u : Transaction) (c : String) :
     (t.mergeWith u).net c = t.net c + u.net c := by

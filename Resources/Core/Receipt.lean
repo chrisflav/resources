@@ -7,6 +7,10 @@ A stored file, what was read off it, and the ways its printed lines can be
 divided. None of this needs the filesystem: the bytes live in the blob store and
 the rows live in SQLite, but what a receipt *says* is a value, and dividing a
 payment by the lines on its receipt is arithmetic over that value.
+
+`LineItem`, the priced line itself, lives with the ledger rather than here: a
+transaction carries the lines it paid for, so the type has to be in scope where
+a transaction is defined.
 -/
 
 namespace Resources
@@ -41,19 +45,6 @@ structure Attachment where
   /-- The per-blob key sealed under a realm key; see above for its framing. -/
   wrappedKey : Option String := none
   deriving Repr, Inhabited, Lean.ToJson
-
-/--
-One priced line printed on a receipt.
-
-Amounts are signed: a till prints a correction as a negative line, and dropping
-the sign would make the lines add up to something that was never charged.
--/
-structure LineItem where
-  description : String
-  /-- How many, when the line opens with a count. -/
-  qty : Option Int := none
-  amount : Amount
-  deriving Repr, Inhabited
 
 /-- What was read off a scanned receipt. -/
 structure Extracted where

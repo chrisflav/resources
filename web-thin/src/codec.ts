@@ -631,6 +631,7 @@ export const transactionCodec: Codec<Transaction> = {
     w.list(t.labels, (w2, s) => w2.str(s))
     provenanceCodec.write(w, t.source)
     w.list(t.attachments, (w2, s) => w2.str(s))
+    w.option(t.items, (w2, its) => w2.list(its, (w3, l) => lineItemCodec.write(w3, l)))
   },
   read(r) {
     return {
@@ -643,9 +644,13 @@ export const transactionCodec: Codec<Transaction> = {
       labels: r.list((r2) => r2.str()),
       source: provenanceCodec.read(r),
       attachments: r.list((r2) => r2.str()),
+      items: r.option((r2) => r2.list((r3) => lineItemCodec.read(r3))),
     }
   },
-  wf: (t) => dateInRange(t.date) && t.postings.every((p) => amountInRange(p.amount)),
+  wf: (t) =>
+    dateInRange(t.date) &&
+    t.postings.every((p) => amountInRange(p.amount)) &&
+    (t.items ?? []).every((l) => amountInRange(l.amount)),
 }
 
 /* ------------------------------------------------------------------ */

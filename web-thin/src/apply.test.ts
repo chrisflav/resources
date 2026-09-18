@@ -59,6 +59,7 @@ function txn(id: string, payee: string, postings: Posting[]): Transaction {
     labels: [],
     source: { kind: 'manual', actor: 'test' },
     attachments: [],
+    items: null,
   }
 }
 

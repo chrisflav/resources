@@ -1296,6 +1296,19 @@ private def divideTests (ctx : Ctx) (r : Report) : IO Report := do
     ((parts.map (fun t => netIn t cash.id)).foldl (· + ·) 0) (-64200)
   r := check r "the receipt rides along on every part"
     (parts.all (fun t => t.attachments == [sha]))
+  -- The page is one page and each part is only some of it, so each says which
+  -- lines it paid for rather than repeating the whole bill.
+  r := checkEq r "a part lists the lines it claimed and no others"
+    ((parts[0]?).bind (·.items) |>.map (fun its => its.map (·.description)))
+    (some ["Haslikuchen", "Hüttewurst mit Brot"])
+  r := checkEq r "a part's lines come to what the part books"
+    ((parts[0]?).bind (·.items) |>.map (fun its => (its.map (·.amount.minor)).sum))
+    (some 2100)
+  r := checkEq r "the remainder lists only what the parts left"
+    ((parts[1]?).bind (·.items) |>.map (fun its => its.map (·.description)))
+    (some ["Panaché 0,5"])
+  r := checkEq r "a whole line is kept as the till printed it"
+    ((parts[0]?).bind (·.items) |>.bind (fun its => (its[0]?).bind (·.qty))) (some 2)
   r := check r "the payment it was divided from is gone"
     ((← Txns.get? ctx ⟨id⟩)).isNone
   -- Read the parts back rather than trusting what came out of the call: a part
@@ -1316,6 +1329,29 @@ private def divideTests (ctx : Ctx) (r : Report) : IO Report := do
     pure false
   catch _ => pure true
   r := check r "a single-unit line cannot be claimed twice" twice
+  -- The part took lines 1 and 3 of the receipt and holds two lines of its own,
+  -- so dividing it again is a division of those two: the third line is the
+  -- remainder's, and offering it here would book the same money twice.
+  let beyond ← try
+    let _ ← Receipts.divideByItems ctx (parts[0]!).id
+      [{ items := [{ line := 3 }], into := "Expenses.Hut.Food" }] "test"
+    pure false
+  catch _ => pure true
+  r := check r "a part cannot be divided by a line that went to its sibling" beyond
+  let again ← Receipts.divideByItems ctx (parts[0]!).id
+    [{ items := [{ line := 2 }], into := "Expenses.Hut.Beer" }] "test"
+  let beer ← Accounts.ensure ctx "Expenses.Hut.Beer" (kind := some .expense)
+  r := checkEq r "dividing a part again divides its own lines"
+    ((again[0]?).map (fun t => netIn t beer.id)) (some 900)
+  r := checkEq r "what that part is left with is its other line"
+    ((again[1]?).bind (·.items) |>.map (fun its => its.map (·.description)))
+    (some ["Haslikuchen"])
+  -- ...and it is called that, rather than keeping a list its sibling has since
+  -- taken half of.
+  r := checkEq r "the remainder of a part is named by the lines it keeps"
+    ((again[1]?).map (·.narration)) (some "Haslikuchen")
+  r := checkEq r "the remainder of a payment keeps the payment's own words"
+    ((parts[1]?).map (·.narration)) (some "cash receipt")
   let tooMuch ← try
     let _ ← Receipts.divideByItems ctx (parts[1]!).id
       [{ items := [{ line := 9 }], into := "Expenses.Hut.Food" }] "test"
@@ -1392,6 +1428,14 @@ private def divideTests (ctx : Ctx) (r : Report) : IO Report := do
   r := checkEq r "claiming every unit leaves no remainder" split.size 2
   r := checkEq r "the narration says how many units it took"
     ((split[0]?).map (·.narration)) (some "10 × FORFAIT 1/2 PENSION, 1 × TAXE DE SEJOUR")
+  -- A line taken in part is listed as the units taken, priced at what they cost,
+  -- so the lines of a part still add up to the part.
+  r := checkEq r "a part of a line is listed as the units it took"
+    ((split[0]?).bind (·.items) |>.map (fun its => its.map (fun i => (i.qty, i.amount.minor))))
+    (some [(some 10, 68000), (some 1, 3333)])
+  r := checkEq r "the other part is listed as the units it was left"
+    ((split[1]?).bind (·.items) |>.map (fun its => its.map (fun i => (i.qty, i.amount.minor))))
+    (some [(some 8, 54400), (some 2, 6667)])
   let overclaim ← try
     let _ ← Receipts.divideByItems ctx (split[0]!).id
       [{ items := [{ line := 1, qty := some 99 }], into := "Expenses.Bunk.Mine" }] "test"

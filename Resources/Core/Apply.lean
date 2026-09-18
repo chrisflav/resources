@@ -242,6 +242,16 @@ def boundedList {α : Type} (what : String) (xs : List α) (limit : Nat := maxPa
     Except String Unit :=
   if xs.length > limit then .error s!"{what}: at most {limit} are allowed" else .ok ()
 
+/-- The lines printed on a receipt, bounded, quantities included. -/
+def boundedItems (items : List LineItem) : Except String Unit := do
+  boundedList "a receipt's lines" items maxLines
+  for i in items do
+    boundedText "a line's description" i.description
+    boundedAmount i.amount
+    match i.qty with
+    | some q => if q.natAbs > maxQty then throw s!"a line covers at most {maxQty} units"
+    | none => pure ()
+
 /-- Everything a transaction carries, bounded. -/
 def boundedTxn (t : Transaction) : Except String Unit := do
   boundedList "a transaction's postings" t.postings maxPostings
@@ -251,6 +261,9 @@ def boundedTxn (t : Transaction) : Except String Unit := do
   boundedText? "a payee" t.payee
   boundedList "a transaction's labels" t.labels
   boundedList "a transaction's attachments" t.attachments
+  match t.items with
+  | some its => boundedItems its
+  | none => pure ()
   for l in t.labels do
     boundedName "a label id" l.val
   for a in t.attachments do
@@ -286,16 +299,6 @@ def boundedParticipants (among : List Participant) : Except String Unit := do
   -- sum is bounded as well as each of them.
   if (among.map (fun p => max p.weight 1)).sum > maxParts then
     throw s!"the weights of a division add up to more than {maxParts}"
-
-/-- The lines printed on a receipt, bounded, quantities included. -/
-def boundedItems (items : List LineItem) : Except String Unit := do
-  boundedList "a receipt's lines" items maxLines
-  for i in items do
-    boundedText "a line's description" i.description
-    boundedAmount i.amount
-    match i.qty with
-    | some q => if q.natAbs > maxQty then throw s!"a line covers at most {maxQty} units"
-    | none => pure ()
 
 /--
 Everything an operation carries, bounded: the one place a size is refused.
@@ -827,21 +830,28 @@ def divideUp (s : State) (author : MemberId) (realm : RealmId) (b : Budget)
 /--
 The parts a payment divides into, as the lines printed on its receipt group them.
 
-All of it is arithmetic over the receipt and the payment: no line may be claimed
+All of it is arithmetic over the lines and the payment: no line may be claimed
 for more than it covers, the lines have to be priced in the currency the payment
 moved, and what no group claimed stays where it was. Nothing here touches the
 state — the parts are handed to `replaceParts`, which is what writes them — so a
 division that cannot be carried out is a sentence rather than a half-written
 ledger.
+
+`printed` is what the payment is divisible by: the lines read off its receipt,
+or, when it is itself a part of an earlier division, the shorter list that part
+was left with. Every part carries away the lines it claimed, and the remainder
+the units they left, so no line is ever offered twice — the receipt itself is
+untouched, because what it says is a fact about the paper rather than about who
+ended up paying for which half of it.
 -/
-def itemParts (t : Transaction) (blob : BlobState) (groups : List Receipts.ItemGroup)
+def itemParts (t : Transaction) (printed : List LineItem) (groups : List Receipts.ItemGroup)
     (newIds : List TxId) : Except String (List Transaction) := do
-  let lines := blob.items.toArray
+  let lines := printed.toArray
   if lines.isEmpty then
     throw "no lines were read off that receipt; run 'resources receipt scan' on it first"
   -- A line's printed quantity is what its total is cut into, and a receipt filed
   -- before these bounds existed can carry any number at all.
-  for l in blob.items do
+  for l in printed do
     match l.qty with
     | some q => if q.natAbs > maxQty then
         throw s!"a line covering {q} units is more than a receipt prints; at most {maxQty}"
@@ -850,6 +860,17 @@ def itemParts (t : Transaction) (blob : BlobState) (groups : List Receipts.ItemG
   let code := commodity.code
   -- How many units a line covers.
   let unitsOf (n : Nat) : Nat := max 1 (((lines[n - 1]!).qty.map Int.natAbs).getD 1)
+  -- Some of a line, as a line of its own: what it is called, how many of its
+  -- units these are, and exactly the money carved for them. All of it is the
+  -- line as printed, count and all, because a part that took everything a line
+  -- covers paid for precisely what the bill says. A count a till printed
+  -- negative stays negative: a correction taken in part is still a correction.
+  let shareLine (n : Nat) (want : Nat) (amount : Int) : LineItem :=
+    let line := lines[n - 1]!
+    if want == unitsOf n then line
+    else
+      let count : Int := if (line.qty.getD 1) < 0 then -(want : Int) else (want : Int)
+      { line with qty := some count, amount := ⟨commodity, amount⟩ }
   -- Check the whole division before writing any of it: no line may be claimed
   -- for more than it covers, or the same money would be booked twice and the
   -- remainder would absorb the difference in silence.
@@ -918,16 +939,20 @@ def itemParts (t : Transaction) (blob : BlobState) (groups : List Receipts.ItemG
   for (g, gi) in groups.zipIdx do
     let mut amount : Int := 0
     let mut names : List String := []
+    let mut mine : List LineItem := []
     for sh in g.items do
       let units := unitsOf sh.line
       let from_ := cursor[sh.line - 1]!
       let want := sh.qty.getD (units - from_)
       let cut := (cuts[sh.line - 1]!).getD #[]
+      let mut share : Int := 0
       for k in [from_ : from_ + want] do
-        amount := amount + cut[k]!
+        share := share + cut[k]!
+      amount := amount + share
       cursor := cursor.set! (sh.line - 1) (from_ + want)
       let desc := (lines[sh.line - 1]!).description
       names := names ++ [if want == units then desc else s!"{want} × {desc}"]
+      mine := mine ++ [shareLine sh.line want share]
     let some nid := newIds[gi]?
       | throw s!"dividing this needs {groups.length + 1} new ids, and \
                  {newIds.length} were given"
@@ -935,6 +960,7 @@ def itemParts (t : Transaction) (blob : BlobState) (groups : List Receipts.ItemG
     parts := parts ++ [{ t with
       id := nid
       narration := String.intercalate ", " names
+      items := some mine
       postings :=
         [{ srcPost with amount := ⟨commodity, -amount⟩ },
          { dstPost with account := ⟨g.into⟩, amount := ⟨commodity, amount⟩ }] }]
@@ -946,12 +972,38 @@ def itemParts (t : Transaction) (blob : BlobState) (groups : List Receipts.ItemG
     if i == srcIdx then { p with amount := ⟨commodity, p.amount.minor + carved⟩ }
     else if i == dstIdx then { p with amount := ⟨commodity, p.amount.minor - carved⟩ }
     else p)
+  -- ...and so do the lines: one nobody claimed as it was printed, one claimed in
+  -- part shrunk to the units still on it, and one claimed in full gone
+  -- altogether. A remainder listing the whole bill would offer a second division
+  -- the lines the first one already spent.
+  let mut left : List LineItem := []
+  let mut leftNames : List String := []
+  for n in [1 : lines.size + 1] do
+    let units := unitsOf n
+    let from_ := cursor[n - 1]!
+    let desc := (lines[n - 1]!).description
+    if from_ == 0 then
+      left := left ++ [lines[n - 1]!]
+      leftNames := leftNames ++ [desc]
+    else if from_ < units then
+      let cut := (cuts[n - 1]!).getD #[]
+      let mut over : Int := 0
+      for k in [from_ : units] do
+        over := over + cut[k]!
+      left := left ++ [shareLine n (units - from_) over]
+      leftNames := leftNames ++ [s!"{units - from_} × {desc}"]
   -- When the lines account for the whole payment there is nothing left to keep.
   if rest.any (fun p => p.amount.minor != 0) then
     let some rid := newIds[groups.length]?
       | throw s!"dividing this needs {groups.length + 1} new ids, and \
                  {newIds.length} were given"
-    parts := parts ++ [{ t with id := rid, postings := rest }]
+    -- What the remainder is called. A payment's own words are the payment's —
+    -- "cash receipt", the payee, whatever the bank said — and they still
+    -- describe what is left of it. A part's are a list the last division wrote,
+    -- and a list still naming what has gone to the siblings describes the wrong
+    -- money, so a part's remainder is named the way a part is: by its lines.
+    let narration := if t.items.isSome then String.intercalate ", " leftNames else t.narration
+    parts := parts ++ [{ t with id := rid, narration, postings := rest, items := some left }]
   return parts
 
 /-! ## Claims
@@ -1312,10 +1364,20 @@ def applyChecked (s : State) (author : MemberId) (realm : RealmId) (op : Op) :
     if groups.isEmpty then
       throw "say which lines go together: --group 1+2=Account"
     let t ← txnOf s id
-    let some sha := t.attachments.head?
-      | throw "this transaction has no receipt to take lines from"
-    let some blob := s.blob? sha | throw s!"no such receipt: {sha}"
-    let parts ← itemParts t blob groups newIds
+    -- A part of an earlier division is divided by what it was left with, not by
+    -- the receipt: the lines its siblings took are theirs, and reading the page
+    -- again would sell them twice. Everything else is divided by the page.
+    let printed ← match t.items with
+      | some [] =>
+        throw "every line on that receipt already belongs to one of the parts this was \
+               divided into; there is nothing left here to divide"
+      | some its => pure its
+      | none => do
+        let some sha := t.attachments.head?
+          | throw "this transaction has no receipt to take lines from"
+        let some blob := s.blob? sha | throw s!"no such receipt: {sha}"
+        pure blob.items
+    let parts ← itemParts t printed groups newIds
     replaceParts s author realm id parts
   | .raiseClaim t =>
     if t.state != .pending then

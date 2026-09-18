@@ -103,6 +103,12 @@ def postingJson (e : NameEnv) (p : Posting) : Json :=
     ("party", jopt (p.party.map e.party)), ("note", jopt p.note),
     ("origin", jopt p.origin), ("tag", jopt p.tag)]
 
+/-- One priced line read off a receipt. -/
+def lineItemJson (i : LineItem) : Json :=
+  Json.mkObj [("description", i.description),
+              ("qty", match i.qty with | some q => jint q | none => Json.null),
+              ("amount", amountJson i.amount)]
+
 /--
 The line a person recognises: the net movement on the account that carries the
 money. Postings on one account are summed first, so a purchase and its fee read
@@ -125,6 +131,12 @@ def txnJson (e : NameEnv) (t : Transaction) : Json :=
     ("postings", Json.arr (t.postings.map (postingJson e)).toArray),
     ("labels", Json.arr (t.labels.map (fun l => Json.str (e.label l))).toArray),
     ("attachments", Json.arr (t.attachments.map Json.str).toArray),
+    -- What this one paid for, when it is a part of a division and so paid for
+    -- only some of the page it hangs on. Null is the ordinary case: whatever its
+    -- receipt says, all of it.
+    ("items", match t.items with
+              | some its => Json.arr (its.map lineItemJson).toArray
+              | none => Json.null),
     ("origins", Json.arr (t.origins.map Json.str).toArray),
     ("headline",
       match headline e t with
@@ -158,12 +170,6 @@ def batchJson (b : ImportBatch) : Json :=
 def attachmentJson (a : Attachment) : Json :=
   Json.mkObj [("sha256", a.sha256), ("mime", a.mime), ("bytes", jint a.bytes),
               ("origName", jopt a.origName), ("createdAt", a.createdAt)]
-
-/-- One priced line read off a receipt. -/
-def lineItemJson (i : LineItem) : Json :=
-  Json.mkObj [("description", i.description),
-              ("qty", match i.qty with | some q => jint q | none => Json.null),
-              ("amount", amountJson i.amount)]
 
 /-- A rule. -/
 def ruleJson (r : Rule) : Json :=

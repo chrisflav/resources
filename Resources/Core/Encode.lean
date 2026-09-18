@@ -270,19 +270,30 @@ instance : LawfulCodec TxnState := Codec.lawful_ofRetract (fun s => by cases s <
 
 instance : Wellformed TxnState := Wellformed.ofIso TxnState.tag
 
+-- A receipt's priced line is encoded here, ahead of the receipts below, because
+-- a transaction carries the lines it paid for and so has to be able to reach it.
+instance : Codec LineItem :=
+  Codec.ofIso
+    (fun l => (l.description, l.qty, l.amount))
+    (fun (description, qty, amount) => { description, qty, amount })
+
+instance : LawfulCodec LineItem := Codec.lawful_ofIso (fun _ => rfl)
+
+instance : Wellformed LineItem := Wellformed.ofIso (fun l => (l.description, l.qty, l.amount))
+
 instance : Codec Transaction :=
   Codec.ofIso
     (fun t => (t.id, t.date, t.payee, t.narration, t.state, t.postings, t.labels, t.source,
-      t.attachments))
-    (fun (id, date, payee, narration, state, postings, labels, source, attachments) =>
-      { id, date, payee, narration, state, postings, labels, source, attachments })
+      t.attachments, t.items))
+    (fun (id, date, payee, narration, state, postings, labels, source, attachments, items) =>
+      { id, date, payee, narration, state, postings, labels, source, attachments, items })
 
 instance : LawfulCodec Transaction := Codec.lawful_ofIso (fun _ => rfl)
 
 instance : Wellformed Transaction :=
   Wellformed.ofIso
     (fun t => (t.id, t.date, t.payee, t.narration, t.state, t.postings, t.labels, t.source,
-      t.attachments))
+      t.attachments, t.items))
 
 /-! ## Filters
 
@@ -539,15 +550,6 @@ instance : LawfulCodec Attachment := Codec.lawful_ofIso (fun _ => rfl)
 instance : Wellformed Attachment :=
   Wellformed.ofIso
     (fun a => (a.sha256, a.mime, a.bytes, a.origName, a.createdAt, a.cipherHash, a.wrappedKey))
-
-instance : Codec LineItem :=
-  Codec.ofIso
-    (fun l => (l.description, l.qty, l.amount))
-    (fun (description, qty, amount) => { description, qty, amount })
-
-instance : LawfulCodec LineItem := Codec.lawful_ofIso (fun _ => rfl)
-
-instance : Wellformed LineItem := Wellformed.ofIso (fun l => (l.description, l.qty, l.amount))
 
 instance : Codec Extracted :=
   Codec.ofIso

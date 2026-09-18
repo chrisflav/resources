@@ -57,6 +57,8 @@ private structure TxnRow where
   narration : String
   state : String
   source : String
+  /-- Whether `txn_item` is the whole answer for this one; see migration 31. -/
+  itemsKnown : Int64
   deriving Row
 
 private structure PostingRow where
@@ -73,6 +75,15 @@ private structure PostingRow where
 private structure PairRow where
   a : String
   b : String
+  deriving Row
+
+/-- A line a transaction paid for, as `txn_item` holds it. -/
+private structure TxnItemRow where
+  txnId : String
+  description : String
+  qty : Option Int64
+  minor : Int64
+  commodity : String
   deriving Row
 
 private structure BalanceRow where
@@ -399,6 +410,9 @@ private def hydrate (ctx : Ctx) (heads : Array TxnRow) : IO (Array Transaction) 
     s!"SELECT txn_id, label_id FROM txn_label WHERE txn_id IN {inList ids} ORDER BY txn_id, idx"
   let attachments ← Db.rows PairRow ctx.db
     s!"SELECT txn_id, sha256 FROM txn_attachment WHERE txn_id IN {inList ids} ORDER BY txn_id, idx"
+  let items ← Db.rows TxnItemRow ctx.db
+    s!"SELECT txn_id, description, qty, minor, commodity FROM txn_item
+       WHERE txn_id IN {inList ids} ORDER BY txn_id, idx"
   return heads.map fun h =>
     { id := ⟨h.id⟩
       date := (Date.ofIso? h.date).getD default
@@ -416,10 +430,16 @@ private def hydrate (ctx : Ctx) (heads : Array TxnRow) : IO (Array Transaction) 
                  tag := p.tag }
         else none
       labels := labels.toList.filterMap fun l => if l.a == h.id then some ⟨l.b⟩ else none
-      attachments := attachments.toList.filterMap fun a => if a.a == h.id then some a.b else none }
+      attachments := attachments.toList.filterMap fun a => if a.a == h.id then some a.b else none
+      items := if h.itemsKnown == (0 : Int64) then none
+        else some (items.toList.filterMap fun i =>
+          if i.txnId == h.id then
+            some { description := i.description, qty := i.qty.map (·.toInt)
+                   amount := ⟨Commodity.ofCode i.commodity, i.minor.toInt⟩ }
+          else none) }
 
 private def headCols : String :=
-  "SELECT t.id, t.date, t.payee, t.narration, t.state, t.source FROM txn t"
+  "SELECT t.id, t.date, t.payee, t.narration, t.state, t.source, t.items_known FROM txn t"
 
 /-- The `WHERE` fragment restricting a query to one state, or to all of them. -/
 private def stateCond : Option TxnState → String

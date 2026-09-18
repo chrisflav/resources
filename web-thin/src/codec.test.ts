@@ -173,6 +173,7 @@ const txn: Transaction = {
   labels: ['lab-trip'],
   source: { kind: 'imported', batch: 'batch-7', fingerprint: 'fp-abc' },
   attachments: ['sha-1', 'sha-2'],
+  items: [{ description: 'half of dinner', qty: 1n, amount: { commodity: eur, minor: 4990n } }],
 }
 
 const filter: Filter = {

@@ -11,13 +11,13 @@ open the receipt behind a cost that carries one.
 It is *thin* in one specific sense: the sequencer is a dumb, blind ordering
 service, so every fact on the screen is one this client worked out for itself
 from bytes it decrypted and checked. It speaks protocol version 2 (`/seq/v2`)
-and format version 6.
+and format version 7.
 
 ```
 npm ci
 npm run dev      # Vite, proxying /seq to a sequencer on 127.0.0.1:8088
 npm run build    # tsc --strict, then a production bundle
-npx vitest run   # 481 tests: byte format, arithmetic, crypto, blobs, sync, conformance
+npx vitest run   # 483 tests: byte format, arithmetic, crypto, blobs, sync, conformance
 ```
 
 `npx vitest run` reads `../conformance/vectors.json` and
@@ -312,7 +312,7 @@ is no export and no way back, so it takes a deliberate confirmation, and the
 
 ## What it agrees with Lean about
 
-- **215 conformance vectors**, at format version 6. `src/conformance.test.ts`
+- **217 conformance vectors**, at format version 7. `src/conformance.test.ts`
   reads `conformance/vectors.json` — emitted by `resources gen-vectors` from the
   Lean core's own `step` — and for every vector decodes `stateHex` and
   `eventHex`, re-encodes them to check the codec both ways, applies `step`, and
@@ -324,7 +324,7 @@ is no export and no way back, so it takes a deliberate confirmation, and the
   byte string and the decoder that has to refuse it — `nat`, `int`, `string`,
   `date`, `state` or `event` — and the same test file runs every one of them
   through this port's own `decode`. Every vector above is well-formed, so a port
-  could reproduce all 215 while accepting bytes no writer produces; and a
+  could reproduce all 217 while accepting bytes no writer produces; and a
   checkpoint is the hash of a state's canonical encoding, so a reader that takes
   a second spelling of one state re-encodes it to something the sender never
   committed to, and two honest peers then disagree about whether a checkpoint
@@ -368,6 +368,16 @@ is no export and no way back, so it takes a deliberate confirmation, and the
   not there. A name is something anybody who may write an entry can take, so a
   lookup by name across every realm is a lookup an outsider chooses the answer
   to; the unscoped `accountByName` is gone from this port entirely.
+- **What a transaction paid for.** Format version 7 gives `Transaction` a
+  trailing `items`, an optional list of priced lines written after its
+  attachments. `null` is a payment nobody has divided: whatever its receipt says,
+  it paid for all of it. Dividing one by the lines on its receipt hands each part
+  the lines it claimed and the remainder the units they left, so the two are
+  never the same money twice — and a part is divided again by its own list rather
+  than by the page, whose lines its siblings have already spent. An empty list is
+  therefore a real answer, said by a remainder whose siblings claimed every
+  printed line and which keeps only a service charge no line covers. The receipt
+  is untouched by all of it: what it says is a fact about the paper.
 - **Every authorisation rule.** `Op.rights` is a total table here as it is in
   `Core/Event.lean`, consulted once at the top of `applyOp` before any state is
   read for effect; `checkBounds` runs next; and what a rule cannot decide is
@@ -564,7 +574,7 @@ would need revisiting if the package were ever hoisted differently.
 | `src/sync.ts` | where an order begins, choosing a checkpoint, verifying the tail, compose-and-submit, the joiner's introduction |
 | `src/store.ts` | where the identity lives, what the invite pinned, the entry the order begins with, and the key generations seen |
 | `src/App.tsx` | opening a session, the join flow, the realm view and the receipt a cost carries |
-| `src/conformance.test.ts` | the 215 vectors and the 17 rejections, run against the codecs and `step` |
+| `src/conformance.test.ts` | the 217 vectors and the 17 rejections, run against the codecs and `step` |
 | `src/codec.test.ts` | the byte strings of `Test/Encode.lean`, and every spelling the decoder refuses |
 | `src/crypto.test.ts` | the byte strings of `Test/Sync.lean`, and the identity file's shape |
 | `src/sync.test.ts` | what stops the fold, what it writes down about where the order begins, and which checkpoints are worth anything |

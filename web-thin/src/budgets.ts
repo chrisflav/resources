@@ -503,6 +503,7 @@ export function divisionOf(
     labels: [],
     source: { kind: 'manual', actor },
     attachments: [],
+    items: null,
   }
   try {
     return validateTxn(divided)
@@ -631,6 +632,7 @@ export function settlementOf(
         labels: [label],
         source: { kind: 'manual', actor },
         attachments: [],
+        items: null,
       }
       try {
         out.push(validateTxn(claim))

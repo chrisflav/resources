@@ -130,9 +130,11 @@ def txRmCmd := `[Cli|
 def txDivideCmd := `[Cli|
   divide VIA runTxDivide;
   "Divides a payment into the things it paid for, reading them off its receipt. \
-   Each group becomes its own transaction against the account the money left; \
-   whatever no group claims stays behind as a remainder, which is the usual \
-   ending, since lines are read off paper and paper folds."
+   Each group becomes its own transaction against the account the money left, \
+   carrying the lines it claimed; whatever no group claims stays behind as a \
+   remainder carrying the rest of them, which is the usual ending, since lines \
+   are read off paper and paper folds. A part is divided again by its own lines, \
+   which 'tx show' numbers, rather than by the whole receipt."
 
   FLAGS:
     g, group : Array String; "Lines and where they belong, as '1+2=Account', comma \

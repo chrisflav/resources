@@ -450,6 +450,11 @@ against the account the money left; whatever no group claimed stays behind in a
 remainder, which is the normal ending rather than a failure -- lines are read
 off paper, and paper folds. Fees and any other legs ride along with the
 remainder, because they belong to the payment and not to any one thing bought.
+
+Each part is left holding the lines it claimed, and the remainder the units they
+left, so dividing one of them again divides its own list rather than the page
+its siblings have already been paid out of. The receipt keeps every line it was
+read with: what it says is a fact about the paper.
 -/
 def divideByItems (ctx : Ctx) (id : TxId) (groups : List ItemGroup) (actor : String) :
     IO (Array Transaction) := do

@@ -110,6 +110,8 @@ private structure TxnRow where
   narration : String
   state : String
   source : String
+  /-- Whether `txn_item` is the whole answer for this one; see migration 31. -/
+  itemsKnown : Int64
   deriving Row
 
 private structure PostingRow where
@@ -188,7 +190,8 @@ private structure AttachmentRow where
   deriving Row
 
 private structure ItemRow where
-  sha256 : String
+  /-- What the line hangs off: a receipt's hash, or a transaction's id. -/
+  key : String
   description : String
   qty : Option Int64
   minor : Int64
@@ -261,7 +264,8 @@ private def accounts (db : SQLite) : IO (Std.HashMap String Account) := do
 
 /-- Every transaction, in every state, with its postings, labels and receipts. -/
 private def txns (db : SQLite) : IO (Std.HashMap String Transaction) := do
-  let heads ← Db.rows TxnRow db "SELECT id, date, payee, narration, state, source FROM txn"
+  let heads ← Db.rows TxnRow db
+    "SELECT id, date, payee, narration, state, source, items_known FROM txn"
   -- `posting_all` deliberately: a claim is a transaction that has not happened,
   -- and reading one back must show what it says. It is *summing* that excludes
   -- pendings, which is what the `posting` view is for.
@@ -272,9 +276,12 @@ private def txns (db : SQLite) : IO (Std.HashMap String Transaction) := do
     "SELECT txn_id, label_id FROM txn_label ORDER BY txn_id, idx"
   let attachments ← Db.rows PairRow db
     "SELECT txn_id, sha256 FROM txn_attachment ORDER BY txn_id, idx"
+  let items ← Db.rows ItemRow db
+    "SELECT txn_id, description, qty, minor, commodity FROM txn_item ORDER BY txn_id, idx"
   let byTxn := groupBy postings (·.txnId)
   let labelsByTxn := groupBy labels (·.a)
   let filesByTxn := groupBy attachments (·.a)
+  let itemsByTxn := groupBy items (·.key)
   return heads.foldl (fun m h =>
     m.insert h.id
       { id := ⟨h.id⟩
@@ -289,7 +296,12 @@ private def txns (db : SQLite) : IO (Std.HashMap String Transaction) := do
             party := p.partyId.map (⟨·⟩)
             note := p.note, origin := p.origin, tag := p.tag }
         labels := (labelsByTxn.getD h.id #[]).toList.map (fun l => ⟨l.b⟩)
-        attachments := (filesByTxn.getD h.id #[]).toList.map (·.b) }) {}
+        attachments := (filesByTxn.getD h.id #[]).toList.map (·.b)
+        items :=
+          if h.itemsKnown == (0 : Int64) then none
+          else some ((itemsByTxn.getD h.id #[]).toList.map fun i =>
+            { description := i.description, qty := i.qty.map (·.toInt)
+              amount := ⟨Commodity.ofCode i.commodity, i.minor.toInt⟩ }) }) {}
 
 /-- The budgets and who each is divided among. -/
 private def budgets (db : SQLite) : IO (Std.HashMap String BudgetState) := do
@@ -351,7 +363,7 @@ private def blobs (db : SQLite) : IO (Std.HashMap String BlobState) := do
   let items ← Db.rows ItemRow db
     "SELECT sha256, description, qty, minor, commodity FROM attachment_item
      ORDER BY sha256, idx"
-  let bySha := groupBy items (·.sha256)
+  let bySha := groupBy items (·.key)
   return rows.foldl (fun m r =>
     m.insert r.sha256
       { file := { sha256 := r.sha256, mime := r.mime, bytes := r.bytes.toInt.toNat

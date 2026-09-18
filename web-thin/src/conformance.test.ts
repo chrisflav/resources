@@ -71,7 +71,7 @@ const formatVersion = Number(readFileSync(versionPath, 'utf8').trim())
  * file this client cannot read announces itself here rather than as a hundred
  * unrelated byte mismatches below.
  */
-const supportedFormatVersion = 6
+const supportedFormatVersion = 7
 
 /** The key an entity is held under, as `Vectors.changeId` reports it. */
 function changeId(c: ReturnType<typeof step>['changes'][number]): string {
@@ -138,8 +138,8 @@ describe('the conformance vectors', () => {
     expect(formatVersion).toBe(supportedFormatVersion)
   })
 
-  it('ships 215 of them, and none is empty', () => {
-    expect(vectors.length).toBe(215)
+  it('ships 217 of them, and none is empty', () => {
+    expect(vectors.length).toBe(217)
     for (const v of vectors) {
       expect(v.name).not.toBe('')
       expect(v.stateHex).not.toBe('')

@@ -1164,6 +1164,7 @@ function BudgetView({
       labels: [],
       source: { kind: 'manual', actor: identity.id },
       attachments: [],
+      items: null,
     }
     await act([{ tag: 15, kind: 'putTransaction', txn }])
     setAmount('')

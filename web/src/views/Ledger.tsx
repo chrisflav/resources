@@ -45,7 +45,13 @@ function Divide({ txn, onDivided }: { txn: Transaction; onDivided: () => void })
   const [adding, setAdding] = useState({ description: '', qty: '', amount: '' })
 
   if (!sha) return null
-  const lines = receipt.data?.items ?? []
+  // What this payment is divisible by: the lines it was left with, when it is
+  // itself a part of an earlier division, and the receipt as read otherwise. A
+  // part's siblings took the rest, so showing the whole page here would
+  // misdescribe what this one paid for and offer the same line twice.
+  const own = txn.items
+  const printed = own === null
+  const lines = own ?? receipt.data?.items ?? []
   const headroom = receipt.data?.headroom ?? null
   const stated = receipt.data?.total ?? null
 
@@ -177,9 +183,12 @@ function Divide({ txn, onDivided }: { txn: Transaction; onDivided: () => void })
       </div>
       {lines.length === 0 ? (
         <div className="muted">
-          {receipt.loading
-            ? 'loading…'
-            : 'No lines were read off this receipt. Add them by hand below, or read it again.'}
+          {!printed
+            ? 'Every line on this receipt went to the parts this was divided into; there is ' +
+              'nothing left here to divide.'
+            : receipt.loading
+              ? 'loading…'
+              : 'No lines were read off this receipt. Add them by hand below, or read it again.'}
         </div>
       ) : (
         <>
@@ -246,15 +255,19 @@ function Divide({ txn, onDivided }: { txn: Transaction; onDivided: () => void })
                     </td>
                     <td className={`num${it.amount.minor < 0 ? ' neg' : ''}`}>{it.amount.text}</td>
                     <td>
-                      <button
-                        className="btn quiet"
-                        style={{ padding: '2px 8px' }}
-                        disabled={busy}
-                        title="Remove this line from the receipt"
-                        onClick={() => void removeLine(n)}
-                      >
-                        Remove
-                      </button>
+                      {/* The lines on the paper are editable; the ones a part was
+                          left with are what a division already decided. */}
+                      {printed && (
+                        <button
+                          className="btn quiet"
+                          style={{ padding: '2px 8px' }}
+                          disabled={busy}
+                          title="Remove this line from the receipt"
+                          onClick={() => void removeLine(n)}
+                        >
+                          Remove
+                        </button>
+                      )}
                     </td>
                   </tr>
                 )
@@ -264,47 +277,55 @@ function Divide({ txn, onDivided }: { txn: Transaction; onDivided: () => void })
         </>
       )}
 
-      <div className="row" style={{ marginTop: 8 }}>
-        <input
-          type="text"
-          style={{ minWidth: 200 }}
-          value={adding.description}
-          placeholder="a line the scan missed"
-          aria-label="new line description"
-          onChange={(e) => setAdding({ ...adding, description: e.target.value })}
-        />
-        <input
-          type="text"
-          style={{ width: 60 }}
-          value={adding.qty}
-          placeholder="qty"
-          aria-label="new line quantity"
-          onChange={(e) => setAdding({ ...adding, qty: e.target.value })}
-        />
-        <input
-          type="text"
-          style={{ width: 90 }}
-          value={adding.amount}
-          placeholder="amount"
-          aria-label="new line amount"
-          onChange={(e) => setAdding({ ...adding, amount: e.target.value })}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') void addLine()
-          }}
-        />
-        <button
-          className="btn quiet"
-          disabled={busy || !adding.description.trim() || !adding.amount.trim()}
-          onClick={() => void addLine()}
-        >
-          Add line
-        </button>
-        {headroom && stated && (
-          <span className={`muted${headroom.minor < 0 ? ' neg' : ''}`} style={{ marginLeft: 'auto' }}>
-            {headroom.text} of {stated.text} is not on any line
-          </span>
-        )}
-      </div>
+      {/* Adding a line is a correction to the page itself, so it belongs where
+          the page is what is shown: a part was left with what a division gave
+          it, and a line invented here would come from nowhere. */}
+      {printed && (
+        <div className="row" style={{ marginTop: 8 }}>
+          <input
+            type="text"
+            style={{ minWidth: 200 }}
+            value={adding.description}
+            placeholder="a line the scan missed"
+            aria-label="new line description"
+            onChange={(e) => setAdding({ ...adding, description: e.target.value })}
+          />
+          <input
+            type="text"
+            style={{ width: 60 }}
+            value={adding.qty}
+            placeholder="qty"
+            aria-label="new line quantity"
+            onChange={(e) => setAdding({ ...adding, qty: e.target.value })}
+          />
+          <input
+            type="text"
+            style={{ width: 90 }}
+            value={adding.amount}
+            placeholder="amount"
+            aria-label="new line amount"
+            onChange={(e) => setAdding({ ...adding, amount: e.target.value })}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') void addLine()
+            }}
+          />
+          <button
+            className="btn quiet"
+            disabled={busy || !adding.description.trim() || !adding.amount.trim()}
+            onClick={() => void addLine()}
+          >
+            Add line
+          </button>
+          {headroom && stated && (
+            <span
+              className={`muted${headroom.minor < 0 ? ' neg' : ''}`}
+              style={{ marginLeft: 'auto' }}
+            >
+              {headroom.text} of {stated.text} is not on any line
+            </span>
+          )}
+        </div>
+      )}
 
       {lines.length > 0 && (
         <>

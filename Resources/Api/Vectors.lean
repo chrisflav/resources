@@ -388,6 +388,18 @@ private def rewrapped : Attachment :=
 private def receipted : Except String State :=
   after blobbed [.attach ⟨"t-shop"⟩ "rcpt", .recordExtraction "rcpt" extracted]
 
+/--
+The same payment, divided once: two of the six rolls are hers.
+
+Both parts hang on the same receipt and neither paid for all of it, so each
+carries the lines it took -- hers the two rolls, the remainder the bread and the
+four rolls left -- and a second division reads those rather than the page.
+-/
+private def divided : Except String State :=
+  after receipted
+    [.divideByItems ⟨"t-shop"⟩ [{ items := [{ line := 2, qty := some 2 }], into := "acc-anna" }]
+      [⟨"t-d1"⟩, ⟨"t-d2"⟩]]
+
 /-- The budget two people share. -/
 private def hut : Budget :=
   { id := ⟨"b-hut"⟩, name := "Hut", note := some "a weekend", closed := false }
@@ -650,7 +662,8 @@ private def fixtures : List (String × Except String State) :=
   , ("imported", imported), ("labelled", labelled), ("grouped", grouped), ("tripped", tripped)
   , ("ruled", ruled), ("claimed", claimed), ("partPaid", partPaid), ("fullPaid", fullPaid)
   , ("resolved", resolved)
-  , ("blobbed", blobbed), ("receipted", receipted), ("budgetOpened", budgetOpened)
+  , ("blobbed", blobbed), ("receipted", receipted), ("divided", divided)
+  , ("budgetOpened", budgetOpened)
   , ("budgetShared", budgetShared), ("budgetFunded", budgetFunded)
   , ("budgetDivided", budgetDivided), ("budgetLate", budgetLate), ("budgetClosed", budgetClosed)
   , ("cabinShared", cabinShared), ("cabinFunded", cabinFunded), ("cabinDivided", cabinDivided)
@@ -793,7 +806,11 @@ private def transactionScenarios : List Scenario :=
   , one "divide-by-items"
       "Two of the six units a line covers go to her; the rest stays behind." receipted
       (.divideByItems ⟨"t-shop"⟩ [{ items := [{ line := 2, qty := some 2 }], into := "acc-anna" }]
-        [⟨"t-d1"⟩, ⟨"t-d2"⟩]) ]
+        [⟨"t-d1"⟩, ⟨"t-d2"⟩])
+  , one "divide-a-part-again"
+      "A remainder is divided by the lines it was left with, numbered from one." divided
+      (.divideByItems ⟨"t-d2"⟩ [{ items := [{ line := 1 }], into := "acc-anna" }]
+        [⟨"t-e1"⟩, ⟨"t-e2"⟩]) ]
 
 /-- Raising, meeting and retiring claims. -/
 private def claimScenarios : List Scenario :=
@@ -987,6 +1004,10 @@ private def perOpRefusalScenarios : List Scenario :=
       (.mergeTransactions [⟨"t-dinner"⟩] ⟨"t-m"⟩ none none [])
   , refuses "refuses-a-division-with-no-groups" "Dividing by lines that were never named."
       receipted (.divideByItems ⟨"t-shop"⟩ [] [⟨"t-d1"⟩])
+  , refuses "refuses-a-line-that-went-to-a-sibling"
+      "A part holds the two lines it was left with, and a third number is not one of them."
+      divided (.divideByItems ⟨"t-d2"⟩ [{ items := [{ line := 3 }], into := "acc-anna" }]
+        [⟨"t-e1"⟩, ⟨"t-e2"⟩])
   , refuses "refuses-a-claim-that-has-happened" "A claim is a transaction that has not happened."
       base (.raiseClaim (txn "t-not-a-claim" [cents "acc-bank" 5000, cents "acc-anna" (-5000)]))
   , refuses "refuses-voiding-a-transaction" "A posted transaction is not a claim to withdraw."
@@ -1605,7 +1626,7 @@ def misfits : List String :=
 /-! ## The files -/
 
 /-- The version the format carries. Bumped by the rules the README states. -/
-def formatVersion : Nat := 6
+def formatVersion : Nat := 7
 
 /-- A string, escaped the way JSON escapes one. -/
 private def jsonStr (s : String) : String := (Lean.Json.str s).compress

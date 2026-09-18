@@ -477,6 +477,7 @@ function boundedTxn(t: Transaction): void {
   boundedTextOpt('a payee', t.payee)
   boundedList("a transaction's labels", t.labels)
   boundedList("a transaction's attachments", t.attachments)
+  if (t.items !== null) boundedItems(t.items)
   for (const l of t.labels) boundedName('a label id', l)
   for (const a of t.attachments) boundedName('an attachment hash', a)
   for (const p of t.postings) {
@@ -1792,6 +1793,7 @@ function run(s: State, author: string, realm: string, op: Op): [State, Change[]]
           labels: claim.labels,
           source: { kind: 'manual', actor: author },
           attachments: [],
+          items: null,
         }
         let checked: Transaction
         try {
@@ -2653,6 +2655,12 @@ export function replay(log: readonly LedgerEvent[]): State {
  * The whole division is checked before any of it is written: no line may be
  * claimed for more than it covers, or the same money would be booked twice and
  * the remainder would absorb the difference in silence.
+ *
+ * Every part carries away the lines it claimed and the remainder the units they
+ * left, so no line is ever offered twice: a part of an earlier division is
+ * divided by what it was left with, not by the page again. The receipt itself is
+ * untouched, because what it says is a fact about the paper rather than about
+ * who ended up paying for which half of it.
  */
 function divideByItems(
   s: State,
@@ -2664,11 +2672,22 @@ function divideByItems(
 ): [State, Change[]] {
   if (groups.length === 0) throw new Error('say which lines go together: --group 1+2=Account')
   const t = txnOf(s, id)
-  const sha = t.attachments[0]
-  if (sha === undefined) throw new Error('this transaction has no receipt to take lines from')
-  const blob = s.blobs.get(sha)
-  if (blob === undefined) throw new Error(`no such receipt: ${sha}`)
-  const lines = blob.items
+  let lines: readonly LineItem[]
+  if (t.items !== null) {
+    if (t.items.length === 0) {
+      throw new Error(
+        'every line on that receipt already belongs to one of the parts this was divided ' +
+          'into; there is nothing left here to divide',
+      )
+    }
+    lines = t.items
+  } else {
+    const sha = t.attachments[0]
+    if (sha === undefined) throw new Error('this transaction has no receipt to take lines from')
+    const blob = s.blobs.get(sha)
+    if (blob === undefined) throw new Error(`no such receipt: ${sha}`)
+    lines = blob.items
+  }
   if (lines.length === 0) {
     throw new Error("no lines were read off that receipt; run 'resources receipt scan' on it first")
   }
@@ -2694,6 +2713,17 @@ function divideByItems(
     return Math.max(1, abs)
   }
   const partsOf = (n: number): bigint[] => splitParts(lines[n - 1].amount.minor, unitsOf(n))
+  // Some of a line, as a line of its own: what it is called, how many of its
+  // units these are, and exactly the money carved for them. All of it is the
+  // line as printed, count and all, because a part that took everything a line
+  // covers paid for precisely what the bill says. A count a till printed
+  // negative stays negative: a correction taken in part is still a correction.
+  const shareLine = (n: number, want: number, amount: bigint): LineItem => {
+    const line = lines[n - 1]
+    if (want === unitsOf(n)) return line
+    const count = (line.qty ?? 1n) < 0n ? BigInt(-want) : BigInt(want)
+    return { ...line, qty: count, amount: { commodity, minor: amount } }
+  }
 
   const taken = lines.map(() => 0)
   for (const g of groups) {
@@ -2757,14 +2787,17 @@ function divideByItems(
   groups.forEach((g, gi) => {
     let amount = 0n
     const names: string[] = []
+    const mine: LineItem[] = []
     for (const sh of g.items) {
       const units = unitsOf(sh.line)
       const from = cursor[sh.line - 1]
       const want = sh.qty ?? Math.max(0, units - from)
-      amount += sum(partsOf(sh.line).slice(from, from + want))
+      const share = sum(partsOf(sh.line).slice(from, from + want))
+      amount += share
       cursor[sh.line - 1] = from + want
       const desc = lines[sh.line - 1].description
       names.push(want === units ? desc : `${want} × ${desc}`)
+      mine.push(shareLine(sh.line, want, share))
     }
     const nid = newIds[gi]
     if (nid === undefined) {
@@ -2777,6 +2810,7 @@ function divideByItems(
       ...t,
       id: nid,
       narration: names.join(', '),
+      items: mine,
       postings: [
         { ...srcPost, amount: { commodity, minor: -amount } },
         { ...dstPost, account: g.into, amount: { commodity, minor: amount } },
@@ -2799,6 +2833,29 @@ function divideByItems(
         ? { ...p, amount: { commodity, minor: p.amount.minor - carved } }
         : p,
   )
+  // ...and so do the lines: one nobody claimed as it was printed, one claimed in
+  // part shrunk to the units still on it, and one claimed in full gone
+  // altogether. A remainder listing the whole bill would offer a second division
+  // the lines the first one already spent.
+  const left: LineItem[] = []
+  const leftNames: string[] = []
+  lines.forEach((line, i) => {
+    const units = unitsOf(i + 1)
+    const from = cursor[i]
+    if (from === 0) {
+      left.push(line)
+      leftNames.push(line.description)
+    } else if (from < units) {
+      left.push(shareLine(i + 1, units - from, sum(partsOf(i + 1).slice(from, units))))
+      leftNames.push(`${units - from} × ${line.description}`)
+    }
+  })
+  // What the remainder is called. A payment's own words are the payment's —
+  // 'cash receipt', the payee, whatever the bank said — and they still describe
+  // what is left of it. A part's are a list the last division wrote, and a list
+  // still naming what has gone to the siblings describes the wrong money, so a
+  // part's remainder is named the way a part is: by its lines.
+  const narration = t.items === null ? t.narration : leftNames.join(', ')
   if (rest.some((p) => p.amount.minor !== 0n)) {
     const rid = newIds[groups.length]
     if (rid === undefined) {
@@ -2806,7 +2863,7 @@ function divideByItems(
         `dividing this needs ${groups.length + 1} new ids, and ${newIds.length} were given`,
       )
     }
-    parts.push({ ...t, id: rid, postings: rest })
+    parts.push({ ...t, id: rid, narration, postings: rest, items: left })
   }
   return replaceParts(s, author, realm, id, parts)
 }
@@ -2965,6 +3022,7 @@ function payClaim(
     labels: [],
     source: { kind: 'manual', actor: author },
     attachments: [],
+    items: null,
   }
   // The two legs are the claim's own, so the poster check is the authorisation
   // above rather than `canPost`; the accounts still have to exist, be open and

@@ -190,6 +190,14 @@ def runTxShow (p : Parsed) : IO UInt32 := withBackend fun b => do
   let atts := (jarr (jobj j "attachments")).map (fun l => l.getStr?.toOption.getD "")
   for a in atts do
     IO.println s!"  receipt: {a}"
+  -- What this one paid for, when it is a part of a division and so paid for only
+  -- some of the page it hangs on. These are the numbers `tx divide` counts by:
+  -- a part is divided again by its own lines, not by the whole receipt.
+  for (it, i) in (jarr (jobj j "items")).zipIdx do
+    let what := Str.clamp (jstr it "description") 40
+    let qty := jstr it "qty"
+    let count := if qty.isEmpty || qty == "1" then "" else s!"{qty} × "
+    IO.println s!"  line {i + 1}: {count}{what}  {jstr (jobj it "amount") "text"}"
 
 /-- Handler for `tx edit`: changes the date, payee or narration in place. -/
 def runTxEdit (p : Parsed) : IO UInt32 := withBackend fun b => do
