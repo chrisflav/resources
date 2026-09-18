@@ -227,7 +227,7 @@ def dispatch (node : Node) (cfg : ServerConfig) (req : Request Body.Stream) :
     -- The cap is, though: it is read off the route before a byte is taken, so
     -- that a stranger's `challenge` can never cost more than four kilobytes of
     -- anything.
-    let cap := bodyLimit method rest
+    let cap := bodyLimit node.limits method rest
     let body ←
       try
         req.body.readAll (α := ByteArray) (maximumSize := some cap.toUInt64)
@@ -251,6 +251,12 @@ def serve (node : Node) (cfg : ServerConfig) : IO Unit := do
   IO.println s!"  verifier  {node.verifier.name}"
   IO.println s!"  limits    {node.limits.burst} writes, refilling {node.limits.perSecond}/s, \
                   {node.limits.blobBurst} blobs at {node.limits.blobPerSecond}/s"
+  -- The two sizes a genesis is measured against, because the entry a shared
+  -- order begins with is a whole store and the refusal it gets when they are
+  -- too small names bytes: an operator who has to raise them should be able to
+  -- read what they are now off the line the service printed when it started.
+  IO.println s!"  bodies    appends and checkpoints up to {node.limits.maxAppendBytes} bytes, \
+                  parts up to {node.limits.maxPartBytes}"
   match node.creators with
   | some cs => IO.println s!"  creators  {cs.size} key(s) may make a ledger"
   | none => IO.println "  creators  unrestricted"

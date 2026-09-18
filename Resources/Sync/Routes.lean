@@ -55,9 +55,9 @@ single-use invite — are not atomic. It also makes the in-memory tables below
 (sessions, challenges, buckets) safe to read and write without any further care.
 
 What is *not* under it is everything expensive that needs nothing from the
-store: the SHA-256 of a sixteen-megabyte blob, the JSON parse of a one-megabyte
-append, and that append's base64 decode and digest per part. Holding the one
-global lock through those made the correct fix for unsynchronised transactions
+store: the SHA-256 of a sixteen-megabyte blob, the JSON parse of an append of
+the same size, and that append's base64 decode and digest per part. Holding the
+one global lock through those made the correct fix for unsynchronised transactions
 into a way for one member with a burst of tokens to stop the whole service for
 seconds at a time. `prepare` does that work first, outside the lock, and hands
 the results in — and `maxParts` and `maxPartBytes` bound how much of it one
@@ -129,8 +129,53 @@ structure Limits where
   that happens to follow from another one.
   -/
   maxParts : Nat := 64
-  /-- How many bytes of ciphertext one part may carry. -/
-  maxPartBytes : Nat := 256 * 1024
+  /--
+  How many bytes of ciphertext one part may carry.
+
+  It was 256 KiB, and that number was chosen for an ordinary entry: a payment,
+  a receipt line, a label. A genesis is not one. The first entry of a shared
+  order is the whole of a store as a single `Op.snapshot`, and for a ledger
+  that has been kept for years that is megabytes — so the number that was
+  comfortable for every later entry was the number that made the first one
+  impossible to push at all, which is the one entry a ledger cannot do without.
+
+  Eight mebibytes is what a years-old ledger's snapshot fits in with room over.
+  What bounds it in practice is `maxAppendBytes`, which is 16 MiB of body and so
+  12 MiB of base64-decoded parts however they are divided up: this number states
+  what *one* part may be, and the body cap states what all of them together may.
+
+  ### Why the work this buys is safe outside the mutex
+
+  Every byte of it is decoded and digested by `prepare`, before the store's lock
+  is taken, so none of it delays anybody else's append — it spends CPU and
+  memory, not the order. What bounds those is the allowance, and the arithmetic
+  is this. One append costs at most `maxAppendBytes` of body to parse, three
+  quarters of that to base64-decode, and one SHA-256 over what comes out:
+  measured, about three seconds of CPU and some tens of megabytes at 16 MiB, and
+  a member has to have uploaded all 16 MiB to ask for it.
+
+  A member may spend `burst` writes back to back — 64 — which is 64 × 16 MiB =
+  1 GiB of body, and they must send that gigabyte to spend them. The bucket then
+  refills at `perSecond`, 8 a second, so the sustained ceiling per member is
+  8 × 16 MiB = 128 MiB of body a second: a rate the network in front of this
+  service refuses long before the parser does. The burst empties in eight
+  seconds of silence and refills in eight.
+
+  And the honest case is one request. A genesis is pushed once, by one member,
+  when a ledger is first put on a sequencer; every entry after it is the
+  kilobytes it always was.
+  -/
+  maxPartBytes : Nat := 8 * 1024 * 1024
+  /--
+  How many bytes of body an append or a checkpoint may carry.
+
+  The two routes that carry a snapshot: `POST ledgers/{l}/events`, whose first
+  entry is a whole store, and `PUT ledgers/{l}/realms/{r}/checkpoint`, which is
+  that same state sealed under a realm key. They are the same class of object
+  and so they are the same number, and a deployment sets it with
+  `--max-append`. Every other route keeps the small caps in `bodyLimit`.
+  -/
+  maxAppendBytes : Nat := 16 * 1024 * 1024
   /-- How many envelopes one fetch may return. -/
   eventLimit : Nat := 500
   /-- The longest an invite may be made to stand, in days. -/
@@ -471,17 +516,24 @@ can be: bytes to decode and hash, and JSON to parse. Both run before anything
 knows who is calling, so the number has to be small where the caller is nobody
 in particular and only generous where they have proved they are a member with a
 grant.
+
+Three routes are generous, and all three carry the same kind of thing: an
+append, whose first entry is a whole store as one snapshot; a checkpoint, which
+is that state sealed under a realm key; and a blob, which is a receipt. The
+other two — the ones a stranger can reach — read four kilobytes, and everything
+else sixty-four.
 -/
-def bodyLimit (method : String) (segments : List String) : Nat :=
+def bodyLimit (limits : Limits) (method : String) (segments : List String) : Nat :=
   match method, segments with
   | "POST", ["challenge"] => 4 * 1024
   | "POST", ["authenticate"] => 4 * 1024
-  | "POST", ["ledgers", _, "events"] => 1024 * 1024
+  | "POST", ["ledgers", _, "events"] => limits.maxAppendBytes
+  | "PUT", ["ledgers", _, "realms", _, "checkpoint"] => limits.maxAppendBytes
   | "PUT", ["ledgers", _, "blobs", _] => 16 * 1024 * 1024
   | _, _ => 64 * 1024
 
 /--
-Whether a JSON text contains a number whose exponent is a weapon.
+Whether a JSON body contains a number whose exponent is a weapon.
 
 Lean's parser accepts any decimal exponent below `USize.size` and materialises
 it as `m * 10 ^ n`, so twenty-two unauthenticated bytes buy ten seconds of CPU
@@ -491,24 +543,32 @@ parser is asked to evaluate it.
 
 The scan tracks JSON string state, so an `e` inside a name or a base64 blob is
 never mistaken for one in a number.
+
+It reads the body where it lies, as bytes, rather than through `toList`. That
+was a sixty-fold amplification on the one path this cap was raised for: a list
+of characters costs some fifty bytes each, so the eleven megabytes of base64 an
+eight-megabyte part arrives as peaked at six hundred megabytes of memory to
+answer a question about them, and the server runs handlers in parallel. Nothing
+this looks for is anything but ASCII, and every byte of a multi-byte character
+is 0x80 or above, so none of them can be mistaken for a quote or an `e`.
 -/
-def hasHugeExponent (text : String) : Bool := Id.run do
-  let cs := text.toList.toArray
+def hasHugeExponent (body : ByteArray) : Bool := Id.run do
+  let ascii (c : Char) : UInt8 := c.val.toUInt8
   let mut i := 0
   let mut inString := false
-  while h : i < cs.size do
-    let c := cs[i]
+  while h : i < body.size do
+    let c := body[i]
     if inString then
-      if c == '\\' then i := i + 1
-      else if c == '"' then inString := false
-    else if c == '"' then inString := true
-    else if c == 'e' || c == 'E' then
+      if c == ascii '\\' then i := i + 1
+      else if c == ascii '"' then inString := false
+    else if c == ascii '"' then inString := true
+    else if c == ascii 'e' || c == ascii 'E' then
       let mut j := i + 1
-      if j < cs.size && (cs[j]! == '+' || cs[j]! == '-') then j := j + 1
+      if j < body.size && (body[j]! == ascii '+' || body[j]! == ascii '-') then j := j + 1
       let start := j
       let mut value : Nat := 0
-      while j < cs.size && cs[j]!.isDigit do
-        value := min 1000 (value * 10 + (cs[j]!.toNat - 48))
+      while j < body.size && ascii '0' ≤ body[j]! && body[j]! ≤ ascii '9' do
+        value := min 1000 (value * 10 + (body[j]!.toNat - 48))
         j := j + 1
       if j > start && value > 100 then return true
       i := j - 1
@@ -539,8 +599,8 @@ Everything about a request that is expensive and needs nothing from the store.
 The store's lock is taken around the whole of a request, which is what makes the
 compare-and-swap and the single-use invite atomic — and which also means that
 every byte of decoding done inside it is a byte the rest of the service spends
-waiting. A sixteen-megabyte blob is seconds of pure-Lean SHA-256; a
-one-megabyte append is a JSON parse, a base64 decode and a digest per part.
+waiting. A sixteen-megabyte blob is seconds of pure-Lean SHA-256; an append of
+the same size is a JSON parse, a base64 decode and a digest per part.
 None of it asks the database anything, so none of it belongs under the lock.
 -/
 structure Prepared where
@@ -563,9 +623,9 @@ Reads an append's envelope and checks everything about it that needs no store.
 
 This is the expensive half of an append and all of it is arithmetic: a base64
 decode and a SHA-256 for every part, against caps that are checked first. The
-caps are what make "expensive" a bounded amount of it — a one-megabyte body
-used to be allowed to spell tens of thousands of parts, and every one of them
-cost a decode and a digest with the whole service waiting behind the lock.
+caps are what make "expensive" a bounded amount of it — a body of any size used
+to be allowed to spell tens of thousands of parts, and every one of them cost a
+decode and a digest with the whole service waiting behind the lock.
 
 The parts are counted off the JSON before a single one is decoded, because a
 cap that is reached after the work it bounds is not a cap.
@@ -595,7 +655,7 @@ def envelopeOfBody (limits : Limits) (j : Json) : Except String Envelope := do
 private def parsedBody (body : ByteArray) : Except String Json :=
   let text := (String.fromUTF8? body).getD ""
   if text.trimAscii.isEmpty then .ok (Json.mkObj [])
-  else if hasHugeExponent text then
+  else if hasHugeExponent body then
     .error "a number in this body has an exponent no protocol field uses"
   else
     match Json.parse text with
@@ -1126,7 +1186,7 @@ def handle (n : Node) (r : Api.Req) (pre : Prepared) (peer : Peer := .inProcess)
   -- by the time it gets here.
   if r.segments.any hasControl then
     return err 400 "a path segment carries a control character"
-  if r.body.size > bodyLimit r.method r.segments then
+  if r.body.size > bodyLimit n.limits r.method r.segments then
     return err 413 "the body is larger than this route accepts"
   match r.method, r.segments with
   | "GET", ["health"] =>

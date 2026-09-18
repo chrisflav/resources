@@ -948,6 +948,12 @@ def sequencerCmd := `[Cli|
                             a unit: 268435456, 256MiB, 512K (default 256MiB). Nothing \
                             collects blobs, so this is what makes a full ledger a sentence \
                             somebody is told."
+    "max-part" : String;   "How many bytes of ciphertext one part of an entry may carry, \
+                            plainly or with a unit (default 8MiB). A ledger's first entry is \
+                            its whole state as one snapshot, which is what this is for."
+    "max-append" : String; "How many bytes of body an append or a checkpoint may carry, \
+                            plainly or with a unit (default 16MiB). Any proxy in front needs \
+                            at least as much."
 ]
 
 def identityInitCmd := `[Cli|

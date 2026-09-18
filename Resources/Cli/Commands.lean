@@ -1453,6 +1453,15 @@ somebody can be told and act on. A size this command cannot read is refused
 rather than rounded or ignored: a quota typed with a zero missing is a service
 that stops taking receipts three months later, and one silently dropped is a
 disk that fills.
+
+`--max-part` and `--max-append` are the two sizes a genesis is measured against:
+how many bytes of ciphertext one part of an entry may carry, and how many bytes
+of body an append or a checkpoint may. The first entry of a shared order is a
+whole store as one snapshot, so for a ledger somebody has kept for years these
+are what decide whether it can be put on a sequencer at all, and the refusal
+when they are too small names bytes. Both default to what `Sync.Limits` says —
+8MiB and 16MiB — and both are read with the same reader as the quota, so a size
+this command cannot make sense of is refused rather than rounded.
 -/
 def runSequencer (p : Parsed) : IO UInt32 := do
   try
@@ -1465,15 +1474,18 @@ def runSequencer (p : Parsed) : IO UInt32 := do
     let origin := flagStr p "origin" s!"http://{host}:{port}"
     let log ← Sync.Log.open (Sync.Config.atDir dataDir)
     let verifier := sequencerVerifier
-    let limits : Sync.Limits ←
-      match flagStr? p "blob-quota" with
-      | none => pure {}
-      | some given =>
-        match Sync.byteSize? given with
-        | some bytes => pure { blobQuotaBytes := bytes }
-        | none =>
-          throw <| IO.userError s!"--blob-quota is a size in bytes, written plainly or with a \
+    let size? (flag : String) : IO (Option Nat) := do
+      let some given := flagStr? p flag | return none
+      let some bytes := Sync.byteSize? given
+        | throw <| IO.userError s!"--{flag} is a size in bytes, written plainly or with a \
                                    unit: 268435456, 256MiB, 512K. '{given}' is not one."
+      return some bytes
+    let fallback : Sync.Limits := {}
+    let limits : Sync.Limits :=
+      { fallback with
+        blobQuotaBytes := (← size? "blob-quota").getD fallback.blobQuotaBytes,
+        maxPartBytes := (← size? "max-part").getD fallback.maxPartBytes,
+        maxAppendBytes := (← size? "max-append").getD fallback.maxAppendBytes }
     let creators ← sequencerCreators p
     -- `testOnly` is not passed and has no spelling here. `make` refuses to build
     -- a sequencer over a verifier that proves nothing, and the one way past that

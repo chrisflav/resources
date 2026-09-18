@@ -366,21 +366,31 @@ def syncTests (r : Report) : IO Report := do
 
     /- ## Body caps and the numbers inside a body -/
     r := checkEq r "a challenge reads four kilobytes"
-      (Sync.bodyLimit "POST" ["challenge"]) (4 * 1024)
-    r := checkEq r "an append reads a megabyte"
-      (Sync.bodyLimit "POST" ["ledgers", "home", "events"]) (1024 * 1024)
+      (Sync.bodyLimit {} "POST" ["challenge"]) (4 * 1024)
+    -- An append used to read a megabyte, which is generous for every entry but
+    -- the first one: a genesis is a whole store as one snapshot, and a ledger
+    -- kept for years does not fit in it.
+    r := checkEq r "an append reads sixteen megabytes"
+      (Sync.bodyLimit {} "POST" ["ledgers", "home", "events"]) (16 * 1024 * 1024)
+    r := checkEq r "and so does a checkpoint, which carries that same state sealed"
+      (Sync.bodyLimit {} "PUT" ["ledgers", "home", "realms", "money", "checkpoint"])
+      (16 * 1024 * 1024)
     r := checkEq r "a blob reads sixteen"
-      (Sync.bodyLimit "PUT" ["ledgers", "home", "blobs", "h"]) (16 * 1024 * 1024)
+      (Sync.bodyLimit {} "PUT" ["ledgers", "home", "blobs", "h"]) (16 * 1024 * 1024)
     r := checkEq r "and everything else sixty-four kilobytes"
-      (Sync.bodyLimit "POST" ["ledgers", "home", "realms"]) (64 * 1024)
+      (Sync.bodyLimit {} "POST" ["ledgers", "home", "realms"]) (64 * 1024)
+    r := checkEq r "the two generous ones are the number a deployment may set"
+      (Sync.bodyLimit { maxAppendBytes := 99 } "POST" ["ledgers", "home", "events"]) 99
+    r := checkEq r "and the small ones are not"
+      (Sync.bodyLimit { maxAppendBytes := 99 } "POST" ["challenge"]) (4 * 1024)
     let oversized := (String.ofList (List.replicate 5000 'x')).toUTF8
     r := checkEq r "a body over the route's cap is refused without being parsed"
       (← Sync.handleSafe node ((Api.Req.simple "POST" ["challenge"]).withBody oversized)).code 413
     r := check r "an exponent no field uses is spotted before the parser evaluates it"
-      (Sync.hasHugeExponent "{\"key\":1e1000000000}")
-    r := check r "a modest one is not" (!Sync.hasHugeExponent "{\"n\":1e9}")
+      (Sync.hasHugeExponent "{\"key\":1e1000000000}".toUTF8)
+    r := check r "a modest one is not" (!Sync.hasHugeExponent "{\"n\":1e9}".toUTF8)
     r := check r "and neither is one inside a string"
-      (!Sync.hasHugeExponent "{\"key\":\"cafe1e1000000000\"}")
+      (!Sync.hasHugeExponent "{\"key\":\"cafe1e1000000000\"}".toUTF8)
     r := checkEq r "a body carrying one is refused"
       (← Sync.handleSafe node
         ((Api.Req.simple "POST" ["challenge"]).withBody "{\"key\":1e1000000000}".toUTF8)).code 400
@@ -756,11 +766,15 @@ def syncTests (r : Report) : IO Report := do
 
     /- ## What one envelope may carry
 
-    Each part costs a base64 decode and a SHA-256, and the body cap alone let
-    one megabyte of JSON spell tens of thousands of them. Both are done before
-    the store is locked now, and both are bounded. -/
+    Each part costs a base64 decode and a SHA-256, and the body cap alone let a
+    body of JSON spell tens of thousands of them -- the more so now that the cap
+    is sixteen megabytes. Both are done before the store is locked, and both are
+    bounded. -/
     r := checkEq r "sixty-four parts is the default cap" ({} : Sync.Limits).maxParts 64
-    r := checkEq r "and 256 KiB the default part" ({} : Sync.Limits).maxPartBytes (256 * 1024)
+    r := checkEq r "and 8 MiB the default part, which is what a genesis needs"
+      ({} : Sync.Limits).maxPartBytes (8 * 1024 * 1024)
+    r := checkEq r "with 16 MiB of body around it"
+      ({} : Sync.Limits).maxAppendBytes (16 * 1024 * 1024)
     let capped ← Sync.Node.make log verifier { maxParts := 2, maxPartBytes := 8 } origin none
       (testOnly := true)
     let (_, cappedTok) ← loginOn capped alice
@@ -803,6 +817,46 @@ def syncTests (r : Report) : IO Report := do
       callOn tight tightTok "POST" ["ledgers", "home", "events"] sixth.toJson
     r := checkEq r "the first append fits in the bucket" (← tightCall).code 201
     r := checkEq r "the next one is refused" (← tightCall).code 429
+
+    /- ## An entry the size of a genesis
+
+    The first entry of a shared order is a whole store as one `Op.snapshot`, so
+    for a ledger somebody has kept for years it is megabytes rather than the
+    kilobytes every later entry is. That is the one entry a ledger cannot be put
+    on a sequencer without, so the caps are exercised at the size they are set
+    to: eight mebibytes of ciphertext goes in, nine does not, and the refusal is
+    a 400 about the bytes rather than a 413 about the route. -/
+    let bulk (bytes : Nat) : Sync.Part :=
+      { realm := "money", generation := 1, ciphertext := ByteArray.mk (Array.replicate bytes 120) }
+    let mib := 1024 * 1024
+    let headNow ← Sync.Log.head log "home"
+    let genesisSized := signedEnvelope alice "home" (headNow.seq + 1) headNow.hash [bulk (8 * mib)]
+    r := checkEq r "a part of exactly the cap is appended"
+      (← call aliceTok "POST" ["ledgers", "home", "events"] genesisSized.toJson).code 201
+    let afterGenesis ← Sync.Log.head log "home"
+    let overSize := signedEnvelope alice "home" (afterGenesis.seq + 1) afterGenesis.hash
+      [bulk (9 * mib)]
+    let refusedSize ← call aliceTok "POST" ["ledgers", "home", "events"] overSize.toJson
+    r := checkEq r "a part over it is refused for its size, not for its route" refusedSize.code 400
+    r := check r "and the sentence names the realm and the number"
+      (((jstr (payload refusedSize) "error").splitOn "is larger than").length == 2)
+    r := checkEq r "the order did not move under the refusal"
+      (← Sync.Log.head log "home").hash afterGenesis.hash
+    -- Twelve megabytes of base64 is under the body cap, so the refusal above is
+    -- the part's. A body over the *route's* cap is the other refusal, and it is
+    -- taken before anything is parsed.
+    let overBody := (Api.Req.simple "POST" ["ledgers", "home", "events"]).withBody
+      (ByteArray.mk (Array.replicate (17 * mib) 120))
+    r := checkEq r "a body over the route's cap is a 413, whoever sent it"
+      (← Sync.handleSafe node
+        (overBody.withHeaders [("authorization", "Bearer " ++ aliceTok)])).code 413
+    -- And twenty kilobytes, which the megabyte cap took and the old default part
+    -- would have taken, is nowhere near either of them now.
+    let twentyK := (Api.Req.simple "POST" ["ledgers", "home", "events"]).withBody
+      (ByteArray.mk (Array.replicate (20 * 1024) 120))
+    r := checkEq r "twenty kilobytes is read rather than refused for its size"
+      (← Sync.handleSafe node
+        (twentyK.withHeaders [("authorization", "Bearer " ++ aliceTok)])).code 400
 
     /- ## Blobs -/
     let bytes := cipher "an encrypted receipt"
