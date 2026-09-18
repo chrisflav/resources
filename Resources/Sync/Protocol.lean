@@ -122,12 +122,24 @@ private def b64Value (c : Char) : Option Nat :=
   else if c == '/' then some 63
   else none
 
-/-- Decodes base64, ignoring padding and whitespace. `none` if a character is not base64. -/
+/--
+Decodes base64, ignoring padding and whitespace. `none` if a character is not base64.
+
+It reads the characters where they lie rather than through `toList`. A list of
+them costs some fifty bytes each, and what arrives here is now as much as twelve
+megabytes of base64 in one part of one append — which made half a gigabyte of
+list to read bytes that were already bytes, with the server running handlers in
+parallel. Everything base64 spells is ASCII, and every byte of a multi-byte
+character is 0x80 or above, so reading a byte as a character refuses exactly
+what reading a character did.
+-/
 def ofBase64? (s : String) : Option ByteArray := Id.run do
+  let cs := s.toUTF8
   let mut acc : Nat := 0
   let mut bits : Nat := 0
   let mut out := ByteArray.empty
-  for c in s.toList do
+  for i in [0:cs.size] do
+    let c := Char.ofNat cs[i]!.toNat
     if c == '=' || c == '\n' || c == '\r' || c == ' ' || c == '\t' then
       continue
     let some v := b64Value c | return none

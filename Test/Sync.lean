@@ -204,6 +204,13 @@ def syncTests (r : Report) : IO Report := do
     for sample in ["", "a", "ab", "abc", "abcd", "the whole of a receipt line"] do
       let round := (Sync.ofBase64? (Sync.toBase64 (cipher sample))).map Sync.toBase64
       r := checkEq r s!"base64 round-trips '{sample}'" round (some (Sync.toBase64 (cipher sample)))
+    r := check r "a character base64 does not spell is refused" (Sync.ofBase64? "ab*d").isNone
+    -- The decoder reads the characters as the bytes they are, so the case worth
+    -- pinning is one that is more than a byte wide: every byte of it is 0x80 or
+    -- above, which base64 does not spell either.
+    r := check r "and so is one that is more than a byte wide" (Sync.ofBase64? "ab\u00e9d").isNone
+    r := checkEq r "whitespace and padding are skipped wherever they fall"
+      ((Sync.ofBase64? "YW\nJj ==").map Sync.toBase64) (some (Sync.toBase64 (cipher "abc")))
     r := checkEq r "hex round-trips" ((Sync.ofHex? "00ff10").map toHex) (some "00ff10")
     r := check r "odd hex is refused" (Sync.ofHex? "abc").isNone
     r := check r "a member id is 64 lowercase hex" (Sync.isMemberId alice.id)

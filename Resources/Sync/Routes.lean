@@ -151,8 +151,8 @@ structure Limits where
   memory, not the order. What bounds those is the allowance, and the arithmetic
   is this. One append costs at most `maxAppendBytes` of body to parse, three
   quarters of that to base64-decode, and one SHA-256 over what comes out:
-  measured, about three seconds of CPU and some tens of megabytes at 16 MiB, and
-  a member has to have uploaded all 16 MiB to ask for it.
+  measured on this machine, 1.7 seconds and 230 MB of memory at a full 16 MiB,
+  and a member has to have uploaded all 16 MiB to ask for it.
 
   A member may spend `burst` writes back to back — 64 — which is 64 × 16 MiB =
   1 GiB of body, and they must send that gigabyte to spend them. The bucket then
