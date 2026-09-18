@@ -1,4 +1,11 @@
 import Resources.Api.Routes
+import Resources.Api.Vectors
+import Resources.Core.Apply
+import Test.Sync
+import Test.Crypto
+import Test.Encode
+import Test.Node
+import Test.NodeHardening
 
 /-!
 # Tests
@@ -11,21 +18,6 @@ would actually write.
 -/
 
 open Lean Resources
-
-/-! ## Harness -/
-
-private structure Report where
-  passed : Nat := 0
-  failed : Array String := #[]
-
-private def check (r : Report) (name : String) (ok : Bool) : Report :=
-  if ok then { r with passed := r.passed + 1 }
-  else { r with failed := r.failed.push name }
-
-private def checkEq [BEq α] [ToString α] (r : Report) (name : String) (actual expected : α) :
-    Report :=
-  if actual == expected then { r with passed := r.passed + 1 }
-  else { r with failed := r.failed.push s!"{name}: got {actual}, expected {expected}" }
 
 /-! ## Pure tests -/
 
@@ -145,6 +137,44 @@ private def ledgerTests (r : Report) : Report := Id.run do
   return r
 
 /-! ## Store-backed tests -/
+
+/--
+The database says exactly what the state says.
+
+Every write now applies an operation to the state in memory and projects what
+came back into SQL, so the two are two renderings of one thing and must agree
+entry for entry. `Load.fromDb` reads the tables back into a state and
+`State.canonical` sorts both, which is what makes the comparison independent of
+how anything was stored.
+
+The log is checked against the same state and in the same breath. A commit
+appends the operations and projects what they changed in one transaction, so
+after every group there are three renderings of one ledger — the tables, the
+state in memory, and the events replayed from nothing — and all three have to
+say the same thing. Replaying after every group rather than once at the end is
+what makes a divergence point at the group that caused it.
+
+On a mismatch the first differing entry of the two renderings is printed. "Two
+states differ" is not a diagnosis; "the database has this transaction with two
+postings and the state has three" is.
+-/
+private def agree (ctx : Ctx) (r : Report) : IO Report := do
+  let stored ← Load.fromDb ctx.db
+  let held ← ctx.state.get
+  let replayed ← Replay.state ctx.db
+  let r := check r "the log replays to the state" (replayed == held)
+  if stored == held then return { r with passed := r.passed + 1 }
+  -- A `Repr` runs to several lines, and a failure is read one line at a time.
+  let entries (s : State) : List String :=
+    s.canonical.flatMap fun (section', rows) =>
+      rows.map fun (key, value) =>
+        s!"{section'}/{key} = " ++ " ".intercalate (value.splitOn "\n")
+  let a := entries stored
+  let b := entries held
+  let detail := match (a.zip b).find? (fun (x, y) => x != y) with
+    | some (x, y) => s!"stored {Str.clamp x 300}; state has {Str.clamp y 300}"
+    | none => s!"the database has {a.length} entries and the state {b.length}"
+  return check r s!"the database agrees with the state ({detail})" false
 
 /-- A tiny deterministic generator, so a failure is always reproducible. -/
 private def lcg (seed : Nat) : Nat := (seed * 1103515245 + 12345) % 2147483648
@@ -343,6 +373,34 @@ private def routeSmoke (ctx : Ctx) (r : Report) : IO Report := do
   let denied ← Api.handleSafe ctx readOnly
     ((Api.Req.simple "POST" ["labels"]).withJson (Json.mkObj [("name", "x")]))
   r := checkEq r "a read-only token cannot write" denied.code 400
+  /- ## Body caps
+  The same defence the sequencer makes, and the same shape: one number read off
+  the method and the path before anything expensive is reached. The transport
+  uses it to stop reading and the route table checks it again, because the CLI in
+  local mode reaches this table without a socket — which is also what lets the
+  refusal be tested here, with no HTTP anywhere. -/
+  r := checkEq r "the default body cap is 64 KiB" (Api.bodyLimit "POST" ["labels"]) (64 * 1024)
+  r := checkEq r "reading asks for nothing more"
+    (Api.bodyLimit "GET" ["transactions"]) (64 * 1024)
+  r := checkEq r "writing a transaction is a megabyte"
+    (Api.bodyLimit "POST" ["transactions"]) (1024 * 1024)
+  r := checkEq r "and so is dividing one"
+    (Api.bodyLimit "POST" ["transactions", "t1", "divide"]) (1024 * 1024)
+  r := checkEq r "a receipt being uploaded is sixteen"
+    (Api.bodyLimit "PUT" ["attachments"]) (16 * 1024 * 1024)
+  r := checkEq r "and so is a bank's export" (Api.bodyLimit "POST" ["imports"]) (16 * 1024 * 1024)
+  let bodyOf (n : Nat) : ByteArray := ByteArray.mk (Array.replicate n (0 : UInt8))
+  let tooBig ← Api.handleSafe ctx caller
+    ((Api.Req.simple "POST" ["labels"]).withBody (bodyOf (64 * 1024 + 1)))
+  r := checkEq r "a body one byte past the cap is a 413" tooBig.code 413
+  let atCap ← Api.handleSafe ctx caller
+    ((Api.Req.simple "POST" ["labels"]).withBody (bodyOf (64 * 1024)))
+  r := check r "and a body exactly at it is refused for some other reason, or not at all"
+    (atCap.code != 413)
+  let bigUpload ← Api.handleSafe ctx caller
+    ((Api.Req.simple "PUT" ["attachments"]).withBody (bodyOf (64 * 1024 + 1)))
+  r := check r "the routes that carry a file are not held to the small cap"
+    (bigUpload.code != 413)
   return r
 
 /-- Merging, unmerging, and the signature extraction they rest on. -/
@@ -445,6 +503,12 @@ rehearsing against rows written the old way. Two things must survive: a
 receivable has to come out as an account belonging to the person it was named
 after, with its balance unchanged, and no posting may go missing behind the view
 that now hides the unposted ones.
+
+Migration 25 is the third, and it changes no meaning — it rebuilds `account`
+under live foreign keys to make a name unique inside a realm instead of across
+the ledger. What has to survive that is every account, the realm each was in, and
+every posting's reference to one, so a store one version short of it is migrated
+here as well.
 -/
 private def migrationTests (r : Report) : IO Report := do
   let root : System.FilePath :=
@@ -501,6 +565,56 @@ private def migrationTests (r : Report) : IO Report := do
     r := checkEq r "though it is there to be read"
       (← Db.scalarInt db
         "SELECT IFNULL(SUM(minor), 0) FROM posting_all WHERE account_id = 'acc-recv'") 0
+    -- A store one version behind, with accounts in two realms and postings
+    -- against them. Migration 25 cannot alter `account`'s constraint, so it
+    -- rebuilds the table underneath live foreign keys — and what has to survive
+    -- that is every account, the realm each was in, and every posting's
+    -- reference to one. Foreign keys are on here exactly as a real store has
+    -- them, because a rebuild under them is the whole difficulty.
+    let old ← SQLite.open (root / "pre25.db") (busyTimeoutMs := 5000)
+    Db.exec old "PRAGMA foreign_keys = ON"
+    for (v, sql) in Schema.migrations do
+      if v ≤ 24 then
+        SQLite.transaction old do
+          Db.exec old sql
+          Db.exec old s!"PRAGMA user_version = {v}"
+    Db.exec old "INSERT INTO realm (id, name, generation) VALUES ('r-sicily', 'Sicily', 0)"
+    Db.exec old "INSERT INTO account (id, name, kind, owner_id, realm_id) VALUES
+      ('acc-mine', 'Budget.Hut', 'equity', '0000000000000000000000SELF',
+       '0000000000000000000000SELF'),
+      ('acc-theirs', 'Budget.Sicily', 'equity', '0000000000000000000000SELF', 'r-sicily')"
+    Db.exec old "INSERT INTO txn (id, date, payee, narration, source, created_at, updated_at)
+      VALUES ('pre-1', '2026-03-01', NULL, 'a cost', 'manual:old', 'x', 'x')"
+    Db.exec old "INSERT INTO posting_all (txn_id, idx, account_id, minor, commodity)
+      VALUES ('pre-1', 0, 'acc-mine', 2500, 'EUR'), ('pre-1', 1, 'acc-theirs', -2500, 'EUR')"
+    r := checkEq r "a store written before the rebuild stops one short of it"
+      (← Schema.currentVersion old) 24
+    r := check r "and the rebuild runs when it is opened" ((← Schema.migrate old) > 0)
+    r := checkEq r "leaving it at the version this binary expects"
+      (← Schema.currentVersion old) Schema.targetVersion
+    r := checkEq r "every account came through the rebuild"
+      (← Db.scalarInt old "SELECT COUNT(*) FROM account") 2
+    r := checkEq r "in the realm it was in"
+      ((← Db.row? String old "SELECT realm_id FROM account WHERE id = 'acc-theirs'").getD "")
+      "r-sicily"
+    r := checkEq r "every posting still names an account that is there"
+      (← Db.scalarInt old
+        "SELECT COUNT(*) FROM posting_all p JOIN account a ON a.id = p.account_id") 2
+    r := checkEq r "and the rebuild left no reference dangling"
+      (← Db.scalarInt old "SELECT COUNT(*) FROM pragma_foreign_key_check") 0
+    let orphan := "INSERT INTO posting_all (txn_id, idx, account_id, minor, commodity)
+      VALUES ('pre-1', 2, 'nobody', 0, 'EUR')"
+    r := check r "a posting to an account that is not there is still refused"
+      (← (do Db.exec old orphan; pure false) <|> pure true)
+    -- The constraint the rebuild exists to replace, read from both sides.
+    Db.exec old "INSERT INTO account (id, name, kind, owner_id, realm_id) VALUES
+      ('acc-same', 'Budget.Hut', 'equity', '0000000000000000000000SELF', 'r-sicily')"
+    r := checkEq r "a name taken in another realm can be taken here"
+      (← Db.scalarInt old "SELECT COUNT(*) FROM account WHERE name = 'Budget.Hut'") 2
+    let twice := "INSERT INTO account (id, name, kind, owner_id, realm_id) VALUES
+      ('acc-again', 'Budget.Hut', 'equity', '0000000000000000000000SELF', 'r-sicily')"
+    r := check r "and taking it twice in one realm is still refused"
+      (← (do Db.exec old twice; pure false) <|> pure true)
     return r
   finally
     IO.FS.removeDirAll root <|> pure ()
@@ -538,78 +652,109 @@ private def settleTests (r : Report) : Report := Id.run do
   return r
 
 /--
-What a share link can reach.
+What a realm is, through the routes that make one.
 
-The property worth testing is not that some particular route is refused — it is
-that the reachable set is small and fixed. A guest sees one budget, posts to one
-account of their own, and everything else is a 404, including routes that exist
-for you.
+A realm is the unit of sharing: one key, one set of members, one thing somebody
+can be let into. Sharing a budget is therefore making a realm and inviting
+somebody to it — and the two things that used to stand in for that, a guest
+route table and a token that speaks for one person on one budget, are gone.
+Checking that they answer 404 and that `budget` is no longer a field of a token
+is the other half of this.
 -/
-private def guestTests (ctx : Ctx) (r : Report) : IO Report := do
+private def realmTests (ctx : Ctx) (r : Report) : IO Report := do
   let mut r := r
-  let budget ← Budgets.open ctx "Shared"
-  let guestParty ← Parties.contact ctx "carla"
-  let g : Guest := { owner := guestParty.id, budget := budget.id }
-  let caller : Api.Caller := { actor := "tok-guest", scopes := Scopes.none, guest := some g }
+  let caller := Api.bootstrapCaller
   let reply (m : String) (segs : List String) (body : Json := Json.mkObj []) : IO Api.Reply :=
     Api.handleSafe ctx caller ((Api.Req.simple m segs).withJson body)
-  -- Everything the ordinary table offers is simply not there.
-  for (m, segs) in [("GET", ["accounts"]), ("GET", ["transactions"]), ("GET", ["budgets"]),
-                    ("GET", ["reports", "people"]), ("GET", ["tokens"]),
-                    ("GET", ["contacts"]), ("GET", ["invoices"])] do
-    r := checkEq r s!"a guest cannot {m} /{String.intercalate "/" segs}"
-      (← reply m segs).code 404
-  -- What they can do: see the budget, and add what they paid for.
-  let seen ← reply "GET" ["guest"]
-  r := checkEq r "a guest can see the budget the link names" seen.code 200
-  match seen.json? with
-  | none => r := check r "the guest view is JSON" false
+  -- Making a realm, and a budget inside it in the same breath.
+  let made ← reply "POST" ["realms"] (Json.mkObj [("name", "Sicily"), ("budget", "Sicily")])
+  r := checkEq r "a realm can be made" made.code 201
+  let some realmJson := made.json? | return check r "the new realm comes back as JSON" false
+  let realmId := (realmJson.getObjValAs? String "id").toOption.getD ""
+  r := check r "and it has an id" (!realmId.isEmpty)
+  r := checkEq r "and it names the budget it was made for"
+    ((realmJson.getObjValAs? String "budget").toOption.getD "") "Sicily"
+  match ← Budgets.get? ctx "Sicily" with
+  | none => r := check r "the budget reached the ledger" false
+  | some b =>
+    let st ← ctx.state.get
+    r := check r "and its account sits in the realm it was opened in"
+      (st.accountByNameIn? ⟨realmId⟩ b.name).isSome
+  -- Listing says the same thing back.
+  let listed ← reply "GET" ["realms"]
+  r := checkEq r "realms can be listed" listed.code 200
+  match listed.json? with
+  | some (.arr rows) =>
+    let mine := rows.filter fun x => (x.getObjValAs? String "id").toOption == some realmId
+    r := checkEq r "and the new one is in the list" mine.size 1
+    r := check r "with you as its admin"
+      (mine.any fun x => (x.getObjValAs? Bool "admin").toOption == some true)
+    r := check r "and no key, because this store syncs with nothing"
+      (mine.any fun x => (x.getObjValAs? Bool "hasKey").toOption == some false)
+  | _ => r := check r "the realm list is an array" false
+  let members ← reply "GET" ["realms", realmId, "members"]
+  r := checkEq r "a realm's members can be read" members.code 200
+  r := checkEq r "a realm that is not there is a 404"
+    (← reply "GET" ["realms", "nope", "members"]).code 404
+  -- An invite is a pending grant on a sequencer, and this store has none.
+  let invited ← reply "POST" ["realms", realmId, "invites"] (Json.mkObj [("for", "carla")])
+  r := checkEq r "an invite without a sequencer is refused" invited.code 400
+  r := check r "and the refusal says what is missing"
+    (Str.containsCI (invited.json?.getD Json.null).compress "sequencer")
+  -- Sync answers for a store that syncs with nothing, rather than failing.
+  let status ← reply "GET" ["sync", "status"]
+  r := checkEq r "sync status answers anyway" status.code 200
+  r := check r "and says this store syncs with nothing"
+    (((status.json?.getD Json.null).getObjValAs? Bool "configured").toOption == some false)
+  r := checkEq r "and a round of it is refused" (← reply "POST" ["sync"]).code 400
+  -- A token is a credential of your own again: `budget` is not a field it reads.
+  let minted ← reply "POST" ["tokens"]
+    (Json.mkObj [("name", "not-a-share-link"), ("scopes", "read"), ("budget", "Sicily"),
+                 ("for", "carla")])
+  r := checkEq r "a token can still be minted" minted.code 201
+  match minted.json? with
+  | none => r := check r "the minted token is JSON" false
   | some j =>
-    r := checkEq r "and is told who they are"
-      ((j.getObjValAs? String "you").toOption.getD "") "carla"
-    r := check r "and nothing in it names an account of yours"
-      (!Str.containsCI j.compress "Assets.Bank")
-  let added ← reply "POST" ["guest", "expenses"]
-    (Json.mkObj [("amount", "42.50"), ("narration", "the taxi"), ("payee", "Taxi"),
-                 ("date", "2026-07-08")])
-  r := checkEq r "a guest can add what they paid for" added.code 201
-  r := checkEq r "and it reaches the budget" (← Budgets.balance ctx budget).minor 4250
-  -- It reached the budget without any of it being yours.
-  let carlaPurse ← Accounts.purse ctx guestParty
-  r := checkEq r "out of their own account and nobody else's"
-    (Ledger.balance (← Txns.list ctx .all {} 10000).toList carlaPurse.id "EUR") (-4250)
-  -- Withdrawing their own is allowed; withdrawing anybody else's is a 404,
-  -- which is the same answer as for a transaction that does not exist.
-  let mineToo : Transaction :=
-    { id := ⟨"guest-mine"⟩, date := (Date.ofIso? "2026-07-08").getD default
-      narration := "yours"
-      postings := [{ account := (← Accounts.ensure ctx "Assets.Bank.Guest").id,
-                     amount := ⟨Commodity.eur, -100⟩ },
-                   { account := (← Budgets.account ctx budget).id,
-                     amount := ⟨Commodity.eur, 100⟩ }] }
-  match mineToo.validate with
-  | .error _ => r := check r "guest fixture balances" false
-  | .ok bt => Txns.put ctx bt "test"
-  r := checkEq r "a guest cannot withdraw a cost of yours"
-    (← reply "DELETE" ["guest", "expenses", "guest-mine"]).code 404
-  r := checkEq r "and it is still there" (← Budgets.balance ctx budget).minor 4350
-  -- Inviting somebody to one budget must not be read as "authentication is set
-  -- up now". It would lock you out of your own client as a side effect, and it
-  -- closes nothing that having no tokens at all had left open.
-  let (_, _) ← Tokens.create ctx "share" (Scopes.ofList [.read, .write]) none (some g)
-  r := check r "a share link is a token" (← Tokens.any ctx)
-  r := check r "but not one of your own, so the API stays as open as it was"
-    (!(← Tokens.anyOwn ctx))
-  let (_, _) ← Tokens.create ctx "mine" (Scopes.ofList [.admin])
-  r := check r "minting one of your own is what locks it down" (← Tokens.anyOwn ctx)
-  -- The order the server reads these in is the whole of the guarantee. A token
-  -- that was presented has to decide who the caller is *before* the
-  -- open-by-default rule is consulted, or a share link handed over while the
-  -- API is still open would come back as the bootstrap caller — full access,
-  -- from the one credential that exists to grant almost none.
-  let stillGuest : Api.Caller := { actor := "tok", scopes := Scopes.none, guest := some g }
-  r := checkEq r "a share link is confined however open the API is"
-    (← Api.handleSafe ctx stillGuest (Api.Req.simple "GET" ["accounts"])).code 404
+    r := check r "and nothing about it is a link" ((j.getObjVal? "link").toOption.isNone)
+    let tok := (j.getObjVal? "token").toOption.getD Json.null
+    r := checkEq r "and its scopes are the ones asked for"
+      ((tok.getObjValAs? String "scopes").toOption.getD "") "read"
+    r := check r "and it says nothing about a budget"
+      ((tok.getObjVal? "budget").toOption.isNone && (tok.getObjVal? "guest").toOption.isNone)
+  -- A pot's name is taken inside a realm and not across the store. An account of
+  -- a budget's name in a realm of somebody else's is their account, written under
+  -- a key this one knows nothing about, and `Core` has always read it that way;
+  -- the projection kept `account.name` unique over the whole table until
+  -- migration 25, so the realm that reused a name was the realm that could not be
+  -- written down — a 500 about a ledger nothing is wrong with.
+  let elba ← reply "POST" ["realms"] (Json.mkObj [("name", "Elba")])
+  r := checkEq r "a second realm can be made" elba.code 201
+  let elbaId := ((elba.json?.getD Json.null).getObjValAs? String "id").toOption.getD ""
+  let pot := Budget.accountName "Ischia"
+  discard <| ctx.commit "test"
+    [.putAccount { id := ⟨"0000000000squatter"⟩, name := pot,
+                   kind := .equity, realm := ⟨elbaId⟩ }]
+    (realm := ⟨elbaId⟩)
+  let ischia ← reply "POST" ["realms"] (Json.mkObj [("name", "Ischia"), ("budget", "Ischia")])
+  r := checkEq r "a budget whose account name is taken in another realm is made anyway"
+    ischia.code 201
+  let ischiaId := ((ischia.json?.getD Json.null).getObjValAs? String "id").toOption.getD ""
+  r := check r "and it reached the ledger" ((← Budgets.get? ctx "Ischia").isSome)
+  let both ← ctx.state.get
+  r := check r "its pot is in the realm it was opened in"
+    (both.accountByNameIn? ⟨ischiaId⟩ pot).isSome
+  r := checkEq r "and the account of that name in the other realm is untouched"
+    ((both.accountByNameIn? ⟨elbaId⟩ pot).map (·.id.val)) (some "0000000000squatter")
+  r := checkEq r "so two accounts of one name stand, one to a realm"
+    (both.accountsSorted.filter (·.name == pot)).length 2
+  -- The tables are where this used to come apart, so they are asked separately.
+  r := checkEq r "and the projection holds both rows"
+    (← Db.scalarInt ctx.db s!"SELECT COUNT(*) FROM account WHERE name = {Db.lit pot}") 2
+  -- The route table a share link used to be dispatched to is not there at all.
+  for (m, segs) in [("GET", ["guest"]), ("POST", ["guest", "expenses"]),
+                    ("DELETE", ["guest", "expenses", "anything"])] do
+    r := checkEq r s!"the retired {m} /{String.intercalate "/" segs} is gone"
+      (← reply m segs).code 404
   return r
 
 /-- A participant, resolved the way the API resolves one. -/
@@ -1111,8 +1256,11 @@ private def divideTests (ctx : Ctx) (r : Report) : IO Report := do
   let sha := "00feed00feed00feed00feed00feed00feed00feed00feed00feed00feed0000"
   let cash ← Accounts.ensure ctx "Assets.Cash.Hut" (kind := some .asset)
   let rest ← Accounts.ensure ctx "Expenses.Hut.Unclassified" (kind := some .expense)
-  Db.exec ctx.db s!"INSERT OR IGNORE INTO attachment (sha256, mime, bytes, created_at)
-                    VALUES ({Db.lit sha}, 'application/pdf', 1, '2026-08-06T00:00:00')"
+  -- A stored file, registered the way storing one does: the bytes are not the
+  -- point here, and the row is a projection of state like any other.
+  discard <| ctx.commit "test" [.registerBlob
+    { sha256 := sha, mime := "application/pdf", bytes := 1, origName := none,
+      createdAt := "2026-08-06T00:00:00" }]
   Receipts.record ctx sha
     { merchant := some "Bächlitalhütte SAC", date := Date.ofIso? "2026-08-06"
       total := some ⟨chf, 64200⟩
@@ -1205,8 +1353,9 @@ private def divideTests (ctx : Ctx) (r : Report) : IO Report := do
   let sha2 := "00beef0000beef0000beef0000beef0000beef0000beef0000beef0000beef00"
   let bunk ← Accounts.ensure ctx "Assets.Cash.Bunk" (kind := some .asset)
   let pot ← Accounts.ensure ctx "Expenses.Bunk.Unclassified" (kind := some .expense)
-  Db.exec ctx.db s!"INSERT OR IGNORE INTO attachment (sha256, mime, bytes, created_at)
-                    VALUES ({Db.lit sha2}, 'application/pdf', 1, '2026-08-01T00:00:00')"
+  discard <| ctx.commit "test" [.registerBlob
+    { sha256 := sha2, mime := "application/pdf", bytes := 1, origName := none,
+      createdAt := "2026-08-01T00:00:00" }]
   Receipts.record ctx sha2
     { total := some ⟨chf, 132400⟩
       items := [{ description := "FORFAIT 1/2 PENSION", qty := some 18, amount := ⟨chf, 122400⟩ },
@@ -1455,14 +1604,17 @@ private def workflowTests (ctx : Ctx) (r : Report) : IO Report := do
   let eur := Commodity.eur
   -- Deleting a draft winds the number back, so the sequence has no hole in it.
   let year := 2026
+  -- The counter is keyed by realm: one sequence for the whole ledger meant an
+  -- admin of any realm a reader could open moved the ledger owner's numbering.
+  let counterName := s!"{Realm.selfId.val}:invoice:{year}"
   let before ← Db.scalarInt ctx.db
-    s!"SELECT value FROM counter WHERE name = {Db.lit s!"invoice:{year}"}"
+    s!"SELECT value FROM counter WHERE name = {Db.lit counterName}"
   let scratch ← Invoices.create ctx "typo" [{ description := "x", qtyMilli := 1000, unitPrice := ⟨eur, 100⟩ }]
     (.link "https://example.org") ((Date.ofIso? "2026-07-10").getD default)
     ((Date.ofIso? "2026-08-01").getD default) eur
   Invoices.delete ctx scratch.id
   let after ← Db.scalarInt ctx.db
-    s!"SELECT value FROM counter WHERE name = {Db.lit s!"invoice:{year}"}"
+    s!"SELECT value FROM counter WHERE name = {Db.lit counterName}"
   r := checkEq r "deleting a draft leaves no gap in the numbering" after before
   r := check r "and the invoice itself is gone" (← Invoices.get? ctx scratch.number).isNone
   -- Only the newest may be wound back; an older hole would renumber a live one.
@@ -1474,7 +1626,7 @@ private def workflowTests (ctx : Ctx) (r : Report) : IO Report := do
     ((Date.ofIso? "2026-08-01").getD default) eur
   Invoices.delete ctx keep.id
   r := checkEq r "removing an older draft does not renumber the counter"
-    (← Db.scalarInt ctx.db s!"SELECT value FROM counter WHERE name = {Db.lit s!"invoice:{year}"}")
+    (← Db.scalarInt ctx.db s!"SELECT value FROM counter WHERE name = {Db.lit counterName}")
     ((newer.number.splitOn "-")[1]!.toNat!)
   return r
 
@@ -1515,6 +1667,1144 @@ private def contactTests (ctx : Ctx) (r : Report) : IO Report := do
     ((← Parties.byName? ctx "Anna Beispiel").isNone)
   return r
 
+/-! ## The pure core -/
+
+/-- The day the core fixtures happen on. Nothing in `Core` knows today's date. -/
+private def coreDate : Date := (Date.ofIso? "2026-03-01").getD default
+
+/-- An account for the core fixtures. -/
+private def coreAccount (id name : String) (kind : AccountKind)
+    (owner : PartyId := Party.selfId) : Account :=
+  { id := ⟨id⟩, name, kind, owner }
+
+/-- A euro posting, by account id. -/
+private def cents (acc : String) (minor : Int) : Posting :=
+  { account := ⟨acc⟩, amount := ⟨Commodity.eur, minor⟩ }
+
+/-- A dated transaction for the core fixtures. -/
+private def coreTxn (id : String) (postings : List Posting)
+    (narration : String := "dinner") : Transaction :=
+  { id := ⟨id⟩, date := coreDate, narration, postings }
+
+/-- One event by the self member, one part per operation, all in the self realm. -/
+private def coreEvent (id : String) (ops : List Op) : Event :=
+  { id, author := Member.selfId, composedAt := "2026-03-01T00:00:00Z"
+    parts := ops.map (fun op => { realm := Realm.selfId, op }) }
+
+/-- Applies an operation as the self member, or leaves the state alone if it fails. -/
+private def coreStep (s : State) (op : Op) : State :=
+  match applyOp s Member.selfId Realm.selfId op with
+  | .ok (s', _) => s'
+  | .error _ => s
+
+/-- What an operation refused with, or the empty string when it went through. -/
+private def coreError (s : State) (op : Op) : String :=
+  match applyOp s Member.selfId Realm.selfId op with
+  | .ok _ => ""
+  | .error e => e
+
+/-- The same, for an operation written by somebody else, in a realm of its own. -/
+private def coreErrorAs (who : String) (realm : RealmId) (s : State) (op : Op) : String :=
+  match applyOp s ⟨who⟩ realm op with
+  | .ok _ => ""
+  | .error e => e
+
+/-- Whether an operation written by somebody else, in a realm of its own, was taken. -/
+private def coreAllows (who : String) (realm : RealmId) (s : State) (op : Op) : Bool :=
+  (applyOp s ⟨who⟩ realm op).toOption.isSome
+
+/-- The accounts every core test starts from. -/
+private def coreBase : State := Id.run do
+  let ops : List Op :=
+    [ .putAccount (coreAccount "acc-bank" "Assets.Bank" .asset)
+    , .putAccount (coreAccount "acc-food" "Expenses.Food" .expense)
+    , .putAccount (coreAccount "acc-unc" "Income.Unclassified" .income)
+    , .putAccount (coreAccount "acc-anna" "Assets.Purse.Anna" .asset ⟨"party-anna"⟩)
+    , .putAccount (coreAccount "acc-bob" "Assets.Purse.Bob" .asset ⟨"party-bob"⟩)
+    , .putAccount { coreAccount "acc-old" "Assets.Shoebox" .asset with closedOn := some coreDate } ]
+  let mut s := State.init
+  for op in ops do
+    s := coreStep s op
+  return s
+
+/-! ## Budgets and invoices in the pure core -/
+
+/-- The budget the fixtures divide. Opened as `Hut`, which makes `Budget.Hut`. -/
+private def coreHut : Budget := { id := ⟨"b-hut"⟩, name := "Hut", note := none, closed := false }
+
+/-- Who the hut is shared between: you and Anna, equally. -/
+private def coreAmong : List Participant :=
+  [ { owner := Party.selfId, name := "me", account := "Expenses.Food" }
+  , { owner := ⟨"party-anna"⟩, name := "Anna", account := "Assets.Purse.Anna" } ]
+
+/-- Applies a list of operations in order, skipping any that fails. -/
+private def coreSteps (s : State) (ops : List Op) : State := ops.foldl coreStep s
+
+/-- A cost somebody paid for, straight into the budget. -/
+private def coreCost (id from_ : String) (minor : Int) (narration : String) : Transaction :=
+  coreTxn id [cents from_ (-minor), cents "acc-hut" minor] narration
+
+/-- The budget as the state has it, so its name is the one it was opened under. -/
+private def coreBudget (s : State) : Budget :=
+  ((s.budget? ⟨"b-hut"⟩).map (·.budget)).getD coreHut
+
+/-- The ledger with people, a label and an open budget: what the budget tests start from. -/
+private def coreOpened : State :=
+  coreSteps coreBase
+    [ .putParty { id := Party.selfId, name := "me", kind := "self" }
+    , .putParty { id := ⟨"party-anna"⟩, name := "Anna", kind := "contact" }
+    , .putParty { id := ⟨"party-bob"⟩, name := "Bob", kind := "contact" }
+    , .putLabel { id := ⟨"lbl-hut"⟩, name := "budget:Hut" }
+    , .openBudget coreHut (coreAccount "acc-hut" "Hut" .expense)
+    , .setParticipants ⟨"b-hut"⟩ coreAmong ]
+
+/-- Two costs, hers and yours, divided between the two of you. -/
+private def coreDivided : State :=
+  coreSteps coreOpened
+    [ .contribute ⟨"b-hut"⟩ (coreCost "t-hut1" "acc-bank" 10000 "the hut")
+    , .contribute ⟨"b-hut"⟩ (coreCost "t-hut2" "acc-anna" 6000 "groceries")
+    , .allocate ⟨"b-hut"⟩ coreAmong Commodity.eur coreDate none ⟨"t-alloc1"⟩
+        [⟨"t-claim1"⟩] ⟨"lbl-hut"⟩ ]
+
+/-- A receipt that turns up afterwards, and a claim from a plan that is out of date. -/
+private def coreLate : State :=
+  coreSteps coreDivided
+    [ .raiseClaim { id := ⟨"t-claim-bob"⟩, date := coreDate, narration := "an older plan"
+                    state := .pending, labels := [⟨"lbl-hut"⟩]
+                    postings := [cents "acc-bank" 1500, cents "acc-bob" (-1500)] }
+    , .contribute ⟨"b-hut"⟩ (coreCost "t-hut3" "acc-bank" 2000 "a late ticket") ]
+
+/-- The late receipt, divided. -/
+private def coreToppedUp : State :=
+  coreStep coreLate (.allocate ⟨"b-hut"⟩ coreAmong Commodity.eur coreDate none ⟨"t-alloc2"⟩
+    [⟨"t-claim2"⟩] ⟨"lbl-hut"⟩)
+
+/-- An invoice to Anna, as it arrives at `issueInvoice`: unnumbered and unreferenced. -/
+private def coreDraft (id : String) : Invoice :=
+  { id := ⟨id⟩, number := "", issued := coreDate, due := coreDate
+    payerId := some ⟨"party-anna"⟩, payerName := "Anna", commodity := Commodity.eur
+    reference := "", status := .draft, note := none, settledTxn := none
+    payment := .link "https://example.org/pay", sourceAccount := none, budgetId := none
+    pendingTxn := none
+    lines := [{ description := "her share", qtyMilli := 1000
+                unitPrice := ⟨Commodity.eur, 5000⟩ }] }
+
+/--
+Dividing a budget, squaring it up, and writing the result down.
+
+The arithmetic is `Core/Budgets.lean` and the writing is `applyOp`; what is
+checked here is that the two together do what the store used to do in SQL —
+including the awkward parts: a second division tops up rather than dividing
+twice, a claim between the same two people is revised rather than duplicated,
+and a number that is deleted is handed out again.
+-/
+private def coreBudgetTests (r : Report) : Report := Id.run do
+  let mut r := r
+  let eur := Commodity.eur
+  -- Which realm a budget was made for is read off the budget's own realm and the
+  -- account it holds inside it. Asked by name across the ledger, an equity
+  -- account of that name in a realm of somebody else's — the first of the name
+  -- in id order — answered for the budget instead, and named that realm as the
+  -- one the budget was made for.
+  let squatted : State :=
+    { coreOpened with
+      realms := coreOpened.realms.insert "r-elsewhere"
+        { id := ⟨"r-elsewhere"⟩, name := "Elsewhere" }
+      accounts := coreOpened.accounts.insert "acc-aaa"
+        { coreAccount "acc-aaa" "Budget.Hut" .equity with realm := ⟨"r-elsewhere"⟩ } }
+  r := checkEq r "a realm is named for the budget opened in it"
+    (Wire.budgetOfRealm squatted { id := Realm.selfId, name := "me" }) (some "Hut")
+  r := checkEq r "and not for one that only holds an account of that budget's name"
+    (Wire.budgetOfRealm squatted { id := ⟨"r-elsewhere"⟩, name := "Elsewhere" }) none
+  -- Opening a budget makes the equity account that holds it.
+  match coreOpened.accountByNameIn? Realm.selfId "Budget.Hut" with
+  | none => r := check r "opening a budget makes the account that holds it" false
+  | some a =>
+    r := check r "a budget account is equity, not an asset" (a.kind == .equity)
+    r := checkEq r "and a bare name is placed under Budget" a.name "Budget.Hut"
+  r := checkEq r "the budget itself is recorded under that name"
+    (coreBudget coreOpened).name "Budget.Hut"
+  -- Dividing two costs between two people, to the cent.
+  match coreDivided.txn? ⟨"t-alloc1"⟩ with
+  | none => r := check r "dividing a budget writes one transaction" false
+  | some t =>
+    r := check r "a division balances" (decide t.Balanced)
+    r := checkEq r "your share of the weekend" (t.netIn ⟨"acc-food"⟩ "EUR") 8000
+    r := checkEq r "hers" (t.netIn ⟨"acc-anna"⟩ "EUR") 8000
+    r := checkEq r "and the budget is emptied by exactly the two costs"
+      (t.netIn ⟨"acc-hut"⟩ "EUR") (-16000)
+  r := checkEq r "so nothing is left undivided"
+    (Budget.balance (coreBudget coreDivided) coreDivided eur).minor 0
+  -- The claims it raises are the ones that leave everybody at zero.
+  let hut := coreBudget coreDivided
+  let plan := (Budget.claims hut coreDivided).filterMap
+    (Pendings.transferOf coreDivided.accountsSorted.toArray)
+  r := checkEq r "one claim squares the weekend up" plan.length 1
+  r := check r "and performing it leaves everybody at zero"
+    ((Settle.residual ((Budget.standings hut coreDivided eur).map Standing.position) plan).all
+      fun p => p.minor == 0)
+  match coreDivided.txn? ⟨"t-claim1"⟩ with
+  | none => r := check r "dividing raises the claim that settles it" false
+  | some c =>
+    r := checkEq r "for what she owes once her groceries are netted off"
+      (Pendings.amount c).minor 2000
+    r := check r "and it has not happened yet" (c.state == .pending)
+  -- A late receipt is divided on its own; what was decided stays decided.
+  match coreToppedUp.txn? ⟨"t-alloc2"⟩, coreToppedUp.txn? ⟨"t-alloc1"⟩ with
+  | some second, some first =>
+    r := checkEq r "a second division tops each person up" (second.netIn ⟨"acc-food"⟩ "EUR") 1000
+    r := checkEq r "both of them" (second.netIn ⟨"acc-anna"⟩ "EUR") 1000
+    r := checkEq r "over only what came in since" (second.netIn ⟨"acc-hut"⟩ "EUR") (-2000)
+    r := checkEq r "and the first division is untouched" (first.netIn ⟨"acc-food"⟩ "EUR") 8000
+  | _, _ => r := check r "a late cost is divided on its own" false
+  -- Settling revises the request it has already made, and withdraws the rest.
+  match coreToppedUp.txn? ⟨"t-claim1"⟩, coreToppedUp.txn? ⟨"t-claim-bob"⟩ with
+  | some revised, some stale =>
+    r := checkEq r "a claim between the same two people is revised in place"
+      (Pendings.amount revised).minor 3000
+    r := check r "and stays outstanding" (revised.state == .pending)
+    r := check r "a claim the facts have overtaken is withdrawn" (stale.state == .void)
+  | _, _ => r := check r "settling revises rather than duplicates" false
+  -- Where a settlement lands, when the budget has never moved anything of theirs.
+  r := checkEq r "somebody with no leg in a budget settles through their purse"
+    (((Budget.settlementAccount (coreBudget coreOpened) coreOpened ⟨"party-bob"⟩ eur).toOption.map
+      (·.val)).getD "") "acc-bob"
+  r := check r "and somebody with no account at all cannot be settled with"
+    (Budget.settlementAccount (coreBudget coreOpened) coreOpened ⟨"party-nobody"⟩
+      eur).toOption.isNone
+  r := check r "a share of hers may not land in an account of yours"
+    (Str.containsCI
+      (coreError coreLate (.allocate ⟨"b-hut"⟩
+        [{ owner := ⟨"party-anna"⟩, name := "Anna", account := "Expenses.Food" }]
+        eur coreDate none ⟨"t-nowhere"⟩ [] ⟨"lbl-hut"⟩))
+      "belongs to somebody else")
+  r := check r "a budget still holding money cannot be settled"
+    (Str.containsCI (coreError coreLate (.settle ⟨"b-hut"⟩ eur none coreDate [] ⟨"lbl-hut"⟩))
+      "still holds")
+  -- Closing, reopening, and closing again.
+  let closed := coreStep coreToppedUp
+    (.closeBudget ⟨"b-hut"⟩ none eur none coreDate ⟨"t-alloc3"⟩ [⟨"t-claim3"⟩] ⟨"lbl-hut"⟩)
+  r := check r "closing a budget with nothing left to divide closes it"
+    (coreBudget closed).closed
+  r := check r "and writes no division it has no use for" (closed.txn? ⟨"t-alloc3"⟩).isNone
+  r := check r "a closed budget takes no more costs"
+    (Str.containsCI (coreError closed
+      (.contribute ⟨"b-hut"⟩ (coreCost "t-hut9" "acc-bank" 100 "one more"))) "is closed")
+  let again := coreSteps closed
+    [ .reopenBudget ⟨"b-hut"⟩
+    , .contribute ⟨"b-hut"⟩ (coreCost "t-hut4" "acc-bank" 4000 "an extra night")
+    , .closeBudget ⟨"b-hut"⟩ none eur none coreDate ⟨"t-alloc4"⟩ [⟨"t-claim4"⟩] ⟨"lbl-hut"⟩ ]
+  r := check r "closing it again closes it again" (coreBudget again).closed
+  match again.txn? ⟨"t-alloc4"⟩ with
+  | none => r := check r "a second close writes a second division" false
+  | some t =>
+    r := checkEq r "the second division covers only what came in since"
+      (t.netIn ⟨"acc-hut"⟩ "EUR") (-4000)
+    r := checkEq r "half of it to each of you" (t.netIn ⟨"acc-anna"⟩ "EUR") 2000
+  r := checkEq r "and what was decided before it stands"
+    (((again.txn? ⟨"t-alloc1"⟩).map fun t => t.netIn ⟨"acc-food"⟩ "EUR").getD 0) 8000
+  -- Invoice numbers are gapless, and a deleted draft gives its number back.
+  let numberOf (s : State) (id : String) : String :=
+    ((s.invoice? ⟨id⟩).map (·.invoice.number)).getD ""
+  let numbered := coreSteps coreOpened
+    [ .issueInvoice (coreDraft "i1") [], .issueInvoice (coreDraft "i2") []
+    , .issueInvoice (coreDraft "i3") [] ]
+  r := checkEq r "invoices are numbered from one" (numberOf numbered "i1") "2026-0001"
+  r := checkEq r "gaplessly" (numberOf numbered "i2") "2026-0002"
+  r := checkEq r "and in the order they were written" (numberOf numbered "i3") "2026-0003"
+  r := check r "each with a reference the importer can find again"
+    (Rf.isValid (((numbered.invoice? ⟨"i1"⟩).map (·.invoice.reference)).getD ""))
+  let rewound := coreSteps numbered [.deleteInvoice ⟨"i3"⟩, .issueInvoice (coreDraft "i4") []]
+  r := check r "a deleted draft is gone" (rewound.invoice? ⟨"i3"⟩).isNone
+  r := checkEq r "and the number it held is handed out again" (numberOf rewound "i4") "2026-0003"
+  r := check r "an invoice somebody has seen is voided rather than deleted"
+    (Str.containsCI
+      (coreError (coreStep numbered (.setInvoiceStatus ⟨"i1"⟩ .sent)) (.deleteInvoice ⟨"i1"⟩))
+      "void it")
+  -- One invoice per claim addressed to you, and none for your own share.
+  match Budget.invoicesFor (coreBudget coreToppedUp) coreToppedUp
+      (.link "https://example.org/pay") coreDate coreDate eur none none
+      [⟨"i-anna"⟩, ⟨"i-spare"⟩] with
+  | .error e => r := check r s!"a budget raises the invoices for its claims ({e})" false
+  | .ok out =>
+    r := checkEq r "one invoice per claim addressed to an account of yours" out.length 1
+    r := check r "and none for your own share" (out.all fun x => x.1.payerName != "me")
+    match out.head? with
+    | none => r := check r "the invoice to her is raised" false
+    | some (inv, sources) =>
+      r := checkEq r "addressed to the person who owes" inv.payerName "Anna"
+      r := checkEq r "for exactly what her claim asks" inv.total.minor 3000
+      r := check r "saying what she already paid for herself"
+        (inv.lines.any fun l => l.description.startsWith "you paid: ")
+      r := checkEq r "and billing the costs it was raised from" sources.length 3
+  return r
+
+/--
+The pure core: what `applyOp` refuses, and what it does when it agrees.
+
+Every case here is decided without a database, which is the point of the
+exercise — the store will apply these same operations and only project what
+comes back.
+-/
+private def coreTests (r : Report) : Report := Id.run do
+  let mut r := r
+  let s0 := coreBase
+  let dinner := coreTxn "t-dinner" [cents "acc-bank" (-10000), cents "acc-food" 10000]
+  -- A part that does not balance is not a part.
+  r := check r "an unbalanced transaction is refused"
+    (Str.containsCI (coreError s0 (.putTransaction
+      (coreTxn "t-bad" [cents "acc-bank" (-10000), cents "acc-food" 9000]))) "does not balance")
+  -- A closed account takes nothing further.
+  r := check r "a closed account takes no more postings"
+    (Str.containsCI (coreError s0 (.putTransaction
+      (coreTxn "t-old" [cents "acc-old" (-10000), cents "acc-food" 10000]))) "is closed")
+  -- Rights: a second member may not post until she is told she may.
+  let withMara := coreSteps s0
+    [ .addMember { id := ⟨"mara"⟩, name := "Mara", party := ⟨"party-mara"⟩ }
+    , .grant Realm.selfId ⟨"mara"⟩ .viewer
+        (coreAccount "acc-mara" "Assets.Purse.Mara" .asset ⟨"party-mara"⟩) ]
+  let asMara (s : State) : String :=
+    match applyOp s ⟨"mara"⟩ Realm.selfId (.putTransaction dinner) with
+    | .ok _ => ""
+    | .error e => e
+  r := check r "a member with no rights may not post"
+    (Str.containsCI (asMara withMara) "you may not post to")
+  r := check r "and somebody who is not in the realm at all may not even try"
+    (Str.containsCI
+      (match applyOp s0 ⟨"zoe"⟩ Realm.selfId (.putTransaction dinner) with
+       | .ok _ => "" | .error e => e)
+      "not in that realm")
+  let told := coreStep (coreStep withMara (.setAccountRights ⟨"acc-bank"⟩ [⟨"mara"⟩]))
+    (.setAccountRights ⟨"acc-food"⟩ [⟨"mara"⟩])
+  r := checkEq r "a member named as a poster may" (asMara told) ""
+  -- Handing an account over is a separate decision from putting one.
+  let handed := coreStep s0 (.setAccountOwner ⟨"acc-food"⟩ ⟨"party-anna"⟩)
+  r := checkEq r "an account can be handed to somebody else"
+    (((handed.account? ⟨"acc-food"⟩).map (·.owner.val)).getD "") "party-anna"
+  r := check r "and putting it again does not take it back"
+    (((coreStep handed (.putAccount (coreAccount "acc-food" "Expenses.Food" .expense))).account?
+      ⟨"acc-food"⟩).map (·.owner.val) == some "party-anna")
+  -- Splitting: the shares add back to exactly what was paid.
+  let s1 := coreStep s0 (.putTransaction dinner)
+  let s2 := coreStep s1 (.splitTransaction ⟨"t-dinner"⟩ [⟨"acc-anna"⟩, ⟨"acc-bob"⟩] true)
+  match s2.txn? ⟨"t-dinner"⟩ with
+  | none => r := check r "the split transaction is still there" false
+  | some t =>
+    r := checkEq r "splitting leaves the funding leg alone" (t.netIn ⟨"acc-bank"⟩ "EUR") (-10000)
+    r := checkEq r "the shares add back to the whole"
+      (t.netIn ⟨"acc-food"⟩ "EUR" + t.netIn ⟨"acc-anna"⟩ "EUR" + t.netIn ⟨"acc-bob"⟩ "EUR")
+      10000
+    r := check r "and no two shares differ by more than a cent"
+      ((t.netIn ⟨"acc-anna"⟩ "EUR" - t.netIn ⟨"acc-food"⟩ "EUR").natAbs ≤ 1)
+    r := check r "a split transaction balances" (decide t.Balanced)
+  -- Merging and unmerging are inverses, leg for leg.
+  let sA := coreStep (coreStep s0 (.putTransaction
+      (coreTxn "t-a" [cents "acc-bank" (-10000), cents "acc-food" 10000])))
+    (.putTransaction (coreTxn "t-b" [cents "acc-bank" (-250), cents "acc-food" 250] "card fee"))
+  let sM := coreStep sA (.mergeTransactions [⟨"t-a"⟩, ⟨"t-b"⟩] ⟨"t-m"⟩ none none [])
+  let sU := coreStep sM (.unmergeTransaction ⟨"t-m"⟩ [⟨"t-a2"⟩, ⟨"t-b2"⟩])
+  let legs (s : State) (ids : List String) : String :=
+    String.intercalate ", "
+      ((((ids.filterMap (fun i => s.txn? ⟨i⟩)).flatMap (fun t =>
+        t.postings.map (fun p => s!"{p.account.val} {p.amount.minor}")))).mergeSort (· ≤ ·))
+  r := check r "merging retires its sources"
+    ((sM.txn? ⟨"t-a"⟩).isNone && (sM.txn? ⟨"t-b"⟩).isNone && (sM.txn? ⟨"t-m"⟩).isSome)
+  r := check r "unmerging retires the merged transaction" (sU.txn? ⟨"t-m"⟩).isNone
+  r := checkEq r "merging and unmerging round-trips the postings"
+    (legs sU ["t-a2", "t-b2"]) (legs sA ["t-a", "t-b"])
+  -- A division may book its spending anywhere; it may not invent money.
+  r := check r "parts that take different money out of the funding account are refused"
+    (Str.containsCI
+      (coreError s1 (.replaceTransaction ⟨"t-dinner"⟩
+        [ coreTxn "t-p1" [cents "acc-bank" (-6000), cents "acc-food" 6000]
+        , coreTxn "t-p2" [cents "acc-bank" (-3000), cents "acc-food" 3000] ] "divide"))
+      "do not take the same money out of")
+  let sR := coreStep s1 (.replaceTransaction ⟨"t-dinner"⟩
+    [ coreTxn "t-p1" [cents "acc-bank" (-6000), cents "acc-food" 6000]
+    , coreTxn "t-p2" [cents "acc-bank" (-4000), cents "acc-anna" 4000] ] "divide")
+  r := check r "parts that take the same money are written"
+    ((sR.txn? ⟨"t-dinner"⟩).isNone && (sR.txn? ⟨"t-p1"⟩).isSome && (sR.txn? ⟨"t-p2"⟩).isSome)
+  -- A part payment splits the claim rather than quietly shrinking it.
+  let sC := coreStep s0 (.raiseClaim
+    { id := ⟨"t-claim"⟩, date := coreDate, narration := "her share", state := .pending
+      postings := [cents "acc-bank" 5000, cents "acc-anna" (-5000)] })
+  let sP := coreStep sC (.putTransaction
+    (coreTxn "t-paid" [cents "acc-bank" 2000, cents "acc-unc" (-2000)] "on account"))
+  let sV := coreStep sP (.resolveClaim ⟨"t-claim"⟩ ⟨"t-paid"⟩ ⟨"t-claim-part"⟩)
+  match sV.txn? ⟨"t-claim-part"⟩, sV.txn? ⟨"t-claim"⟩ with
+  | some met, some rest =>
+    r := check r "the part that was met is settled" (met.state == .settled)
+    r := checkEq r "for exactly what arrived" (Pendings.amount met).minor 2000
+    r := check r "and what is left is still pending" (rest.state == .pending)
+    r := checkEq r "reduced by what was paid" (Pendings.amount rest).minor 3000
+  | _, _ => r := check r "a part payment splits the claim" false
+  r := checkEq r "meeting a claim tells the payment who the money was from"
+    (((sV.txn? ⟨"t-paid"⟩).map (fun t => t.netIn ⟨"acc-anna"⟩ "EUR")).getD 0) (-2000)
+  -- A claim is exactly two legs, whichever door it comes through.
+  r := check r "a claim with three legs is refused"
+    (Str.containsCI (coreError s0 (.raiseClaim
+      { id := ⟨"t-three"⟩, date := coreDate, narration := "three ways", state := .pending
+        postings := [cents "acc-bank" 6000, cents "acc-anna" (-3000),
+                     cents "acc-bob" (-3000)] })) "exactly two legs")
+  -- Paying a claim: the person who would have seen the money arrive, and nobody
+  -- else. The payer saying so is a receipt they wrote themselves.
+  let purses := coreSteps s0
+    [ .addMember { id := ⟨"mara"⟩, name := "Mara", party := ⟨"party-mara"⟩ }
+    , .addMember { id := ⟨"nils"⟩, name := "Nils", party := ⟨"party-nils"⟩ }
+    , .addMember { id := ⟨"otto"⟩, name := "Otto", party := ⟨"party-otto"⟩ }
+    , .grant Realm.selfId ⟨"mara"⟩ .viewer
+        (coreAccount "acc-mara" "Assets.Purse.Mara" .asset ⟨"party-mara"⟩)
+    , .grant Realm.selfId ⟨"nils"⟩ .viewer
+        (coreAccount "acc-nils" "Assets.Purse.Nils" .asset ⟨"party-nils"⟩)
+    , .grant Realm.selfId ⟨"otto"⟩ .viewer
+        (coreAccount "acc-otto" "Assets.Purse.Otto" .asset ⟨"party-otto"⟩)
+    , .raiseClaim
+        { id := ⟨"t-claim-m"⟩, date := coreDate, narration := "her share", state := .pending
+          postings := [cents "acc-nils" 5000, cents "acc-mara" (-5000)] } ]
+  let payAs (who : String) (s : State) (pid : String) : Except String State :=
+    (applyOp s ⟨who⟩ Realm.selfId (.payClaim ⟨"t-claim-m"⟩ ⟨pid⟩ coreDate)).map (·.1)
+  match payAs "nils" purses "t-pay" with
+  | .error e => r := check r s!"the receiver's member may pay a claim: {e}" false
+  | .ok paid =>
+    match paid.txn? ⟨"t-pay"⟩, paid.txn? ⟨"t-claim-m"⟩ with
+    | some entry, some met =>
+      r := checkEq r "paying a claim moves exactly what it asked for"
+        (entry.netIn ⟨"acc-nils"⟩ "EUR") 5000
+      r := checkEq r "out of the account that owed it" (entry.netIn ⟨"acc-mara"⟩ "EUR") (-5000)
+      r := checkEq r "and says what it is for" entry.narration "payment of her share"
+      r := check r "both legs are tagged as the claim's"
+        (entry.postings.all (fun p => p.tag == some Pendings.tag))
+      r := check r "the payment is posted" (entry.state == .posted)
+      r := check r "and the claim it met is settled" (met.state == .settled)
+    | _, _ => r := check r "paying a claim writes the payment and settles the claim" false
+  r := check r "the member who owes it may not say it was paid"
+    (Str.containsCI
+      (match payAs "mara" purses "t-pay" with | .ok _ => "" | .error e => e)
+      "only the receiver or an admin")
+  r := check r "and neither may a third member"
+    (Str.containsCI
+      (match payAs "otto" purses "t-pay" with | .ok _ => "" | .error e => e)
+      "only the receiver or an admin")
+  r := check r "an admin of the realm may"
+    (payAs Member.selfId.val purses "t-pay").toOption.isSome
+  match payAs "nils" purses "t-pay" with
+  | .error _ => r := check r "a claim can be paid once" false
+  | .ok paid =>
+    r := check r "and a claim that is already settled cannot be paid again"
+      (Str.containsCI
+        (match payAs "nils" paid "t-pay-again" with | .ok _ => "" | .error e => e)
+        "already settled")
+  r := check r "a claim between accounts that cannot hold money is not paid at all"
+    (Str.containsCI
+      (coreError
+        (coreSteps coreOpened
+          [ .raiseClaim
+              { id := ⟨"t-claim-e"⟩, date := coreDate, narration := "into the pot"
+                state := .pending
+                postings := [cents "acc-hut" 1000, cents "acc-anna" (-1000)] } ])
+        (.payClaim ⟨"t-claim-e"⟩ ⟨"t-pay-e"⟩ coreDate))
+      "accounts that can hold money")
+  -- A budget is an account anybody in the realm may put a cost into, while it is open.
+  let shared := coreSteps coreOpened
+    [ .addMember { id := ⟨"mara"⟩, name := "Mara", party := ⟨"party-mara"⟩ }
+    , .grant Realm.selfId ⟨"mara"⟩ .viewer
+        (coreAccount "acc-mara" "Assets.Purse.Mara" .asset ⟨"party-mara"⟩) ]
+  let contribution := coreTxn "t-her-cost" [cents "acc-mara" (-2500), cents "acc-hut" 2500] "food"
+  let asMaraIn (s : State) : String :=
+    match applyOp s ⟨"mara"⟩ Realm.selfId (.putTransaction contribution) with
+    | .ok _ => ""
+    | .error e => e
+  r := checkEq r "a participant may post into a budget of their realm while it is open"
+    (asMaraIn shared) ""
+  let shut := coreStep shared (.closeBudget ⟨"b-hut"⟩ none Commodity.eur none coreDate
+    ⟨"t-alloc-c"⟩ [⟨"t-claim-c"⟩] ⟨"lbl-hut"⟩)
+  r := check r "the budget really is closed"
+    (((shut.budget? ⟨"b-hut"⟩).map (·.budget.closed)) == some true)
+  r := check r "and a closed budget takes nothing further from them"
+    (Str.containsCI (asMaraIn shut) "you may not post to")
+  -- A grant hands out a purse; it never moves an account that is already elsewhere.
+  let twoRealms := coreSteps s0
+    [ .addMember { id := ⟨"mara"⟩, name := "Mara", party := ⟨"party-mara"⟩ }
+    , .createRealm { id := ⟨"realm-flat"⟩, name := "flat"
+                     members := [(Member.selfId, .admin)], generation := 0 } ]
+  r := check r "a grant naming an account of another realm is refused"
+    (Str.containsCI (coreErrorAs Member.selfId.val ⟨"realm-flat"⟩ twoRealms
+      (.grant ⟨"realm-flat"⟩ ⟨"mara"⟩ .viewer
+        (coreAccount "acc-bank" "Assets.Bank" .asset))) "another realm")
+  r := check r "and a grant written in a realm other than the one it names is refused too"
+    (Str.containsCI (coreError twoRealms (.grant ⟨"realm-flat"⟩ ⟨"mara"⟩ .viewer
+      (coreAccount "acc-mara" "Assets.Purse.Mara" .asset))) "only change the realm it names")
+  let regranted := coreStep twoRealms (.grant Realm.selfId ⟨"mara"⟩ .viewer
+    (coreAccount "acc-bank" "Assets.Bank" .asset))
+  r := check r "and a grant naming one of this realm's own accounts leaves it alone"
+    (((regranted.account? ⟨"acc-bank"⟩).map (fun a => (a.realm, a.bridgeOf))) ==
+      some (Realm.selfId, none))
+  r := check r "while still letting the member in"
+    (((regranted.realm? Realm.selfId).map (fun x => x.isMember ⟨"mara"⟩)) == some true)
+  -- Joining a realm through an invite: the admin's node was not there, so the
+  -- only person who can write the newcomer into the log is the newcomer.
+  let nils : Member := { id := ⟨"nils"⟩, name := "Nils", party := ⟨"party-nils"⟩ }
+  let asNils (s : State) (op : Op) : Except String State :=
+    (applyOp s ⟨"nils"⟩ Realm.selfId op).map (·.1)
+  let said (e : Except String State) : String :=
+    match e with | .ok _ => "" | .error msg => msg
+  match asNils s0 (.addMember nils) with
+  | .error e => r := check r s!"a member may introduce themselves: {e}" false
+  | .ok introduced =>
+    r := check r "a member may introduce themselves"
+      (((introduced.member? ⟨"nils"⟩).map (·.name)) == some "Nils")
+    r := check r "and the party their spending lands on is written with them"
+      (((introduced.party? ⟨"party-nils"⟩).map (fun p => (p.name, p.kind))) ==
+        some ("Nils", "contact"))
+  r := check r "but a member may not write somebody else in"
+    (Str.containsCI
+      (said (asNils s0 (.addMember { id := ⟨"otto"⟩, name := "Otto"
+                                     party := ⟨"party-otto"⟩ })))
+      "only an admin")
+  let namedAlready := coreSteps s0
+    [ .putParty { id := ⟨"party-nils"⟩, name := "Nils Andersson", kind := "contact" }
+    , .addMember nils ]
+  r := check r "a party the ledger already knows is left exactly as it was"
+    (((namedAlready.party? ⟨"party-nils"⟩).map (·.name)) == some "Nils Andersson")
+  -- And the grant: a view of the realm, self-attested, and nothing beyond it.
+  let joined := coreStep s0 (.addMember nils)
+  let nilsPurse := coreAccount "acc-nils" "Assets.Purse.Nils" .asset
+  match asNils joined (.grant Realm.selfId ⟨"nils"⟩ .viewer nilsPurse) with
+  | .error e => r := check r s!"a member may grant themselves a view: {e}" false
+  | .ok viewing =>
+    r := check r "a member may grant themselves a view of a realm"
+      (((viewing.realm? Realm.selfId).map (fun x => x.roleOf ⟨"nils"⟩)) == some (some .viewer))
+    r := check r "and the purse it opens is theirs, not the author's"
+      (((viewing.account? ⟨"acc-nils"⟩).map (fun a => (a.owner, a.bridgeOf))) ==
+        some (⟨"party-nils"⟩, some ⟨"nils"⟩))
+  r := check r "a self-grant buys a view and nothing more"
+    (Str.containsCI (said (asNils joined (.grant Realm.selfId ⟨"nils"⟩ .admin nilsPurse)))
+      "only an admin")
+  let alsoOtto := coreStep joined
+    (.addMember { id := ⟨"otto"⟩, name := "Otto", party := ⟨"party-otto"⟩ })
+  r := check r "and lets nobody else in"
+    (Str.containsCI
+      (said (asNils alsoOtto (.grant Realm.selfId ⟨"otto"⟩ .viewer
+        (coreAccount "acc-otto" "Assets.Purse.Otto" .asset))))
+      "only an admin")
+  r := check r "a bridge an admin opens belongs to the member's party too"
+    ((((coreStep joined (.grant Realm.selfId ⟨"nils"⟩ .viewer nilsPurse)).account?
+      ⟨"acc-nils"⟩).map (·.owner)) == some ⟨"party-nils"⟩)
+  r := check r "a grant naming somebody the ledger has never heard of is refused"
+    (Str.containsCI (coreError s0 (.grant Realm.selfId ⟨"zoe"⟩ .viewer
+      (coreAccount "acc-zoe" "Assets.Purse.Zoe" .asset))) "add zoe first")
+  -- What an account mirrors is set when it is made, and never afterwards.
+  let mirrored := coreStep s0 (.putAccount
+    { coreAccount "acc-mine" "Assets.Purse.Mine" .asset with mirrorOf := some ⟨"acc-bridge"⟩ })
+  r := check r "an account can be made as the mirror of a bridge"
+    (((mirrored.account? ⟨"acc-mine"⟩).bind (·.mirrorOf)) == some ⟨"acc-bridge"⟩)
+  let reput := coreStep mirrored
+    (.putAccount (coreAccount "acc-mine" "Assets.Purse.Mine" .asset))
+  r := check r "and putting it again does not forget what it mirrors"
+    (((reput.account? ⟨"acc-mine"⟩).bind (·.mirrorOf)) == some ⟨"acc-bridge"⟩)
+  let repointed := coreStep mirrored (.putAccount
+    { coreAccount "acc-mine" "Assets.Purse.Mine" .asset with mirrorOf := some ⟨"acc-other"⟩ })
+  r := check r "nor lets it be repointed at another bridge"
+    (((repointed.account? ⟨"acc-mine"⟩).bind (·.mirrorOf)) == some ⟨"acc-bridge"⟩)
+  -- ## One rule per operation
+  --
+  -- Every case below is an operation this core used to take from somebody who
+  -- had no business writing it. They are grouped the way `Op.rights` is.
+  let viewer := coreSteps s0
+    [ .addMember { id := ⟨"mara"⟩, name := "Mara", party := ⟨"party-mara"⟩ }
+    , .grant Realm.selfId ⟨"mara"⟩ .viewer
+        (coreAccount "acc-mara" "Assets.Purse.Mara" .asset ⟨"party-mara"⟩) ]
+  let refusedMara (name : String) (op : Op) (words : String) : Report → Report := fun r =>
+    check r name (Str.containsCI (coreErrorAs "mara" Realm.selfId viewer op) words)
+  -- Genesis. It is a position in the log, not an operation, so no part may carry
+  -- one at all — "fresh" used to be a question about the state a reader had
+  -- managed to fold, and a client holding one generation's key folds nothing
+  -- written under any other.
+  r := check r "a snapshot is refused wherever a part carries one"
+    (Str.containsCI (coreError s0 (.snapshot coreOpened)) "where a log starts")
+  r := check r "and refused on an empty ledger too, where it used to be taken"
+    (Str.containsCI (coreError State.init (.snapshot coreOpened)) "where a log starts")
+  -- Where it *is* read: position 1 of a replay, and nowhere else.
+  let genesisEvent := coreEvent "genesis" [.snapshot coreOpened]
+  let later := coreEvent "later" [.putLabel { id := ⟨"lbl-late"⟩, name := "late" }]
+  r := check r "a log that opens with one snapshot replays from it"
+    (replay [genesisEvent] == coreOpened)
+  r := check r "and the events after it are folded onto it"
+    ((replay [genesisEvent, later]).label? ⟨"lbl-late"⟩).isSome
+  r := check r "the same snapshot at position two changes nothing"
+    (replay [later, genesisEvent] == replay [later])
+  -- Exactly one part, and that part a snapshot, is the whole test. An event
+  -- with a snapshot beside something else is an ordinary event whose snapshot
+  -- part is refused and whose neighbour applies.
+  let mixed := replay [coreEvent "both"
+    [.snapshot coreOpened, .putLabel { id := ⟨"lbl-x"⟩, name := "x" }]]
+  r := check r "an event of a snapshot beside something else is not a beginning"
+    (mixed.accounts.isEmpty && (mixed.label? ⟨"lbl-x"⟩).isSome)
+  -- Structure. A viewer writes none of it.
+  r := refusedMara "a viewer may not write an account"
+    (.putAccount (coreAccount "acc-new" "Expenses.Books" .expense)) "only an admin" r
+  r := refusedMara "nor rename one onto a budget's name"
+    (.putAccount (coreAccount "acc-bank" "Budget.Hut" .asset)) "only an admin" r
+  r := refusedMara "nor merge accounts" (.mergeAccounts ⟨"acc-food"⟩ ⟨"acc-mara"⟩)
+    "only an admin" r
+  r := refusedMara "nor delete one" (.deleteAccount ⟨"acc-bob"⟩) "only an admin" r
+  r := refusedMara "nor say who posts where" (.setAccountRights ⟨"acc-bank"⟩ [⟨"mara"⟩])
+    "only an admin" r
+  r := refusedMara "nor hand an account over" (.setAccountOwner ⟨"acc-bank"⟩ ⟨"party-mara"⟩)
+    "only an admin" r
+  r := refusedMara "nor write a label" (.putLabel { id := ⟨"0000"⟩, name := "budget:Hut" })
+    "only an admin" r
+  r := refusedMara "nor delete one" (.deleteLabel ⟨"lbl-hut"⟩) "only an admin" r
+  r := refusedMara "nor rewrite a party"
+    (.putParty { id := Party.selfId, name := "not you", kind := "contact" }) "only an admin" r
+  r := refusedMara "nor save a group"
+    (.putGroup { name := "flat", members := ["Anna"] }) "only an admin" r
+  r := refusedMara "nor a trip"
+    (.putTrip { id := "t", name := "t", starts := coreDate, ends := coreDate
+                payer := "party-anna", note := none }) "only an admin" r
+  r := refusedMara "nor a rule"
+    (.putRule { id := ⟨"rul"⟩, name := "r", filterSrc := "", filter := .all
+                setAccount := none, addLabels := [], setParty := none, priority := 0 })
+    "only an admin" r
+  r := refusedMara "nor record an import batch"
+    (.recordImportBatch { id := ⟨"bat"⟩, profile := "p", filename := none, account := none
+                          stamp := "", total := 0, duplicates := 0 }) "only an admin" r
+  -- A merge asks about the account being emptied, not only the one being filled.
+  let twoPurses := coreSteps viewer
+    [ .addMember { id := ⟨"nils"⟩, name := "Nils", party := ⟨"party-nils"⟩ }
+    , .grant Realm.selfId ⟨"nils"⟩ .viewer
+        (coreAccount "acc-nils" "Assets.Purse.Nils" .asset ⟨"party-nils"⟩) ]
+  r := check r "a merge is not a way to take somebody else's purse"
+    (Str.containsCI
+      (coreErrorAs "mara" Realm.selfId twoPurses (.mergeAccounts ⟨"acc-nils"⟩ ⟨"acc-mara"⟩))
+      "only an admin")
+  -- Realms. A realm is created with its author as its only admin.
+  r := check r "a realm cannot be created with somebody else already inside it"
+    (Str.containsCI (coreError viewer
+      (.createRealm { id := ⟨"realm-flat"⟩, name := "flat"
+                      members := [(⟨"mara"⟩, .admin)], generation := 0 }))
+      "its only admin")
+  r := check r "nor at a generation that says its keys have been rotated"
+    (Str.containsCI (coreError viewer
+      (.createRealm { id := ⟨"realm-flat"⟩, name := "flat"
+                      members := [(Member.selfId, .admin)], generation := 3 }))
+      "generation 0")
+  r := check r "a role is only changed in the realm the part names"
+    (Str.containsCI (coreError viewer (.setRole ⟨"realm-other"⟩ ⟨"mara"⟩ .admin))
+      "only change the realm it names")
+  r := check r "and so is a revoke"
+    (Str.containsCI (coreError viewer (.revoke ⟨"realm-other"⟩ ⟨"mara"⟩))
+      "only change the realm it names")
+  r := check r "and a rotation"
+    (Str.containsCI (coreError viewer (.rotateRealmKey ⟨"realm-other"⟩))
+      "only change the realm it names")
+  -- A self-introduction is about who you are, and the party is part of that.
+  r := check r "a newcomer may not introduce themselves as the ledger's own party"
+    (Str.containsCI
+      (coreErrorAs "zoe" Realm.selfId s0
+        (.addMember { id := ⟨"zoe"⟩, name := "Zoe", party := Party.selfId }))
+      "ledger's own party")
+  r := check r "nor as somebody else's"
+    (Str.containsCI
+      (coreErrorAs "zoe" Realm.selfId viewer
+        (.addMember { id := ⟨"zoe"⟩, name := "Zoe", party := ⟨"party-mara"⟩ }))
+      "already somebody else's")
+  r := check r "nor may they change the party they were recorded under"
+    (Str.containsCI
+      (coreErrorAs "mara" Realm.selfId viewer
+        (.addMember { id := ⟨"mara"⟩, name := "Mara", party := ⟨"party-zoe"⟩ }))
+      "cannot change the party")
+  -- Removing a member puts them out of this realm; the identity goes last.
+  let inTwo := coreSteps viewer
+    [ .createRealm { id := ⟨"realm-flat"⟩, name := "flat"
+                     members := [(Member.selfId, .admin)], generation := 0 } ]
+  let outOfSelf := coreStep inTwo (.removeMember ⟨"mara"⟩)
+  r := check r "removing a member puts them out of the realm the part names"
+    (((outOfSelf.realm? Realm.selfId).map (fun x => x.isMember ⟨"mara"⟩)) == some false)
+  r := check r "and takes the identity with them when no realm is left holding it"
+    (outOfSelf.member? ⟨"mara"⟩).isNone
+  -- Transactions. A viewer of the realm may write their own legs and no others.
+  r := refusedMara "a transaction needs postings"
+    (.putTransaction (coreTxn "t-empty" [])) "needs postings" r
+  r := refusedMara "a transaction is written as posted"
+    (.putTransaction { coreTxn "t-void" [cents "acc-mara" (-1), cents "acc-food" 1] with
+                       state := .void }) "written as posted" r
+  r := check r "and a rewrite of a transaction with no leg in this realm is refused"
+    (Str.containsCI
+      (coreErrorAs "mara" ⟨"realm-flat"⟩
+        (coreSteps inTwo [.putTransaction dinner]) (.putTransaction dinner))
+      "not in that realm")
+  r := refusedMara "a viewer may not retire somebody else's transaction"
+    (.deleteTransaction ⟨"t-dinner"⟩) "no such transaction" r
+  let spent := coreStep s0 (.putTransaction dinner)
+  let spentSeen := coreSteps spent
+    [ .addMember { id := ⟨"mara"⟩, name := "Mara", party := ⟨"party-mara"⟩ }
+    , .grant Realm.selfId ⟨"mara"⟩ .viewer
+        (coreAccount "acc-mara" "Assets.Purse.Mara" .asset ⟨"party-mara"⟩) ]
+  r := check r "a viewer may not delete a transaction whose legs are not theirs"
+    (Str.containsCI (coreErrorAs "mara" Realm.selfId spentSeen (.deleteTransaction ⟨"t-dinner"⟩))
+      "you may not post to")
+  r := check r "nor split it"
+    (Str.containsCI (coreErrorAs "mara" Realm.selfId spentSeen
+      (.splitTransaction ⟨"t-dinner"⟩ [⟨"acc-mara"⟩] true)) "you may not post to")
+  r := check r "nor hang a receipt on it"
+    (Str.containsCI (coreErrorAs "mara" Realm.selfId spentSeen (.attach ⟨"t-dinner"⟩ "rcpt"))
+      "you may not post to")
+  r := check r "nor take one off it"
+    (Str.containsCI (coreErrorAs "mara" Realm.selfId spentSeen (.detach ⟨"t-dinner"⟩ "rcpt"))
+      "you may not post to")
+  -- Claims. Raising is an admin's; meeting and withdrawing are the creditor's.
+  r := refusedMara "a viewer may not raise a claim"
+    (.raiseClaim { id := ⟨"t-c"⟩, date := coreDate, narration := "mine", state := .pending
+                   postings := [cents "acc-mara" 100, cents "acc-bank" (-100)] })
+    "only an admin" r
+  let owed := coreSteps s0
+    [ .addMember { id := ⟨"mara"⟩, name := "Mara", party := ⟨"party-mara"⟩ }
+    , .addMember { id := ⟨"nils"⟩, name := "Nils", party := ⟨"party-nils"⟩ }
+    , .grant Realm.selfId ⟨"mara"⟩ .viewer
+        (coreAccount "acc-mara" "Assets.Purse.Mara" .asset ⟨"party-mara"⟩)
+    , .grant Realm.selfId ⟨"nils"⟩ .viewer
+        (coreAccount "acc-nils" "Assets.Purse.Nils" .asset ⟨"party-nils"⟩)
+    , .raiseClaim
+        { id := ⟨"t-owed"⟩, date := coreDate, narration := "her share", state := .pending
+          postings := [cents "acc-nils" 5000, cents "acc-mara" (-5000)] } ]
+  r := check r "the debtor may not withdraw the claim against them"
+    (Str.containsCI (coreErrorAs "mara" Realm.selfId owed (.voidClaim ⟨"t-owed"⟩ none))
+      "may withdraw this claim")
+  r := check r "the creditor may"
+    (coreAllows "nils" Realm.selfId owed (.voidClaim ⟨"t-owed"⟩ none))
+  r := check r "a claim that has been met is not withdrawn afterwards"
+    (Str.containsCI
+      (coreError (coreStep owed (.payClaim ⟨"t-owed"⟩ ⟨"t-p"⟩ coreDate))
+        (.voidClaim ⟨"t-owed"⟩ none))
+      "outstanding claim")
+  r := check r "and the debtor does not get to say a claim was met either"
+    (Str.containsCI
+      (coreErrorAs "mara" Realm.selfId
+        (coreStep owed (.putTransaction
+          (coreTxn "t-arrived" [cents "acc-nils" 5000, cents "acc-unc" (-5000)] "paid")))
+        (.resolveClaim ⟨"t-owed"⟩ ⟨"t-arrived"⟩ ⟨"t-part"⟩))
+      "may meet this claim")
+  -- Budgets. Every verb is an admin's, and the pot is keyed by its account id.
+  r := check r "a viewer may not open a budget"
+    (Str.containsCI (coreErrorAs "mara" Realm.selfId viewer
+      (.openBudget coreHut (coreAccount "acc-hut" "Hut" .equity))) "only an admin")
+  r := check r "nor name who a budget is divided among"
+    (Str.containsCI (coreErrorAs "mara" Realm.selfId shared
+      (.setParticipants ⟨"b-hut"⟩ coreAmong)) "only an admin")
+  r := check r "nor allocate it"
+    (Str.containsCI (coreErrorAs "mara" Realm.selfId shared
+      (.allocate ⟨"b-hut"⟩ coreAmong Commodity.eur coreDate none ⟨"t-a"⟩ [] ⟨"lbl-hut"⟩))
+      "only an admin")
+  r := check r "nor close it"
+    (Str.containsCI (coreErrorAs "mara" Realm.selfId shared
+      (.closeBudget ⟨"b-hut"⟩ none Commodity.eur none coreDate ⟨"t-a"⟩ [] ⟨"lbl-hut"⟩))
+      "only an admin")
+  r := check r "a budget is decided in the realm it lives in"
+    (Str.containsCI (coreErrorAs Member.selfId.val ⟨"realm-other"⟩ shared
+      (.reopenBudget ⟨"b-hut"⟩)) "only an admin")
+  r := check r "the budget's own account is the one its record names"
+    (((shared.budget? ⟨"b-hut"⟩).map (·.account)) == some ⟨"acc-hut"⟩)
+  r := check r "and an account that merely shares its name is not it"
+    (let shadowed := coreStep shared
+      (.putAccount { coreAccount "0000" "Budget.Hut" .equity with realm := Realm.selfId })
+     (Budget.account? (coreBudget shadowed) shadowed).map (·.id) == some ⟨"acc-hut"⟩)
+  r := check r "a participant may put money into the pot"
+    (coreAllows "mara" Realm.selfId shared
+      (.putTransaction (coreTxn "t-in" [cents "acc-mara" (-2500), cents "acc-hut" 2500] "food")))
+  r := check r "and may not take it out again"
+    (Str.containsCI
+      (coreErrorAs "mara" Realm.selfId shared
+        (.putTransaction (coreTxn "t-out" [cents "acc-hut" (-2500), cents "acc-mara" 2500] "mine")))
+      "you may not post to")
+  -- Invoices. The numbering is one sequence and only an admin moves it.
+  r := refusedMara "a viewer may not issue an invoice"
+    (.issueInvoice (coreDraft "i-v") []) "only an admin" r
+  r := refusedMara "nor move one to a new status" (.setInvoiceStatus ⟨"i-v"⟩ .sent)
+    "only an admin" r
+  -- Receipts. What a receipt says is what a division divides by.
+  let filed := coreStep viewer (.registerBlob
+    { sha256 := "rcpt", mime := "image/jpeg", bytes := 8, origName := none, createdAt := "" })
+  r := check r "the member who filed a receipt may say what it contains"
+    (coreAllows Member.selfId.val Realm.selfId filed
+      (.setReceiptLines "rcpt" [{ description := "bread", amount := ⟨Commodity.eur, 500⟩ }]))
+  r := check r "and somebody who did not may not"
+    (Str.containsCI (coreErrorAs "mara" Realm.selfId filed
+      (.setReceiptLines "rcpt" [{ description := "wine", amount := ⟨Commodity.eur, 500⟩ }]))
+      "may say what it contains")
+  r := check r "nor re-seal it under another key"
+    (Str.containsCI (coreErrorAs "mara" Realm.selfId filed
+      (.registerBlob { sha256 := "rcpt", mime := "image/jpeg", bytes := 8, origName := none
+                       createdAt := "", cipherHash := some "ff" }))
+      "register it again")
+  r := refusedMara "nor forget it" (.forgetBlob "rcpt") "only an admin" r
+  -- Bounds. What an event carries is bounded, because a reader applies it.
+  r := check r "a receipt line cannot claim a quantity nobody printed"
+    (Str.containsCI
+      (coreError filed
+        (.setReceiptLines "rcpt"
+          [{ description := "x", qty := some 1000000000000, amount := ⟨Commodity.eur, 1⟩ }]))
+      "covers at most")
+  r := check r "a transaction cannot carry more postings than a person writes"
+    (Str.containsCI
+      (coreError s0 (.putTransaction (coreTxn "t-many"
+        ((List.replicate 201 (cents "acc-bank" 0))))))
+      "at most 200")
+  r := check r "a budget cannot be divided among a crowd"
+    (Str.containsCI
+      (coreError coreOpened (.setParticipants ⟨"b-hut"⟩
+        (List.replicate 101 { owner := ⟨"party-anna"⟩, name := "Anna"
+                              account := "Assets.Purse.Anna" })))
+      "at most 100")
+  r := check r "a share's weight is bounded"
+    (Str.containsCI
+      (coreError coreOpened (.setParticipants ⟨"b-hut"⟩
+        [{ owner := ⟨"party-anna"⟩, name := "Anna", account := "Assets.Purse.Anna"
+           weight := 10001 }]))
+      "weight has to be between")
+  r := check r "and an identifier is not a megabyte"
+    (Str.containsCI
+      (coreError s0 (.putLabel { id := ⟨String.ofList (List.replicate 201 'x')⟩, name := "x" }))
+      "longer than 200")
+  -- ## The realm every entity is in
+  --
+  -- Eight kinds of entry used to have none, so "an admin of the part's realm"
+  -- reached across every realm a reader could open — and creating a realm you
+  -- administer and handing somebody a key to it is something any member may do.
+  let other : RealmId := ⟨"realm-other"⟩
+  let twoRealms := coreSteps viewer
+    [ .createRealm { id := other, name := "flat", members := [(Member.selfId, .admin)] } ]
+  let inOther (ops : List Op) : State :=
+    ops.foldl (fun st op =>
+      match applyOp st Member.selfId other op with
+      | .ok (st', _) => st'
+      | .error _ => st) twoRealms
+  let theirs := inOther
+    [ .putLabel { id := ⟨"lbl-theirs"⟩, name := "theirs" }
+    , .putParty { id := ⟨"party-theirs"⟩, name := "Landlord", kind := "contact" }
+    , .putGroup { name := "flatmates", members := ["Anna"] }
+    , .putTrip { id := "trp-t", name := "Flat", starts := coreDate, ends := coreDate
+                 payer := "party-anna", note := none }
+    , .putRule { id := ⟨"rul-t"⟩, name := "rent", filterSrc := "", filter := .all
+                 setAccount := none, addLabels := [], setParty := none, priority := 0 }
+    , .registerBlob { sha256 := "theirs", mime := "image/jpeg", bytes := 8, origName := none
+                      createdAt := "" } ]
+  r := check r "an entity is created in the realm the part names"
+    (((theirs.label? ⟨"lbl-theirs"⟩).map (·.realm)) == some other)
+  let elsewhere (name : String) (op : Op) : Report → Report := fun r =>
+    check r name (Str.containsCI (coreError theirs op) "not in this realm")
+  r := elsewhere "a label of another realm is not this part's to rewrite"
+    (.putLabel { id := ⟨"lbl-theirs"⟩, name := "mine now" }) r
+  r := elsewhere "nor to delete" (.deleteLabel ⟨"lbl-theirs"⟩) r
+  r := elsewhere "nor a party of one"
+    (.putParty { id := ⟨"party-theirs"⟩, name := "not them", kind := "contact" }) r
+  r := elsewhere "nor a group" (.putGroup { name := "flatmates", members := ["Bob"] }) r
+  r := elsewhere "nor a trip"
+    (.putTrip { id := "trp-t", name := "Flat", starts := coreDate, ends := coreDate
+                payer := "party-bob", note := none }) r
+  r := elsewhere "nor a rule"
+    (.putRule { id := ⟨"rul-t"⟩, name := "mine", filterSrc := "", filter := .all
+                setAccount := none, addLabels := [], setParty := none, priority := 1 }) r
+  r := elsewhere "nor a receipt filed in one"
+    (.setReceiptLines "theirs" [{ description := "x", amount := ⟨Commodity.eur, 1⟩ }]) r
+  r := elsewhere "nor forget it" (.forgetBlob "theirs") r
+  r := check r "a member may revise their own party from any realm they are in"
+    (coreAllows "mara" other
+      (coreSteps theirs [.grant other ⟨"mara"⟩ .viewer
+        (coreAccount "acc-m2" "Members.Mara" .asset ⟨"party-mara"⟩)])
+      (.putParty { id := ⟨"party-mara"⟩, name := "Mara Neumann", kind := "contact" }))
+  r := check r "and the record keeps the realm it was introduced in"
+    (((theirs.party? ⟨"party-mara"⟩).map (·.realm)) == some Realm.selfId)
+  -- A label is stripped from this realm's transactions and no others.
+  let crossed := coreSteps
+    (inOther [.putAccount (coreAccount "acc-t" "Expenses.Theirs" .expense)])
+    [ .putLabel { id := ⟨"lbl-here"⟩, name := "here" }
+    , .putTransaction { coreTxn "t-here"
+        [cents "acc-bank" (-100), cents "acc-food" 100] "dinner" with
+          labels := [⟨"lbl-here"⟩] } ]
+  r := check r "deleting a label strips it from this realm's transactions"
+    ((((coreStep crossed (.deleteLabel ⟨"lbl-here"⟩)).txn? ⟨"t-here"⟩).map (·.labels))
+      == some [])
+  -- A label of theirs, on a transaction of yours: deleting it would have to
+  -- rewrite a transaction with no leg in their realm, so it is refused and the
+  -- label stays rather than leaving an id nothing resolves.
+  let borrowed := coreSteps
+    (inOther [.putLabel { id := ⟨"lbl-there"⟩, name := "there" }])
+    [ .putTransaction { coreTxn "t-mine"
+        [cents "acc-bank" (-100), cents "acc-food" 100] "dinner" with
+          labels := [⟨"lbl-there"⟩] } ]
+  r := check r "and is refused when it would have to rewrite another realm's"
+    (Str.containsCI (coreErrorAs Member.selfId.val other borrowed (.deleteLabel ⟨"lbl-there"⟩))
+      "no leg in this realm")
+  -- Invoice numbering is one sequence per realm, not one for the ledger.
+  let year := coreDate.year.toInt.toNat
+  let numbered := coreStep (inOther [.issueInvoice (coreDraft "i-1") []])
+    (.issueInvoice (coreDraft "i-2") [])
+  r := check r "the invoice counter is one sequence per realm"
+    (numbered.counters.contains s!"{Realm.selfId.val}:invoice:{year}" &&
+      numbered.counters.contains s!"{other.val}:invoice:{year}")
+  r := check r "so an admin of another realm cannot move your numbering"
+    (numbered.counters[s!"{Realm.selfId.val}:invoice:{year}"]? == some 1)
+  -- ## The invoice record's own realm
+  --
+  -- The counter being keyed by realm made the missing one worse rather than
+  -- better: an admin of any realm a reader could open deleted a draft issued
+  -- somewhere else and wound back their own realm's sequence, so the issuing
+  -- realm kept the burnt number and the next invoice in the other realm
+  -- duplicated one already sent. The same door marked any invoice paid or void.
+  let stepIn (st : State) (realm : RealmId) (op : Op) : State :=
+    match applyOp st Member.selfId realm op with
+    | .ok (st', _) => st'
+    | .error _ => st
+  let issuedThere := inOther [.issueInvoice (coreDraft "i-there") []]
+  r := check r "an invoice carries the realm it was issued in"
+    (((issuedThere.invoice? ⟨"i-there"⟩).map (·.realm)) == some other)
+  let fromHere (name : String) (op : Op) : Report → Report := fun r =>
+    check r name (Str.containsCI (coreError issuedThere op) "not in this realm")
+  r := fromHere "an invoice of another realm is not this part's to delete"
+    (.deleteInvoice ⟨"i-there"⟩) r
+  r := fromHere "nor to move to a new status" (.setInvoiceStatus ⟨"i-there"⟩ .void) r
+  r := fromHere "nor to record a settlement against"
+    (.settleInvoice ⟨"i-there"⟩ ⟨"t-nothing"⟩) r
+  r := check r "so a counter is only ever wound back by the realm that moved it"
+    ((coreStep issuedThere (.deleteInvoice ⟨"i-there"⟩)).counters[s!"{other.val}:invoice:{year}"]?
+      == some 1)
+  -- The payer is resolved by name in the part's realm. A member may set the name
+  -- of their own party to anything at all from any realm they are in, so the
+  -- lookup across every realm handed an invoice to whichever record sorted first.
+  let annaHere := coreStep twoRealms
+    (.putParty { id := ⟨"party-anna"⟩, name := "Anna", kind := "contact" })
+  let twoAnnas := stepIn annaHere other
+    (.putParty { id := ⟨"party-anna-there"⟩, name := "Anna", kind := "contact" })
+  let payerThere := stepIn twoAnnas other (.issueInvoice (coreDraft "i-payer") [])
+  r := check r "an invoice's payer is the person of that name in the part's realm"
+    (((payerThere.invoice? ⟨"i-payer"⟩).bind (·.invoice.payerId)) == some ⟨"party-anna-there"⟩)
+  let newPayer := stepIn twoRealms other
+    (.issueInvoice { coreDraft "i-new" with
+                     payerName := "Dora", payerId := some ⟨"party-dora"⟩ } [])
+  r := check r "and a payer nobody knows yet is introduced in that realm"
+    (((newPayer.party? ⟨"party-dora"⟩).map (·.realm)) == some other)
+  -- A grant looks for the bridge by name in the realm it is granting, so a name
+  -- somebody took in another realm no longer blocks it. `Members.<name>` is a
+  -- name any member can mint about themselves through the attest door.
+  let nameTakenHere := coreSteps twoRealms
+    [ .addMember { id := ⟨"zoe"⟩, name := "Zoe", party := ⟨"party-zoe"⟩ }
+    , .putAccount (coreAccount "acc-here" "Members.Zoe" .asset) ]
+  r := check r "a grant is not blocked by an account of that name in another realm"
+    (coreAllows Member.selfId.val other nameTakenHere
+      (.grant other ⟨"zoe"⟩ .viewer (coreAccount "acc-zoe-there" "Members.Zoe" .asset)))
+  -- A settlement lands in an account of theirs in the budget's own realm. An
+  -- account of theirs anywhere else used to outrank it and then be refused by
+  -- the posting rules, which stopped every settlement of the budget until an
+  -- admin closed or renamed an account in a realm that had nothing to do with it.
+  let bobAbroad := stepIn
+    (coreStep coreOpened
+      (.createRealm { id := other, name := "flat", members := [(Member.selfId, .admin)] }))
+    other (.putAccount (coreAccount "acc-b0" "Assets.Purse.Bob" .asset ⟨"party-bob"⟩))
+  r := checkEq r "a settlement account is looked for in the budget's own realm"
+    (((Budget.settlementAccount (coreBudget bobAbroad) bobAbroad ⟨"party-bob"⟩
+        Commodity.eur).toOption.map (·.val)).getD "") "acc-bob"
+  -- ## The attest door makes one purse and adopts nothing
+  let joiner := coreSteps twoRealms
+    [.addMember { id := ⟨"zoe"⟩, name := "Zoe", party := ⟨"party-zoe"⟩ }]
+  let selfGranted := (applyOp joiner ⟨"zoe"⟩ other
+    (.grant other ⟨"zoe"⟩ .viewer
+      { coreAccount "acc-zoe" "Budget.Hut" .equity with posters := [⟨"zoe"⟩] })).toOption
+  r := check r "a self-grant opens the purse named after the member, and nothing else"
+    (match selfGranted with
+     | some (st, _) =>
+       match st.account? ⟨"acc-zoe"⟩ with
+       | some a => a.name == "Members.Zoe" && a.kind == .asset && a.posters.isEmpty &&
+                   a.bridgeOf == some ⟨"zoe"⟩ && a.mirrorOf.isNone
+       | none => false
+     | none => false)
+  r := check r "and refuses a name that is already an account in that realm"
+    (Str.containsCI
+      (coreErrorAs "zoe" other
+        (inOther [.putAccount (coreAccount "acc-taken" "Members.Zoe" .asset)] |>
+          coreSteps <| [.addMember { id := ⟨"zoe"⟩, name := "Zoe", party := ⟨"party-zoe"⟩ }])
+        (.grant other ⟨"zoe"⟩ .viewer (coreAccount "acc-zoe" "Members.Zoe" .asset)))
+      "already an account")
+  -- ## A budget is held in a pot, and a pot is not somebody's purse
+  let squatted := coreSteps joiner
+    [.grant Realm.selfId ⟨"zoe"⟩ .viewer
+      (coreAccount "acc-squat" "Budget.Camp" .equity ⟨"party-zoe"⟩)]
+  r := check r "a budget refuses to be opened over somebody's purse"
+    (Str.containsCI
+      (coreError squatted (.openBudget { id := ⟨"b-camp"⟩, name := "Camp", note := none
+                                         closed := false }
+        (coreAccount "acc-camp" "Camp" .equity)))
+      "purse")
+  -- ## Claims
+  r := check r "a stored claim is not overwritten by a plain transaction"
+    (Str.containsCI
+      (coreError (coreSteps coreBase
+        [.raiseClaim { id := ⟨"t-c"⟩, date := coreDate, narration := "owed", state := .pending
+                       postings := [cents "acc-bank" 500, cents "acc-anna" (-500)] }])
+        (.putTransaction (coreTxn "t-c" [cents "acc-bank" 500, cents "acc-anna" (-500)] "no")))
+      "not overwritten")
+  -- Replaying a log is a function of the log, and of nothing else.
+  let accountsPart : List Op :=
+    [ .putAccount (coreAccount "acc-x" "Assets.X" .asset)
+    , .putAccount (coreAccount "acc-y" "Expenses.Y" .expense) ]
+  let namesPart : List Op :=
+    [ .putParty { id := ⟨"party-anna"⟩, name := "Anna", kind := "contact" }
+    , .putLabel { id := ⟨"lbl-hut"⟩, name := "trip:hut" } ]
+  let spend : List Op :=
+    [ .putTransaction (coreTxn "t-x" [cents "acc-x" (-500), cents "acc-y" 500] "coffee") ]
+  let broken : List Op :=
+    [ .putTransaction (coreTxn "t-lost" [cents "acc-x" (-500)] "half an entry") ]
+  let log : List Event :=
+    [ coreEvent "e1" accountsPart, coreEvent "e2" namesPart
+    , coreEvent "e3" spend, coreEvent "e4" broken ]
+  let reordered : List Event :=
+    [ coreEvent "e2" namesPart.reverse, coreEvent "e1" accountsPart.reverse
+    , coreEvent "e3" spend, coreEvent "e4" broken ]
+  r := check r "replaying a log twice gives the same state" (state log == state log)
+  r := check r "and the order of independent parts does not show" (state log == state reordered)
+  r := check r "an invalid part is skipped rather than failing its event"
+    (((state log).txn? ⟨"t-lost"⟩).isNone && ((state log).txn? ⟨"t-x"⟩).isSome)
+  return coreBudgetTests r
+
+/--
+The log, and what it is worth.
+
+The tables are a cache from here on, so the question these ask is whether the
+cache could be thrown away: does the log, replayed from nothing, give back the
+ledger the suite has just spent a second building? Then the three things that
+have to be true for that answer to mean anything — the chain verifies, a byte
+changed under it stops verifying, and the first event carries the state the store
+opened with, which is what makes a database that predates the log replayable at
+all.
+-/
+private def logTests (ctx : Ctx) (r : Report) : IO Report := do
+  let held ← ctx.state.get
+  let log ← Replay.events ctx.db
+  let replayed ← Replay.state ctx.db
+  let (seq, hash) ← EventLog.head ctx.db
+  let mut r := check r "replaying the log gives back the state in memory" (replayed == held)
+  r := checkEq r "every event in the chain verified" log.size seq
+  r := checkEq r "and the head names the last of them" hash.length 64
+  r := checkEq r "the replayed state hashes as the one in memory does"
+    (Encode.hashState replayed) (Encode.hashState held)
+  r := checkEq r "the log starts at sequence 1"
+    (← Db.scalarInt ctx.db "SELECT IFNULL(MIN(seq), 0) FROM event") 1
+  match log[0]? with
+  | none => r := check r "the log starts with a genesis event" false
+  | some e =>
+    r := checkEq r "genesis is one part" e.parts.length 1
+    r := check r "and it is the snapshot the store opened with"
+      (match e.parts.head? with | some { op := .snapshot _, .. } => true | _ => false)
+  let root : System.FilePath :=
+    ((← IO.getEnv "TMPDIR").getD "/tmp") / s!"resources-log-{← freshId}"
+  try
+    let fresh ← Ctx.open (Config.atDir root)
+    -- What a rebuild does: a whole state written onto tables that hold nothing.
+    fresh.transaction (Project.all fresh.db replayed)
+    r := check r "a replayed state projected onto an empty store reads back as itself"
+      ((← Load.fromDb fresh.db) == replayed)
+    -- One name, an account of it in each of two realms. `account.name` was
+    -- unique over the whole table until migration 25, so this is the write that
+    -- a realm arriving from a sequencer used to come apart on: `Core` holds both
+    -- accounts — a name is only a name inside a realm — and the store could not
+    -- hold what `Core` held.
+    let twin ← Ctx.open (Config.atDir (root / "twin"))
+    let other : RealmId := ⟨"0000000000000000000000TWIN"⟩
+    discard <| twin.commit "test"
+      [.createRealm { id := other, name := "Twin", members := [(twin.member, .admin)] }]
+    discard <| twin.commit "test"
+      [.putAccount { id := ⟨"acc-twin-here"⟩, name := "Budget.Twin", kind := .equity }]
+    discard <| twin.commit "test"
+      [.putAccount { id := ⟨"acc-twin-there"⟩, name := "Budget.Twin", kind := .equity,
+                     realm := other }]
+      (realm := other)
+    r := checkEq r "one name is an account in each of two realms"
+      (← Db.scalarInt twin.db "SELECT COUNT(*) FROM account WHERE name = 'Budget.Twin'") 2
+    let back ← Load.fromDb twin.db
+    r := checkEq r "and the one written here reads back as itself"
+      ((back.accountByNameIn? Realm.selfId "Budget.Twin").map (·.id.val))
+      (some "acc-twin-here")
+    r := checkEq r "as does the one written in the other realm"
+      ((back.accountByNameIn? other "Budget.Twin").map (·.id.val)) (some "acc-twin-there")
+    r := check r "and the store reads back as the state it is a projection of"
+      (back == (← twin.state.get))
+    -- The head is what the next append chains onto, so a head that has drifted
+    -- is a store whose next event forks its own history. `Ctx.open` hashes the
+    -- rows and asks, every time, and refuses rather than writing onto the fork.
+    let reopens : IO Bool := do
+      (do discard <| Ctx.open (Config.atDir root); pure true) <|> pure false
+    r := check r "a store whose chain is whole opens" (← reopens)
+    Db.exec fresh.db
+      s!"UPDATE ledger_head SET hash = {Db.lit EventLog.zeroHash} WHERE id = 1"
+    r := check r "one whose head names an event that is not the last does not" !(← reopens)
+    Db.exec fresh.db
+      "UPDATE ledger_head SET hash = (SELECT hash FROM event ORDER BY seq DESC LIMIT 1)
+       WHERE id = 1"
+    r := check r "and putting the head back on the last event opens it again" (← reopens)
+    Db.exec fresh.db "UPDATE ledger_head SET seq = seq + 1 WHERE id = 1"
+    r := check r "a head that has run ahead of the log is refused too" !(← reopens)
+    Db.exec fresh.db "UPDATE ledger_head SET seq = seq - 1 WHERE id = 1"
+    -- The hash covers the stored bytes, so editing them is not a quiet edit.
+    Db.exec fresh.db "UPDATE event SET bytes = X'00' WHERE seq = 1"
+    let refused ← (do discard <| Replay.events fresh.db; pure false) <|> pure true
+    r := check r "a byte changed under the log stops it verifying" refused
+    r := check r "and stops the store opening at all" !(← reopens)
+    return r
+  finally
+    IO.FS.removeDirAll root <|> pure ()
+
+/-! ## The conformance vectors -/
+
+/--
+The vectors a port is checked against, checked against the core that wrote them.
+
+`resources gen-vectors` hands an unverified implementation the only thing that
+can hold it to these semantics: a state, an event, and the bytes the answer comes
+to. That is worth nothing unless the vectors are true here first — so every one
+is taken apart the way a port would take it apart, stepped, and hashed, and the
+hash has to be the one the vector carries.
+
+Decoding is not the identity on a `State`: the maps come back rebuilt from their
+sorted entries, which is exactly what `State.ofBytes_toBytes` says and no more.
+So this also says that stepping a rebuilt state lands on the same bytes as
+stepping the state it was rebuilt from — the property the whole file rests on,
+and the one a port cannot check for us.
+-/
+private def vectorTests (r : Report) : Report := Id.run do
+  let mut r := r
+  let vs := Api.Vectors.vectors
+  r := check r "there are at least sixty conformance vectors" (vs.length ≥ 60)
+  r := checkEq r "every state a vector starts from was reached by applying operations"
+    (String.intercalate "; " Api.Vectors.setupErrors) ""
+  r := checkEq r "and every scenario is refused exactly where it says it is"
+    (String.intercalate "; " Api.Vectors.misfits) ""
+  r := checkEq r "the vectors are named uniquely" (vs.map (·.name)).eraseDups.length vs.length
+  -- The other half of what the shared artefacts pin. Every vector above is a
+  -- well-formed input, so a third implementation could reproduce all of them
+  -- while accepting bytes no writer produces — and a checkpoint is a name for
+  -- bytes, so a decoder that takes two spellings of one state is a decoder two
+  -- honest peers disagree through. `conformance/rejects.json` is generated from
+  -- this same list, so a port and this core are held to one set of refusals.
+  let rjs := Api.Vectors.rejects
+  r := check r "there are rejections for every shape the decoder has to refuse" (rjs.length ≥ 15)
+  r := checkEq r "the rejections are named uniquely"
+    (rjs.map (·.name)).eraseDups.length rjs.length
+  r := checkEq r "and this core refuses every one of them"
+    (String.intercalate "; " Api.Vectors.rejectMisfits) ""
+  for v in vs do
+    match Api.Vectors.ofHex? v.stateHex, Api.Vectors.ofHex? v.eventHex with
+    | some stateBytes, some eventBytes =>
+      match Codec.decode (α := State) stateBytes, Codec.decode (α := Event) eventBytes with
+      | some s, some e =>
+        let (out, _) := step s e
+        r := checkEq r s!"vector {v.name} steps to the bytes it says it does"
+          (toHex (Codec.encode out)) v.expectedHex
+        r := checkEq r s!"vector {v.name} steps to the hash it says it does"
+          (Encode.hashState out) v.expectedHash
+      | _, _ => r := check r s!"vector {v.name} decodes" false
+    | _, _ => r := check r s!"vector {v.name} is written in hex" false
+  return r
+
 /-! ## Entry point -/
 
 def main : IO UInt32 := do
@@ -1528,30 +2818,52 @@ def main : IO UInt32 := do
     r := invoiceTests r
     r := filterParseTests r
     r := ledgerTests r
+    r := coreTests r
+    r := encodeTests r
+    r := vectorTests r
     let corpus ← seedCorpus ctx 200
     IO.println s!"seeded {corpus.size} transactions"
     r ← filterAgreement ctx corpus r
     r ← sortOrdering ctx r
     r ← importIdempotence ctx r
+    r ← agree ctx r
     r ← trialBalance ctx r
     r ← routeSmoke ctx r
+    r ← agree ctx r
+    r ← syncTests r
+    r ← cryptoTests r
+    r ← nodeTests r
+    r ← nodeHardeningTests r
     r ← headlineTests ctx r
+    r ← agree ctx r
     r := signatureTests r
     r ← mergeTests ctx r
+    r ← agree ctx r
     r ← migrationTests r
     r := settleTests r
     r ← purseTests ctx r
-    r ← guestTests ctx r
+    r ← agree ctx r
+    r ← realmTests ctx r
+    r ← agree ctx r
     r ← resettleTests ctx r
+    r ← agree ctx r
     r := biproportionalTests r
     r ← closeTests ctx r
+    r ← agree ctx r
     r ← topUpTests ctx r
+    r ← agree ctx r
     r ← invoiceFromTxnTests ctx r
+    r ← agree ctx r
     r ← splitAndTripTests ctx r
+    r ← agree ctx r
     r := receiptTests r
     r ← divideTests ctx r
+    r ← agree ctx r
     r ← workflowTests ctx r
+    r ← agree ctx r
     r ← contactTests ctx r
+    r ← agree ctx r
+    r ← logTests ctx r
     for failure in r.failed do
       IO.eprintln s!"FAIL  {failure}"
     IO.println s!"{r.passed} passed, {r.failed.size} failed"

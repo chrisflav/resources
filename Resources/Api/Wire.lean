@@ -178,10 +178,7 @@ def tokenJson (t : ApiToken) : Json :=
   Json.mkObj [
     ("id", t.id.val), ("name", t.name), ("scopes", toString t.scopes),
     ("createdAt", t.createdAt), ("lastUsedAt", jopt t.lastUsedAt),
-    ("expiresAt", jopt t.expiresAt),
-    ("guest", Json.bool t.guest.isSome),
-    ("owner", jopt (t.guest.map (·.owner.val))),
-    ("budget", jopt (t.guest.map (·.budget.val)))]
+    ("expiresAt", jopt t.expiresAt)]
 
 /-- A revision. -/
 def revisionJson (r : Txns.Revision) : Json :=
@@ -223,42 +220,154 @@ def standingJson (s : Standing) : Json :=
     ("owner", s.owner.val), ("name", s.name), ("amount", amountJson s.amount),
     ("owes", Json.bool (s.amount.minor > 0))]
 
-/-! ## The guest view
+/-! ## Realms, invites and sync
 
-What somebody holding a share link may see. It is a separate shape rather than a
-filtered version of the ordinary one, because "filtered" is a property of the
-code that does the filtering, and this has to be a property of the payload: no
-account names of yours, no other budgets, no contacts, no ids that address
-anything outside the budget the link names.
+What the node's own half of the API says about itself. A realm is the unit of
+sharing — one key, one set of members, one thing other people can be let into —
+and everything here is a way of looking at one: who is in it, whether this node
+can still open it, and how far the order it belongs to has got.
 -/
 
-/-- One cost, as the person you shared it with may see it. -/
-def guestCostJson (t : Transaction) (amount : Amount) (paidBy : String) (mine : Bool) : Json :=
-  Json.mkObj [
-    ("id", t.id.val), ("date", t.date.toIso),
-    ("what", if (t.payee.getD "").trimAscii.isEmpty then t.narration else t.payee.getD ""),
-    ("amount", amountJson amount), ("paidBy", paidBy), ("mine", Json.bool mine)]
+/-- What one round of sync came to. -/
+structure Round where
+  /-- When it ran. `at` is a keyword, so the field is `ran` and the wire says "at". -/
+  ran : String := ""
+  /-- Entries taken in and applied. -/
+  applied : Nat := 0
+  /-- Entries carrying nothing this node holds a key for. -/
+  unreadable : Nat := 0
+  /-- Entries that were coherent bytes saying incoherent things. -/
+  rejected : Nat := 0
+  /-- Local events offered and accepted. -/
+  pushed : Nat := 0
+  /-- Times the head had moved under us. -/
+  conflicts : Nat := 0
+  /-- Where the remote order stands for this node now. -/
+  seq : Nat := 0
+  /-- Why the round stopped early, or empty when it did not. -/
+  trouble : String := ""
+  deriving Inhabited
 
-/-- A claim, without naming anybody's accounts. -/
-def guestClaimJson (e : NameEnv) (t : Transaction) : Json :=
-  Json.mkObj [
-    ("id", t.id.val), ("due", t.date.toIso), ("state", t.state.toString),
-    ("amount", amountJson (Pendings.amount t)),
-    ("from", jopt ((Pendings.payer? t).map e.ownerName)),
-    ("to", jopt ((Pendings.receiver? t).map e.ownerName))]
+/-- Where this store syncs, and how far it has got. -/
+structure SyncStatus where
+  /-- Whether there is a sequencer at all. Everything below is empty when not. -/
+  configured : Bool := false
+  /-- Base URL of the sequencer. -/
+  sequencer : String := ""
+  /-- Which ledger on it this store is. -/
+  ledger : String := ""
+  /-- This node's member id: the hex of its signing key. -/
+  member : String := ""
+  /-- This node's agreement key, which realm keys are wrapped to. -/
+  boxPk : String := ""
+  /-- The last position in the remote order this node has taken in. -/
+  seq : Nat := 0
+  /-- The hash of the entry at that position. -/
+  hash : String := ""
+  /-- How many local events are waiting to be offered. -/
+  pending : Nat := 0
+  /-- How many events the local log holds. -/
+  events : Nat := 0
+  /-- Realms this node missed a part of, and whose projection is therefore not comparable. -/
+  unverified : List String := []
+  /-- What the last round this process ran came to, if it has run one. -/
+  lastRound : Option Round := none
+  deriving Inhabited
 
-/-- A budget as a guest sees it: the costs, where everybody stands, what is asked. -/
-def guestJson (b : Budget) (who : String) (outstanding total : Amount) (costs : Array Json)
-    (standings : Array Standing) (claims : Array Json) : Json :=
+/-- One member of a realm: who they are here, and what they may do. -/
+def realmMemberJson (m : Member) (role : RealmRole) (mine : Bool) : Json :=
+  Json.mkObj [("id", m.id.val), ("name", m.name), ("role", toString role),
+              ("mine", Json.bool mine)]
+
+/-- The member record for an id, or a stand-in for one the ledger has forgotten. -/
+def memberOr (s : State) (id : MemberId) : Member :=
+  (s.member? id).getD { id, name := id.val }
+
+/--
+The budget a realm was made for, when it was made for one.
+
+A budget record names the realm its admins decide about it in, and the equity
+account that holds it is asked for inside that realm. It used to be asked for by
+name across the whole ledger, which is the first account of that name in id
+order — so a purse somebody had called `Budget.Sicily` in a realm of their own
+could answer for a budget held somewhere else entirely, and name this realm as
+the one that budget was made for.
+-/
+def budgetOfRealm (s : State) (r : Realm) : Option String :=
+  (sortedValues s.budgets).findSome? fun b =>
+    if b.realm == r.id && (s.accountByNameIn? r.id b.budget.name).isSome then
+      some (Budget.shortName b.budget)
+    else none
+
+/--
+A realm: who is in it, which generation of its key it is on, and whether this
+node still holds that key.
+
+`hasKey` is about this node and not about the realm. A realm whose generation
+has moved past the newest key here is one this node has been put out of, and
+saying so is the difference between "nothing has been written lately" and "you
+can no longer read what is being written".
+
+`unverified` is the other half of the same honesty. It is true when some entry
+of the shared order carried a part in this realm that this node could not open,
+so what is shown of the realm is a fold *around* a hole: a node that was revoked
+and let back in, or one that joined without a usable checkpoint, has exactly
+this. Such a realm cannot have a checkpoint published for it and cannot have
+anybody else's checked against it, and a reader who is not told so is a reader
+being shown a partial ledger as though it were the ledger.
+-/
+def realmJson (s : State) (me : MemberId) (r : Realm) (hasKey : Bool)
+    (unverified : Bool := false) : Json :=
   Json.mkObj [
-    ("budget", Budget.shortName b), ("note", Json.str (b.note.getD "")),
-    ("closed", Json.bool b.closed),
-    ("you", who),
-    ("total", amountJson total),
-    ("undivided", amountJson outstanding),
-    ("costs", Json.arr costs),
-    ("standings", Json.arr (standings.map standingJson)),
-    ("claims", Json.arr claims)]
+    ("id", r.id.val), ("name", r.name),
+    ("generation", Json.num (JsonNumber.fromNat r.generation)),
+    ("hasKey", Json.bool hasKey), ("unverified", Json.bool unverified),
+    ("admin", Json.bool (r.isAdmin me)),
+    ("budget", jopt (budgetOfRealm s r)),
+    ("members", Json.arr (r.members.map fun (id, role) =>
+      realmMemberJson (memberOr s id) role (id == me)).toArray)]
+
+/--
+A realm's membership, seen from both sides.
+
+The ledger says who is in the realm; the sequencer says who holds a key for it,
+which is what decides whether they can read a word of it. `granted` is null when
+nobody was asked, because an empty list would say something much stronger.
+-/
+def realmMembersJson (s : State) (me : MemberId) (r : Realm) (granted : Option (Array String)) :
+    Json :=
+  Json.mkObj [
+    ("realm", r.id.val), ("name", r.name),
+    ("members", Json.arr (r.members.map fun (m, role) =>
+      realmMemberJson (memberOr s m) role (m == me)).toArray),
+    ("granted", match granted with
+                | some ms => Json.arr (ms.map Json.str)
+                | none => Json.null)]
+
+/-- An invite: who it is for, what it lets them do, and the link that redeems it. -/
+def inviteJson (r : Realm) (who role expires link : String) : Json :=
+  Json.mkObj [
+    ("realm", r.id.val), ("name", r.name), ("for", who), ("role", role),
+    ("expires", expires), ("link", link)]
+
+/-- What one round of sync came to. -/
+def roundJson (r : Round) : Json :=
+  let jnat (n : Nat) : Json := Json.num (JsonNumber.fromNat n)
+  Json.mkObj [
+    ("at", r.ran), ("applied", jnat r.applied), ("unreadable", jnat r.unreadable),
+    ("rejected", jnat r.rejected), ("pushed", jnat r.pushed),
+    ("conflicts", jnat r.conflicts), ("seq", jnat r.seq), ("trouble", r.trouble)]
+
+/-- Where this store syncs, and how far it has got. -/
+def syncStatusJson (s : SyncStatus) : Json :=
+  let jnat (n : Nat) : Json := Json.num (JsonNumber.fromNat n)
+  Json.mkObj [
+    ("configured", Json.bool s.configured), ("sequencer", s.sequencer),
+    ("ledger", s.ledger), ("member", s.member), ("boxPk", s.boxPk),
+    ("seq", jnat s.seq), ("hash", s.hash), ("pending", jnat s.pending),
+    ("events", jnat s.events),
+    ("unverified", Json.arr (s.unverified.map Json.str).toArray),
+    ("lastRound", match s.lastRound with | some r => roundJson r | none => Json.null)]
 
 /-! ## Parsing incoming transactions -/
 

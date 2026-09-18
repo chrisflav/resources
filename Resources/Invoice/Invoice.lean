@@ -4,151 +4,21 @@ import Resources.Store.Budgets
 /-!
 # Invoices and payment requests
 
-Invoice numbers must be gapless, so the number is allocated inside the same
-database transaction that inserts the row. Every invoice carries an ISO 11649
-reference which the QR code puts into the payer's transfer, which the importer
-finds again in the next bank export — closing the loop between requirement (g)
-and requirement (b) with no manual reconciliation step.
+Invoice numbers must be gapless, so the number is allocated by the operation
+that writes the document down rather than by whoever asked for it: a gap is a
+question an auditor asks, and one nobody can answer afterwards. Every invoice
+carries an ISO 11649 reference which the QR code puts into the payer's transfer,
+which the importer finds again in the next bank export — closing the loop
+between requirement (g) and requirement (b) with no manual reconciliation step.
+
+Reading an invoice is SQL; writing one is an operation, like everything else
+that reaches the ledger. What is left in this file is the part `Core` cannot do:
+mint an identifier and make sure the payer exists.
 -/
 
 open Lean SQLite
 
 namespace Resources
-
-/-- Rounds `a / b` to the nearest integer, halves away from zero. `b` must be positive. -/
-def divRound (a b : Int) : Int :=
-  if b == 0 then 0
-  else if a ≥ 0 then (a + b / 2) / b
-  else -((-a + b / 2) / b)
-
-/-- One line of an invoice. Quantities carry three decimals, tax rates are basis points. -/
-structure InvoiceLine where
-  description : String
-  /-- Quantity times 1000, so `2.5` hours is `2500`. -/
-  qtyMilli : Int
-  unitPrice : Amount
-  /-- VAT in basis points: 19% is `1900`. -/
-  taxBp : Int := 0
-  deriving Repr, Inhabited
-
-namespace InvoiceLine
-
-/-- The line total before tax. -/
-def net (l : InvoiceLine) : Amount :=
-  ⟨l.unitPrice.commodity, divRound (l.qtyMilli * l.unitPrice.minor) 1000⟩
-
-/-- The tax on this line. -/
-def tax (l : InvoiceLine) : Amount :=
-  ⟨l.unitPrice.commodity, divRound (l.net.minor * l.taxBp) 10000⟩
-
-/-- The line total including tax. -/
-def gross (l : InvoiceLine) : Amount :=
-  ⟨l.unitPrice.commodity, l.net.minor + l.tax.minor⟩
-
-/-- The quantity rendered with up to three decimals. -/
-def quantity (l : InvoiceLine) : String :=
-  Amount.digits ⟨⟨"", 3⟩, l.qtyMilli⟩
-
-/-- The tax rate as a percentage string. -/
-def taxRate (l : InvoiceLine) : String :=
-  Amount.digits ⟨⟨"", 2⟩, l.taxBp⟩ ++ "%"
-
-end InvoiceLine
-
-/-- The lifecycle of an invoice. -/
-inductive InvoiceStatus
-  | draft | sent | paid | void
-  deriving DecidableEq, Repr, Inhabited
-
-namespace InvoiceStatus
-
-/-- The name used in the database and in JSON. -/
-def toString : InvoiceStatus → String
-  | .draft => "draft" | .sent => "sent" | .paid => "paid" | .void => "void"
-
-/-- Inverse of `toString`. -/
-def ofString? : String → Option InvoiceStatus
-  | "draft" => some .draft | "sent" => some .sent
-  | "paid" => some .paid | "void" => some .void | _ => none
-
-instance : ToString InvoiceStatus := ⟨InvoiceStatus.toString⟩
-
-end InvoiceStatus
-
-/-- A payment request addressed to a party. -/
-structure Invoice where
-  id : InvoiceId
-  /-- Gapless, allocated per year: `2026-0007`. -/
-  number : String
-  issued : Date
-  due : Date
-  payerId : Option PartyId
-  payerName : String
-  commodity : Commodity
-  /-- The ISO 11649 reference that closes the loop with the importer. -/
-  reference : String
-  status : InvoiceStatus
-  note : Option String
-  settledTxn : Option TxId
-  payment : PaymentRequest
-  /-- The budget account this was raised from. -/
-  sourceAccount : Option String
-  /-- The budget whose division this invoice speaks about, when there is one. -/
-  budgetId : Option BudgetId
-  /--
-  The claim this invoice asks to have met.
-
-  An invoice itemises costs that have already happened and asks for a payment
-  that has not. Those are two entries, and this is the second one: the document
-  describes the first and points at the second, so "has this been paid" is a
-  question about the claim rather than a flag somebody has to remember to set.
-  -/
-  pendingTxn : Option TxId
-  lines : List InvoiceLine
-  deriving Repr, Inhabited
-
-namespace Invoice
-
-/-- The sum before tax. -/
-def net (i : Invoice) : Amount :=
-  ⟨i.commodity, (i.lines.map (fun l => l.net.minor)).sum⟩
-
-/-- The total tax. -/
-def tax (i : Invoice) : Amount :=
-  ⟨i.commodity, (i.lines.map (fun l => l.tax.minor)).sum⟩
-
-/-- The amount actually due. -/
-def total (i : Invoice) : Amount :=
-  ⟨i.commodity, i.net.minor + i.tax.minor⟩
-
-/-- The string encoded in this invoice's QR code. -/
-def qrPayload (i : Invoice) : Except String String :=
-  i.payment.payload i.total i.reference
-
-/-- A JSON view, for the API and the web client. -/
-def toJson (i : Invoice) : Json :=
-  Json.mkObj [
-    ("id", i.id.val), ("number", i.number), ("issued", i.issued.toIso), ("due", i.due.toIso),
-    ("payerName", i.payerName), ("payerId", (i.payerId.map (·.val)).getD ""),
-    ("commodity", i.commodity.code), ("reference", i.reference),
-    ("status", i.status.toString), ("note", i.note.getD ""),
-    ("settledTxn", (i.settledTxn.map (·.val)).getD ""),
-    ("payment", i.payment.describe), ("sourceAccount", Json.str (i.sourceAccount.getD "")),
-    ("budgetId", Json.str ((i.budgetId.map (·.val)).getD "")),
-    ("pendingTxn", Json.str ((i.pendingTxn.map (·.val)).getD "")),
-    ("net", Json.num (JsonNumber.fromInt i.net.minor)),
-    ("tax", Json.num (JsonNumber.fromInt i.tax.minor)),
-    ("total", Json.num (JsonNumber.fromInt i.total.minor)),
-    ("totalText", i.total.render),
-    ("lines", Json.arr (i.lines.map (fun l => Json.mkObj [
-        ("description", l.description),
-        ("quantity", l.quantity),
-        ("unitPrice", Json.num (JsonNumber.fromInt l.unitPrice.minor)),
-        ("taxBp", Json.num (JsonNumber.fromInt l.taxBp)),
-        ("net", Json.num (JsonNumber.fromInt l.net.minor)),
-        ("gross", Json.num (JsonNumber.fromInt l.gross.minor))])).toArray) ]
-
-end Invoice
 
 private structure InvoiceRow where
   id : String
@@ -217,18 +87,7 @@ document and the entries cannot disagree. Leaving the second half out would ask
 somebody who paid for the taxi to pay for their share of it a second time.
 -/
 def linesFor (ctx : Ctx) (b : Budget) (owner : PartyId) : IO (List InvoiceLine) := do
-  let borne ← Budgets.allocationLines ctx b owner
-  let funded ← Budgets.fundedLines ctx b owner
-  let line (prefix' : String) : (String × Amount) → InvoiceLine
-    | (description, amount) =>
-      { description := prefix' ++ description, qtyMilli := 1000, unitPrice := amount }
-  return borne.toList.map (line "") ++ funded.toList.map (line "you paid: ")
-
-/-- Records which outlays an invoice is asking to be repaid for. -/
-def recordSources (ctx : Ctx) (id : InvoiceId) (sources : List TxId) : IO Unit := do
-  for t in sources do
-    Db.exec ctx.db s!"INSERT OR IGNORE INTO invoice_source (invoice_id, txn_id)
-                      VALUES ({Db.lit id.val}, {Db.lit t.val})"
+  return Budget.linesFor b (← ctx.state.get) owner
 
 /-- The transactions an invoice covers. -/
 def sourcesOf (ctx : Ctx) (id : InvoiceId) : IO (Array TxId) := do
@@ -256,54 +115,37 @@ def get? (ctx : Ctx) (idOrNumber : String) : IO (Option Invoice) := do
   return (← hydrate ctx rows)[0]?
 
 /--
-Allocates the next invoice number for a year. Called inside the caller's
-transaction so numbering stays gapless even if two writers race.
--/
-def nextNumber (ctx : Ctx) (year : Nat) : IO String := do
-  let n ← ctx.nextCounter s!"invoice:{year}"
-  return s!"{year}-" ++ Str.padLeft (toString n) 4 '0'
+Creates an invoice, allocating its number and reference.
 
-/-- Creates an invoice, allocating its number and reference. -/
+The number comes from the counters inside `Op.issueInvoice` rather than from
+here, so it is decided at the moment the document is written down and the
+sequence stays gapless. What is left for the store is the payer: a document
+addressed to somebody this ledger has never heard of would otherwise become a
+second record of a person, and `Core` has no way to mint them an id.
+-/
 def create (ctx : Ctx) (payerName : String) (lines : List InvoiceLine)
     (payment : PaymentRequest) (issued due : Date) (commodity : Commodity := Commodity.eur)
     (note : Option String := none) (sourceAccount : Option String := none)
     (budget : Option BudgetId := none) (pending : Option TxId := none)
     (status : InvoiceStatus := .draft) : IO Invoice := do
-  let id ← freshId
-  let now ← nowStamp
-  ctx.transaction do
-    let year := issued.year.toInt.toNat
-    let number ← nextNumber ctx year
-    let reference := Rf.make (number.replace "-" "")
-    let party ← Parties.ensure ctx payerName
-    let (kind, data) := payment.encode
-    Db.exec ctx.db s!"INSERT INTO invoice
-      (id, number, issued, due, payer_id, payer_name, commodity, reference, status,
-       note, settled_txn, created_at, payment_kind, payment_data, source_account,
-       budget_id, pending_txn)
-      VALUES ({Db.lit id}, {Db.lit number}, {Db.lit issued.toIso}, {Db.lit due.toIso},
-              {Db.lit party.id.val}, {Db.lit payerName}, {Db.lit commodity.code},
-              {Db.lit reference}, {Db.lit status.toString}, {Db.litOpt note}, NULL, {Db.lit now},
-              {Db.lit kind}, {Db.lit data}, {Db.litOpt sourceAccount},
-              {Db.litOpt (budget.map (·.val))}, {Db.litOpt (pending.map (·.val))})"
-    for (l, i) in lines.zipIdx do
-      Db.exec ctx.db s!"INSERT INTO invoice_line
-        (invoice_id, idx, description, qty_milli, unit_minor, tax_bp)
-        VALUES ({Db.lit id}, {i}, {Db.lit l.description}, {l.qtyMilli},
-                {l.unitPrice.minor}, {l.taxBp})"
-    return { id := ⟨id⟩, number, issued, due, payerId := some party.id, payerName,
-             commodity, reference, status, note, settledTxn := none,
-             payment, sourceAccount, budgetId := budget, pendingTxn := pending, lines }
+  let id : InvoiceId := ⟨← freshId⟩
+  let party ← Parties.ensure ctx payerName
+  let draft : Invoice :=
+    { id, number := "", issued, due, payerId := some party.id, payerName, commodity
+      reference := "", status, note, settledTxn := none, payment, sourceAccount
+      budgetId := budget, pendingTxn := pending, lines }
+  discard <| ctx.commit "system" [.issueInvoice draft []]
+  let some raised := (← ctx.state.get).invoice? id
+    | throw <| IO.userError s!"the invoice for {payerName} was not written"
+  return raised.invoice
 
 /-- Moves an invoice to a new status. -/
 def setStatus (ctx : Ctx) (id : InvoiceId) (status : InvoiceStatus) : IO Unit :=
-  Db.exec ctx.db
-    s!"UPDATE invoice SET status = {Db.lit status.toString} WHERE id = {Db.lit id.val}"
+  discard <| ctx.commit "system" [.setInvoiceStatus id status]
 
 /-- Marks an invoice paid and records which transaction settled it. -/
 def settle (ctx : Ctx) (id : InvoiceId) (txn : TxId) : IO Unit :=
-  Db.exec ctx.db s!"UPDATE invoice SET status = 'paid', settled_txn = {Db.lit txn.val}
-                    WHERE id = {Db.lit id.val}"
+  discard <| ctx.commit "system" [.settleInvoice id txn]
 
 /--
 Deletes an invoice, its lines and the record of what it billed.
@@ -315,16 +157,7 @@ Only a draft may go: once a number has been sent to somebody it has to be voided
 instead, because they have seen it.
 -/
 def delete (ctx : Ctx) (id : InvoiceId) : IO Unit :=
-  ctx.transaction do
-    let number := (← Db.row? String ctx.db
-      s!"SELECT number FROM invoice WHERE id = {Db.lit id.val}").getD ""
-    Db.exec ctx.db s!"DELETE FROM invoice WHERE id = {Db.lit id.val}"
-    match number.splitOn "-" with
-    | [year, seq] =>
-      Db.exec ctx.db s!"UPDATE counter SET value = value - 1
-                        WHERE name = {Db.lit s!"invoice:{year}"}
-                          AND value = {Db.lit seq}"
-    | _ => pure ()
+  discard <| ctx.commit "system" [.deleteInvoice id]
 
 /--
 Settles invoices whose ISO 11649 reference turns up in a transaction's payee or
@@ -368,41 +201,22 @@ to be an invoice "born paid" was a document about nothing outstanding.
 def forBudget (ctx : Ctx) (b : Budget) (payment : PaymentRequest) (issued due : Date)
     (commodity : Commodity := Commodity.eur) (note : Option String := none)
     (only : Option (List String) := none) : IO (Array Invoice) := do
-  let accounts ← Accounts.list ctx
-  let existing ← Db.rows String ctx.db
-    s!"SELECT pending_txn FROM invoice
-       WHERE budget_id = {Db.lit b.id.val} AND pending_txn IS NOT NULL AND status != 'void'"
-  let done := existing.toList
-  let mut out : Array Invoice := #[]
-  for claim in ← Budgets.claims ctx b do
-    if claim.state != .pending then continue
-    if done.contains claim.id.val then continue
-    if let some keep := only then
-      if !keep.contains claim.id.val then continue
-    let some recvId := Pendings.receiver? claim | continue
-    let some payId := Pendings.payer? claim | continue
-    let some recv := accounts.find? (·.id == recvId) | continue
-    let some payer := accounts.find? (·.id == payId) | continue
-    -- Somebody else's claim on somebody else. Theirs to chase, not yours.
-    if !recv.mine then continue
-    let lines ← linesFor ctx b payer.owner
-    if lines.isEmpty then continue
-    -- An invoice asks for exactly what its claim asks for. The two can differ
-    -- when a settlement routed part of somebody's position to a third person,
-    -- or when an earlier invoice already asked for some of it, and saying so is
-    -- better than quietly billing a figure the QR code will not match.
-    let asked := (Pendings.amount claim).minor
-    let stated := (lines.map (fun l => l.gross.minor)).sum
-    let lines :=
-      if stated == asked then lines
-      else lines ++ [{ description := "already asked for, or settled directly with the others"
-                       qtyMilli := 1000, unitPrice := ⟨commodity, asked - stated⟩ }]
-    let who := ((← Parties.byId? ctx payer.owner).map (·.name)).getD payer.name
-    let inv ← create ctx who lines payment issued due commodity note (some b.name)
-      (some b.id) (some claim.id)
-    recordSources ctx inv.id ((← Budgets.costs ctx b).toList.map (·.id))
-    out := out.push inv
-  return out
+  let before ← ctx.state.get
+  -- One identifier per claim the budget has raised, which is as many documents
+  -- as this can possibly write.
+  let mut ids : List InvoiceId := []
+  for _ in [0 : (Budget.claims b before).length] do
+    ids := ids ++ [⟨← freshId⟩]
+  let drafts ← IO.ofExcept
+    (Budget.invoicesFor b before payment issued due commodity note only ids)
+  if drafts.isEmpty then return #[]
+  -- Every payer is made sure of before the documents are written: an invoice
+  -- can be addressed to somebody, and it cannot invent them.
+  for (inv, _) in drafts do
+    discard <| Parties.ensure ctx inv.payerName
+  discard <| ctx.commit "system" (drafts.map fun (inv, sources) => Op.issueInvoice inv sources)
+  let after ← ctx.state.get
+  return (drafts.filterMap fun (inv, _) => (after.invoice? inv.id).map (·.invoice)).toArray
 
 end Invoices
 

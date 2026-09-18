@@ -1,4 +1,4 @@
-import Resources.Core.Settle
+import Resources.Core.Claim
 import Resources.Store.Repo
 
 /-!
@@ -35,47 +35,27 @@ open Lean
 namespace Resources
 namespace Pendings
 
-/-- The tag both legs of a claim carry, so a claim is recognisable leg by leg. -/
-def tag : String := "claim"
-
-/-- The account a claim expects money to arrive in. -/
-def receiver? (t : Transaction) : Option AccountId :=
-  (t.postings.find? (·.amount.minor > 0)).map (·.account)
-
-/-- The account a claim expects money to leave. -/
-def payer? (t : Transaction) : Option AccountId :=
-  (t.postings.find? (·.amount.minor < 0)).map (·.account)
-
-/-- What a claim still asks for. -/
-def amount (t : Transaction) : Amount :=
-  match t.postings.find? (·.amount.minor > 0) with
-  | some p => p.amount
-  | none => ⟨Commodity.eur, 0⟩
-
 /--
 Raises a claim for `amount` passing from `payer` to `receiver` by `due`.
 
 Two legs, both tagged, and validated like anything else that reaches the store:
-a promise that does not balance is not a promise about money.
+a promise that does not balance is not a promise about money. The tagging, the
+checks and the validation all live in `Op.raiseClaim`; what is left here is the
+one thing `Core` cannot do, which is to mint the id.
 -/
 def create (ctx : Ctx) (payer receiver : AccountId) (amount : Amount) (due : Date)
     (narration : String) (actor : String) (labels : List LabelId := [])
     (payee : Option String := none) : IO Transaction := do
-  if amount.minor ≤ 0 then
-    throw <| IO.userError "a claim has to ask for something"
-  if payer == receiver then
-    throw <| IO.userError "a claim between one account and itself asks for nothing"
   let t : Transaction :=
     { id := ⟨← freshId⟩, date := due, payee, narration, state := .pending
       postings :=
         [{ account := receiver, amount, tag := some tag },
          { account := payer, amount := ⟨amount.commodity, -amount.minor⟩, tag := some tag }]
       labels, source := .manual actor }
-  match t.validate with
-  | .error e => throw <| IO.userError e
-  | .ok bt =>
-    Txns.put ctx bt actor "claim"
-    return bt.val
+  let changes ← ctx.commit actor [.raiseClaim t] (kind := "claim")
+  match (Change.written changes)[0]? with
+  | some raised => return raised
+  | none => throw <| IO.userError "a claim has to ask for something"
 
 /-- Outstanding claims matching a filter, soonest due first. -/
 def list (ctx : Ctx) (f : Filter := .all) (limit : Nat := 500) : IO (Array Transaction) :=
@@ -105,52 +85,29 @@ more, and a claim that had quietly shrunk would let the difference be asked for
 a second time.
 -/
 def resolve (ctx : Ctx) (id : TxId) (actual : TxId) (actor : String) : IO Transaction := do
-  let some claim ← Txns.get? ctx id
+  -- Read once, before anything is written, to name the revisions: a part
+  -- payment records the half that was met as `resolve` and the claim it reduced
+  -- as `part-resolve`, and the kind has to be chosen per id in advance.
+  let before ← ctx.state.get
+  let partly : Bool :=
+    match before.txn? id, before.txn? actual with
+    | some claim, some act =>
+      match receiver? claim with
+      | some recv =>
+        let asked := amount claim
+        let arrived := act.netIn recv asked.commodity.code
+        0 < arrived && arrived < asked.minor
+      | none => false
+    | _, _ => false
+  let splitId : TxId := ⟨← freshId⟩
+  discard <| ctx.commit actor [.resolveClaim id actual splitId] (kind := "resolve")
+    (kinds := fun x =>
+      if x == actual then some "claim"
+      else if x == id && partly then some "part-resolve"
+      else none)
+  let some met := (← ctx.state.get).txn? id
     | throw <| IO.userError s!"no such claim: {id.val}"
-  if claim.state != .pending then
-    throw <| IO.userError s!"that claim is already {claim.state}"
-  let some act ← Txns.get? ctx actual
-    | throw <| IO.userError s!"no such transaction: {actual.val}"
-  if act.state != .posted then
-    throw <| IO.userError "a claim can only be met by a transaction that actually happened"
-  let some recv := receiver? claim
-    | throw <| IO.userError "this claim has no receiving leg"
-  let some payAcc := payer? claim
-    | throw <| IO.userError "this claim has no paying leg"
-  let asked := amount claim
-  let arrived := act.netIn recv asked.commodity.code
-  if arrived ≤ 0 then
-    let some acc ← Accounts.byId? ctx recv | throw <| IO.userError "the receiving account is gone"
-    throw <| IO.userError s!"{actual.val} brings nothing into {acc.name}"
-  let some payer ← Accounts.byId? ctx payAcc
-    | throw <| IO.userError "the paying account is gone"
-  let matched := min arrived asked.minor
-  -- What the claim contributes to the real transaction: who the money was from.
-  -- Anything it overpays goes to the same place, which is right — an
-  -- overpayment leaves their purse owing them the difference.
-  discard <| Txns.claim ctx #[actual] payer.name actor
-  let left := asked.minor - matched
-  -- A met claim is stamped the way a merge stamps its sources, so it points at
-  -- the entry that discharged it.
-  let resize (n : Int) (t : Transaction) : Transaction :=
-    { t with postings := t.postings.map fun p =>
-        { p with amount := (⟨p.amount.commodity, if p.amount.minor > 0 then n else -n⟩ : Amount) } }
-  let stamp (t : Transaction) : Transaction :=
-    { t with postings := t.postings.map fun p => { p with origin := p.origin <|> some actual.val } }
-  let write (t : Transaction) (kind : String) : IO Transaction := do
-    match t.validate with
-    | .error e => throw <| IO.userError s!"the claim would not balance: {e}"
-    | .ok bt =>
-      Txns.put ctx bt actor kind
-      return bt.val
-  if left == 0 then
-    return ← write (stamp { claim with state := .settled }) "resolve"
-  -- The part that was met becomes a record in its own right, so what has been
-  -- asked for stays the sum of both halves.
-  discard <| write
-    (stamp (resize matched { claim with id := ⟨← freshId⟩, date := act.date, state := .settled }))
-    "resolve"
-  write (resize left claim) "part-resolve"
+  return met
 
 /--
 Retires a claim that will never be performed.
@@ -166,33 +123,24 @@ your loss, which is a different account and a different sentence.
 -/
 def void (ctx : Ctx) (id : TxId) (actor : String)
     (writeOffTo : Option String := none) : IO Transaction := do
-  let some claim ← Txns.get? ctx id
+  let before ← ctx.state.get
+  let some claim := before.txn? id
     | throw <| IO.userError s!"no such claim: {id.val}"
   if claim.state == .posted then
     throw <| IO.userError "that is a transaction, not a claim"
-  if let some name := writeOffTo then
-    let some payAcc := payer? claim
-      | throw <| IO.userError "this claim has no paying leg to write off"
-    let loss ← Accounts.ensure ctx name
-    if !loss.mine then
-      throw <| IO.userError s!"{loss.name} is not yours, so the loss cannot land there"
-    let amount := amount claim
-    let today ← Date.today
-    let entry : Transaction :=
-      { id := ⟨← freshId⟩, date := today, payee := claim.payee
-        narration := s!"written off: {claim.narration}"
-        postings :=
-          [{ account := loss.id, amount },
-           { account := payAcc, amount := ⟨amount.commodity, -amount.minor⟩ }]
-        labels := claim.labels, source := .manual actor }
-    match entry.validate with
-    | .error e => throw <| IO.userError s!"the write-off would not balance: {e}"
-    | .ok bt => Txns.put ctx bt actor "write-off"
-  match ({ claim with state := .void } : Transaction).validate with
-  | .error e => throw <| IO.userError e
-  | .ok bt =>
-    Txns.put ctx bt actor "void"
-    return bt.val
+  -- The account the loss lands in has to exist before the operation can name
+  -- it, and the entry needs an id and a date: the three things `Core` has no
+  -- way to produce for itself.
+  let writeOff ← match writeOffTo with
+    | some name => do
+      let loss ← Accounts.ensure ctx name
+      pure (some (loss.id, (⟨← freshId⟩ : TxId), ← Date.today))
+    | none => pure none
+  discard <| ctx.commit actor [.voidClaim id writeOff] (kind := "void")
+    (kinds := fun x => if some x == writeOff.map (·.2.1) then some "write-off" else none)
+  let some voided := (← ctx.state.get).txn? id
+    | throw <| IO.userError s!"no such claim: {id.val}"
+  return voided
 
 /--
 Posted transactions that could meet this claim: money arriving in the account it
@@ -208,20 +156,6 @@ def candidates (ctx : Ctx) (t : Transaction) (limit : Nat := 10) : IO (Array Tra
   let asked := amount t
   let hits ← Txns.list ctx (.account acc.name) { key := .date, descending := true } 200
   return (hits.filter fun x => x.netIn recv asked.commodity.code > 0).take limit
-
-/--
-A claim, read as the movement it would make between two owners.
-
-This is the bridge to `Settle`: a plan is arithmetic over positions, and a claim
-already outstanding is a movement somebody has already been asked to make, so it
-has to be netted off before any more are raised.
--/
-def transferOf (accounts : Array Account) (t : Transaction) : Option Settle.Transfer := do
-  let recv ← receiver? t
-  let pay ← payer? t
-  let to ← accounts.find? (·.id == recv)
-  let from_ ← accounts.find? (·.id == pay)
-  pure { from_ := from_.owner.val, to := to.owner.val, minor := (amount t).minor }
 
 end Pendings
 end Resources

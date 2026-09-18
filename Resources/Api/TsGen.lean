@@ -99,7 +99,7 @@ private def sampleRule : Rule :=
 
 private def sampleToken : ApiToken :=
   { id := ⟨"tok"⟩, name := "cli", scopes := Scopes.ofList [.read], createdAt := "2026-01-01",
-    lastUsedAt := none, expiresAt := none, guest := none }
+    lastUsedAt := none, expiresAt := none }
 
 private def sampleRevision : Txns.Revision :=
   { seq := 1, stamp := "2026-01-01T00:00:00", actor := "cli", kind := "create", patch := "{}" }
@@ -121,6 +121,21 @@ private def sampleParticipant : Participant :=
 
 private def sampleStanding : Standing :=
   { owner := samplePartner.id, name := "anna", amount := ⟨sampleCommodity, 13583⟩ }
+
+private def sampleRealm : Realm :=
+  { id := ⟨"rlm"⟩, name := "Sicily", generation := 1,
+    members := [(Member.selfId, .admin), (⟨"b0"⟩, .viewer)] }
+
+private def sampleRealmState : State :=
+  { State.init with realms := State.init.realms.insert sampleRealm.id.val sampleRealm }
+
+private def sampleRound : Wire.Round :=
+  { ran := "2026-01-01T00:00:00", applied := 2, pushed := 1, seq := 41 }
+
+private def sampleSyncStatus : Wire.SyncStatus :=
+  { configured := true, sequencer := "https://seq.example", ledger := "home",
+    member := "3f2a", boxPk := "9c1d", seq := 41, hash := "deadbeef", pending := 0,
+    events := 128, lastRound := some sampleRound }
 
 private def sampleInvoiceLines : Array Json :=
   (((Invoice.toJson sampleInvoice).getObjValAs? (Array Json) "lines").toOption).getD #[]
@@ -173,7 +188,20 @@ def module : String :=
       (Wire.budgetJson sampleEnv sampleBudget ⟨sampleCommodity, 0⟩ ⟨sampleCommodity, 13583⟩ 2
         #[sampleParticipant] #[sampleStanding] #[sampleClaim])
       [("outstanding", "Amount"), ("allocated", "Amount"), ("among", "Participant[]"),
-       ("standings", "Standing[]"), ("claims", "Claim[]")]]
+       ("standings", "Standing[]"), ("claims", "Claim[]")],
+    interfaceOf "RealmMember"
+      (Wire.realmMemberJson { id := Member.selfId, name := "me" } .admin true),
+    interfaceOf "Realm" (Wire.realmJson sampleRealmState Member.selfId sampleRealm true false)
+      [("members", "RealmMember[]")],
+    interfaceOf "RealmMembers"
+      (Wire.realmMembersJson sampleRealmState Member.selfId sampleRealm (some #[Member.selfId.val]))
+      [("members", "RealmMember[]"), ("granted", "string[] | null")],
+    interfaceOf "Invite"
+      (Wire.inviteJson sampleRealm "anna" "viewer" "2026-01-15"
+        "https://seq.example/join/#abc"),
+    interfaceOf "Round" (Wire.roundJson sampleRound),
+    interfaceOf "SyncStatus" (Wire.syncStatusJson sampleSyncStatus)
+      [("unverified", "string[]"), ("lastRound", "Round | null")]]
 
 end TsGen
 end Api

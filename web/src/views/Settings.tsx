@@ -14,6 +14,7 @@ export default function Settings({ onChanged }: { onChanged: () => void }) {
   const [error, setError] = useState<string | null>(null)
   const attachments = useAsync(() => api.attachments(), [])
   const tokens = useAsync(() => api.tokens(), [])
+  const sync = useAsync(() => api.syncStatus(), [])
 
   const save = () => {
     setToken(token)
@@ -67,6 +68,45 @@ export default function Settings({ onChanged }: { onChanged: () => void }) {
         </div>
       </div>
 
+      <div className="card">
+        <div className="card-head">this node's identity and sync</div>
+        <div className="card-body">
+          {sync.error && <div className="error">{sync.error}</div>}
+          <div className="muted">
+            The member id is the hex of this node's signing key, and the agreement key is what
+            other people wrap a realm key to. Both are public; the secret halves never leave
+            identity.json, which is encrypted under a passphrase this page has never seen.
+          </div>
+          <div className="mono" style={{ wordBreak: 'break-all' }}>
+            member {sync.data?.member || 'no identity yet — run `resources identity init`'}
+            <br />
+            agreement {sync.data?.boxPk || '—'}
+          </div>
+          {sync.data?.configured ? (
+            <>
+              <div className="mono muted" style={{ wordBreak: 'break-all' }}>
+                sequencer {sync.data.sequencer}
+                <br />
+                ledger {sync.data.ledger}
+                <br />
+                head entry {sync.data.seq} {sync.data.hash.slice(0, 12)}
+                <br />
+                {sync.data.pending} of {sync.data.events} local events waiting to go out
+              </div>
+              <div className="muted">
+                Read-only here on purpose: where a store syncs is `sync.json` beside the database,
+                and changing it is `resources sync init`. Syncing itself is on the Sharing tab.
+              </div>
+            </>
+          ) : (
+            <div className="muted">
+              This store syncs with nothing: every event stays in the local log and no realm can
+              be shared. `resources sync init --sequencer URL` is what changes that.
+            </div>
+          )}
+        </div>
+      </div>
+
       <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
         <div className="card">
           <div className="card-head">mint a token</div>
@@ -100,7 +140,7 @@ export default function Settings({ onChanged }: { onChanged: () => void }) {
         </div>
 
         <div className="card">
-          <div className="card-head">tokens and share links</div>
+          <div className="card-head">tokens</div>
           <div className="table-wrap">
             <table>
               <thead>
@@ -116,11 +156,7 @@ export default function Settings({ onChanged }: { onChanged: () => void }) {
                   <tr key={t.id}>
                     <td>{t.name}</td>
                     <td>
-                      {t.guest ? (
-                        <span className="pill warn">one budget, one person</span>
-                      ) : (
-                        <span className="mono muted">{t.scopes}</span>
-                      )}
+                      <span className="mono muted">{t.scopes}</span>
                     </td>
                     <td className="mono muted">{t.lastUsedAt ?? 'never'}</td>
                     <td>
@@ -145,9 +181,9 @@ export default function Settings({ onChanged }: { onChanged: () => void }) {
           </div>
           <div className="card-body">
             <div className="muted">
-              A share link reaches one budget and one person's accounts, and nothing else — not
-              because each route checks, but because it is dispatched to a route table of its own.
-              Revoking one stops it at once.
+              A token is a credential of your own. Letting somebody else in is an invite to a
+              realm, on the Sharing tab: it hands them a key rather than a narrower version of
+              yours, and what they can read is what that key opens.
             </div>
           </div>
         </div>

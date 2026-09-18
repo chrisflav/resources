@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { api } from '../api'
 import { useAsync, useDebounced } from '../hooks'
-import type { Budget, Invoice } from '../types'
+import type { Budget, Invoice, Realm } from '../types'
 
 function Detail({ invoice, onChanged }: { invoice: Invoice; onChanged: () => void }) {
   const [busy, setBusy] = useState(false)
@@ -200,9 +200,18 @@ export default function Sharing({
   const [theirAmount, setTheirAmount] = useState('')
   const [theirWhat, setTheirWhat] = useState('')
 
-  // …and the link that lets them do it themselves
+  // …and the realm that lets them do it themselves
   const [shareWith, setShareWith] = useState('')
+  const [shareRole, setShareRole] = useState('viewer')
   const [linkFor, setLinkFor] = useState<string | null>(null)
+  const [newRealm, setNewRealm] = useState('')
+  const [openRealm, setOpenRealm] = useState<string | null>(null)
+  const realms = useAsync(() => api.realms(), [])
+  const members = useAsync(
+    () => (openRealm ? api.realmMembers(openRealm) : Promise.resolve(null)),
+    [openRealm],
+  )
+  const sync = useAsync(() => api.syncStatus(), [])
 
   // 3 · write up
   const [beneficiary, setBeneficiary] = useState('')
@@ -324,16 +333,56 @@ export default function Sharing({
       people.reload()
     })
 
-  const share = () =>
+  const allRealms: Realm[] = realms.data ?? []
+  const realmOf = (b: Budget) => allRealms.find((r) => r.budget === b.shortName) ?? null
+  const realm = allRealms.find((r) => r.id === openRealm) ?? null
+
+  // Sharing a budget is making the realm it lives in, and inviting somebody to
+  // that. A realm is one key and one set of members; the invite is a pending
+  // grant on the sequencer, and redeeming it makes them a member with a key of
+  // their own rather than a caller with fewer rights.
+  const shareBudget = (b: Budget) =>
     guard(async () => {
-      if (!budget) return
-      const r = await api.createShareLink({
-        name: `${budget.shortName} · ${shareWith.trim()}`,
-        budget: budget.shortName,
-        for: shareWith.trim(),
-      })
-      setLinkFor(`${window.location.origin}${r.link}`)
+      const found = realmOf(b)
+      if (found) {
+        setOpenRealm(found.id)
+        return
+      }
+      const made = await api.createRealm({ name: b.shortName, budget: b.shortName })
+      setOpenRealm(made.id)
+      setNotice(`${made.name} is a realm now — invite somebody to it below`)
+      realms.reload()
+      budgets.reload()
+    })
+
+  const startRealm = () =>
+    guard(async () => {
+      const made = await api.createRealm({ name: newRealm.trim(), budget: newRealm.trim() })
+      setNewRealm('')
+      setOpenRealm(made.id)
+      setNotice(`${made.name} is open — lend costs into ${made.budget ?? made.name}`)
+      realms.reload()
+      budgets.reload()
+    })
+
+  const invite = (id: string) =>
+    guard(async () => {
+      const made = await api.inviteToRealm(id, { for: shareWith.trim(), role: shareRole })
+      setLinkFor(made.link)
       setShareWith('')
+      members.reload()
+    })
+
+  const syncNow = () =>
+    guard(async () => {
+      const r = await api.syncNow()
+      setNotice(
+        r.trouble ||
+          `${r.applied} in, ${r.pushed} out; the shared order stands at entry ${r.seq}`,
+      )
+      sync.reload()
+      realms.reload()
+      budgets.reload()
     })
 
   const writeUp = () =>
@@ -567,33 +616,24 @@ export default function Sharing({
                   let them add their own
                 </div>
                 <div className="row">
-                  <input
-                    type="text"
-                    list="bearer-names"
-                    style={{ flex: '1 1 160px' }}
-                    placeholder="who to send a link to"
-                    value={shareWith}
-                    onChange={(e) => setShareWith(e.target.value)}
-                    aria-label="who to share with"
-                  />
                   <button
                     className="btn quiet"
-                    disabled={busy || !shareWith.trim()}
-                    onClick={() => void share()}
+                    disabled={busy}
+                    onClick={() => void shareBudget(budget)}
                   >
-                    Make a link
+                    {realmOf(budget) ? 'Invite somebody' : 'Share this budget'}
                   </button>
+                  <span className="muted">
+                    {realmOf(budget)
+                      ? `in realm ${realmOf(budget)?.name}`
+                      : 'this budget is yours alone'}
+                  </span>
                 </div>
-                {linkFor && (
-                  <>
-                    <input className="mono" type="text" readOnly value={linkFor} aria-label="link" />
-                    <div className="muted">
-                      Send this once — it is shown once. Whoever holds it sees this budget and
-                      nothing else, and can only ever post to an account of their own. Revoke it in
-                      Settings.
-                    </div>
-                  </>
-                )}
+                <div className="muted">
+                  Sharing a budget is making the realm it lives in and inviting somebody to that.
+                  Whoever redeems the invite becomes a member with a key of their own and a purse
+                  in the realm, and can put what they paid for straight into the budget.
+                </div>
               </div>
 
               <div className="card-body">
@@ -705,7 +745,7 @@ export default function Sharing({
                   <div className="muted">
                     Say who shares it once; closing is what divides it. Until you close, costs
                     just accumulate — which is what the budget account is for. Closing also stops
-                    anybody adding to it, including whoever holds a share link.
+                    anybody adding to it, including everybody else in its realm.
                   </div>
                   <div className="muted">
                     Reopening leaves every division already made exactly as it is. Closing again
@@ -959,6 +999,194 @@ export default function Sharing({
                 </tbody>
               </table>
               {list.length === 0 && <div className="empty">No invoices yet.</div>}
+            </div>
+          </div>
+
+          <div className="card">
+            <div className="card-head">realms — one key, one set of members</div>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>realm</th>
+                    <th>budget</th>
+                    <th className="num">generation</th>
+                    <th className="num">members</th>
+                    <th>key</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {allRealms.map((r) => (
+                    <tr
+                      key={r.id}
+                      className={`clickable${openRealm === r.id ? ' selected' : ''}`}
+                      onClick={() => setOpenRealm(openRealm === r.id ? null : r.id)}
+                    >
+                      <td>{r.name}</td>
+                      <td>{r.budget ?? ''}</td>
+                      <td className="num">{r.generation}</td>
+                      <td className="num">{r.members.length}</td>
+                      <td>
+                        {r.hasKey ? (
+                          <span className="pill good">held here</span>
+                        ) : (
+                          <span className="pill">not held here</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {allRealms.length === 0 && !realms.loading && (
+                <div className="empty">No realms yet.</div>
+              )}
+            </div>
+
+            {realm && (
+              <>
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>member</th>
+                        <th>role</th>
+                        <th>key</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(members.data?.members ?? realm.members).map((m) => (
+                        <tr key={m.id}>
+                          <td>
+                            {m.name}
+                            {m.mine ? ' (you)' : ''}
+                          </td>
+                          <td>{m.role}</td>
+                          <td className="muted">
+                            {members.data?.granted == null
+                              ? '—'
+                              : members.data.granted.includes(m.id)
+                                ? 'held'
+                                : 'none'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="card-body">
+                  <div className="row">
+                    <input
+                      type="text"
+                      list="bearer-names"
+                      style={{ flex: '1 1 160px' }}
+                      placeholder="who to invite"
+                      value={shareWith}
+                      onChange={(e) => setShareWith(e.target.value)}
+                      aria-label="who to invite"
+                    />
+                    <select
+                      value={shareRole}
+                      onChange={(e) => setShareRole(e.target.value)}
+                      aria-label="what they may do"
+                    >
+                      <option value="viewer">viewer</option>
+                      <option value="admin">admin</option>
+                    </select>
+                    <button
+                      className="btn quiet"
+                      disabled={busy || !shareWith.trim()}
+                      onClick={() => void invite(realm.id)}
+                    >
+                      Make an invite
+                    </button>
+                  </div>
+                  {linkFor && (
+                    <>
+                      <input
+                        className="mono"
+                        type="text"
+                        readOnly
+                        value={linkFor}
+                        aria-label="invite link"
+                        onFocus={(e) => e.currentTarget.select()}
+                      />
+                      <div className="row">
+                        <button
+                          className="btn quiet"
+                          onClick={() => void navigator.clipboard?.writeText(linkFor)}
+                        >
+                          Copy link
+                        </button>
+                      </div>
+                      <div className="muted">
+                        Send it once. The secret is in the fragment after the #, which a browser
+                        never sends to a server, and the offer is single-use and expires.
+                      </div>
+                    </>
+                  )}
+                </div>
+              </>
+            )}
+
+            <div className="card-body">
+              <div className="row">
+                <input
+                  type="text"
+                  style={{ flex: '1 1 160px' }}
+                  placeholder="Sicily2026"
+                  value={newRealm}
+                  onChange={(e) => setNewRealm(e.target.value)}
+                  aria-label="name for a shared budget"
+                />
+                <button
+                  className="btn quiet"
+                  disabled={busy || !newRealm.trim()}
+                  onClick={() => void startRealm()}
+                >
+                  Start a shared budget
+                </button>
+              </div>
+              <div className="muted">
+                A budget has to be made inside the realm it is shared in: an account cannot move
+                between realms afterwards, because that would move money out from under the key it
+                was written under.
+              </div>
+            </div>
+          </div>
+
+          <div className="card">
+            <div className="card-head">sync — the order everybody shares</div>
+            <div className="card-body">
+              {sync.data && sync.data.configured ? (
+                <>
+                  <div className="mono muted">
+                    sequencer {sync.data.sequencer}
+                    <br />
+                    ledger {sync.data.ledger}
+                    <br />
+                    head entry {sync.data.seq} {sync.data.hash.slice(0, 12)}
+                    <br />
+                    {sync.data.pending} event{sync.data.pending === 1 ? '' : 's'} waiting to go out
+                  </div>
+                  <div className="muted">
+                    {sync.data.lastRound
+                      ? `last round ${sync.data.lastRound.at}: ` +
+                        `${sync.data.lastRound.applied} in, ${sync.data.lastRound.pushed} out` +
+                        (sync.data.lastRound.trouble ? ` — ${sync.data.lastRound.trouble}` : '')
+                      : 'no round has run in this process yet'}
+                  </div>
+                  <div className="row">
+                    <button className="btn quiet" disabled={busy} onClick={() => void syncNow()}>
+                      Sync now
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <div className="muted">
+                  This store syncs with nothing, so a realm is a set of accounts and nobody else
+                  can be let into it. `resources sync init --sequencer URL` is what changes that.
+                </div>
+              )}
             </div>
           </div>
         </div>

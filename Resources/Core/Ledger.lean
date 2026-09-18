@@ -70,6 +70,19 @@ can read a balance.
 def Party.selfId : PartyId := ⟨"0000000000000000000000SELF"⟩
 
 /--
+The realm your own accounts live in.
+
+A realm is a set of accounts with one viewer set and one key. There is exactly
+one to begin with — yours — and it is a constant for the same reason the self
+party is: every account is in a realm, and nothing should have to bootstrap
+which one before it can read a balance.
+-/
+def Realm.selfId : RealmId := ⟨"0000000000000000000000SELF"⟩
+
+/-- The one identity a single-user ledger has: you. -/
+def Member.selfId : MemberId := ⟨"self"⟩
+
+/--
 An account. Names are dot-separated paths — `Assets.Bank.DKB.Giro`,
 `Expenses.Travel.Trains`, `Budget.Rent` — and the hierarchy is what subtree
 balances are computed over. Only some accounts correspond to a real bank
@@ -98,6 +111,27 @@ structure Account where
   note : Option String := none
   /-- Closed accounts are hidden by default and reject new postings. -/
   closedOn : Option Date := none
+  /-- Which realm this account belongs to: the set of accounts sharing one key. -/
+  realm : RealmId := Realm.selfId
+  /--
+  The purse of a member inside this realm, when this account is one.
+
+  A bridge is how a member holds a balance in somebody else's realm, and it is
+  the one account they may always post to, because it is theirs.
+  -/
+  bridgeOf : Option MemberId := none
+  /-- Members who may post here besides the realm's admins and this account's member. -/
+  posters : List MemberId := []
+  /--
+  The bridge account, in a realm you share with somebody, that this one mirrors.
+
+  A member's balance inside another realm lives on a bridge there; the same
+  balance, seen from their own books, lives on an account in their own realm.
+  Set on the private account and pointing at the bridge, this is the only thing
+  that says the two are the same money, which is what any statement about the
+  pair moving by equal and opposite amounts has to be said in terms of.
+  -/
+  mirrorOf : Option AccountId := none
   deriving Repr, Inhabited, ToJson, FromJson
 
 namespace Account
@@ -145,6 +179,17 @@ structure Party where
   importer produced. Only contacts are offered when there is a person to choose.
   -/
   kind : String := "merchant"
+  /--
+  Which realm this person is recorded in: the one whose admins decide about
+  them, and the one a part has to name to say anything about them.
+
+  A party used to be a fact about the whole ledger, so an admin of any realm a
+  reader could open could rewrite any person in it — your own record included.
+  The party a member's spending lands on is written in the realm they were first
+  introduced in, and they may revise it from any realm they are in, which is the
+  one exception and is `putParty`'s rule rather than this field's.
+  -/
+  realm : RealmId := Realm.selfId
   deriving Repr, Inhabited, ToJson, FromJson
 
 /-- A free-form tag on a transaction. -/
@@ -152,6 +197,8 @@ structure Label where
   id : LabelId
   name : String
   colour : Option String := none
+  /-- Which realm this label belongs to: shared vocabulary is a realm's, not a ledger's. -/
+  realm : RealmId := Realm.selfId
   deriving Repr, Inhabited, ToJson, FromJson
 
 /-! ## Postings and transactions -/

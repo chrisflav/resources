@@ -1,11 +1,18 @@
-import Resources.Store.Db
+import Resources.Store.Commit
 
 /-!
 # Repository
 
-Every read and write of ledger data goes through here. Transactions are only
-ever written through `Txns.put`, which takes a `{ t // t.Balanced }` — so no
-code path in the system can persist a transaction that does not balance.
+Every read and write of ledger data goes through here. Reads are SQL, because
+the tables are indexed and a query is the right tool for a question. Writes are
+not: every one of them composes the operations it means and hands them to
+`Ctx.commit`, which applies them to the state and projects what came back.
+
+Two things follow, and they are the reason the writes look the way they do.
+Nothing in this file writes a ledger table — `Store/Project.lean` does, from a
+change it was given. And the rules an operation enforces are enforced once, in
+`Core/Apply.lean`, so `Txns.put` still cannot persist an unbalanced transaction
+and no longer has to know why.
 -/
 
 open Lean SQLite
@@ -23,6 +30,7 @@ private structure AccountRow where
   iban : Option String
   note : Option String
   closedOn : Option String
+  realmId : Option String
   deriving Row
 
 private structure PartyRow where
@@ -32,12 +40,14 @@ private structure PartyRow where
   email : Option String
   note : Option String
   kind : String
+  realmId : String
   deriving Row
 
 private structure LabelRow where
   id : String
   name : String
   colour : Option String
+  realmId : String
   deriving Row
 
 private structure TxnRow where
@@ -88,10 +98,11 @@ private def ofRow (r : AccountRow) : Account :=
     commodity := r.commodity.map Commodity.ofCode
     iban := r.iban
     note := r.note
-    closedOn := r.closedOn.bind Date.ofIso? }
+    closedOn := r.closedOn.bind Date.ofIso?
+    realm := ⟨r.realmId.getD Realm.selfId.val⟩ }
 
 private def selectCols : String :=
-  "SELECT id, name, kind, owner_id, commodity, iban, note, closed_on FROM account"
+  "SELECT id, name, kind, owner_id, commodity, iban, note, closed_on, realm_id FROM account"
 
 /-- Every account, ordered by name. -/
 def list (ctx : Ctx) (includeClosed : Bool := true) : IO (Array Account) := do
@@ -99,9 +110,17 @@ def list (ctx : Ctx) (includeClosed : Bool := true) : IO (Array Account) := do
   let rs ← Db.rows AccountRow ctx.db (selectCols ++ whereClause ++ " ORDER BY name")
   return rs.map ofRow
 
-/-- Looks up an account by its exact dotted name. -/
-def byName? (ctx : Ctx) (name : String) : IO (Option Account) := do
-  let r ← Db.row? AccountRow ctx.db (selectCols ++ s!" WHERE name = {Db.lit name}")
+/--
+Looks up an account by its exact dotted name, inside one realm.
+
+A realm is a set of accounts one group of people may write, and a name is
+something any of them may take — so which account a name means is a question
+that only has an answer inside a realm.
+-/
+def byName? (ctx : Ctx) (name : String) (realm : RealmId := Realm.selfId) :
+    IO (Option Account) := do
+  let r ← Db.row? AccountRow ctx.db (selectCols ++
+    s!" WHERE name = {Db.lit name} AND realm_id = {Db.lit realm.val} ORDER BY id")
   return r.map ofRow
 
 /-- Looks up an account by id. -/
@@ -121,20 +140,18 @@ def kindOfName (name : String) : AccountKind :=
 
 /-- Inserts an account. -/
 def insert (ctx : Ctx) (a : Account) : IO Unit :=
-  Db.exec ctx.db
-    s!"INSERT INTO account (id, name, kind, owner_id, commodity, iban, note, closed_on)
-    VALUES ({Db.lit a.id.val}, {Db.lit a.name}, {Db.lit a.kind.toString},
-            {Db.lit a.owner.val},
-            {Db.litOpt (a.commodity.map (·.code))}, {Db.litOpt a.iban}, {Db.litOpt a.note},
-            {Db.litOpt (a.closedOn.map (·.toIso))})"
+  discard <| ctx.commit "system" [.putAccount a]
 
-/-- Updates the mutable fields of an account. -/
+/--
+Updates the mutable fields of an account.
+
+The owner is said twice on purpose. Putting an account keeps the owner it has —
+retagging somebody's account by mentioning its name in passing is exactly the
+confusion an owner exists to prevent — so an edit that really does hand it over
+has to say so out loud, which is the second operation.
+-/
 def update (ctx : Ctx) (a : Account) : IO Unit :=
-  Db.exec ctx.db s!"UPDATE account SET name = {Db.lit a.name}, kind = {Db.lit a.kind.toString},
-    owner_id = {Db.lit a.owner.val},
-    commodity = {Db.litOpt (a.commodity.map (·.code))}, iban = {Db.litOpt a.iban},
-    note = {Db.litOpt a.note}, closed_on = {Db.litOpt (a.closedOn.map (·.toIso))}
-    WHERE id = {Db.lit a.id.val}"
+  discard <| ctx.commit "system" [.putAccount a, .setAccountOwner a.id a.owner]
 
 /--
 Returns the account with this name, creating it (and its kind) if absent.
@@ -144,14 +161,14 @@ exists keeps the owner it has: retagging somebody's account by mentioning its
 name in passing is exactly the confusion an owner exists to prevent.
 -/
 def ensure (ctx : Ctx) (name : String) (kind : Option AccountKind := none)
-    (owner : Option PartyId := none) : IO Account := do
-  match ← byName? ctx name with
+    (owner : Option PartyId := none) (realm : RealmId := Realm.selfId) : IO Account := do
+  match ← byName? ctx name realm with
   | some a => return a
   | none =>
     let a : Account :=
       { id := ⟨← freshId⟩, name, kind := kind.getD (kindOfName name)
-        owner := owner.getD Party.selfId }
-    insert ctx a
+        owner := owner.getD Party.selfId, realm }
+    discard <| ctx.commit "system" [.putAccount a] (realm := realm)
     return a
 
 /-- The account name a person's own money lives in. -/
@@ -171,33 +188,26 @@ def purse (ctx : Ctx) (p : Party) : IO Account :=
 
 /-- Hands an account to somebody else, or takes it back. -/
 def setOwner (ctx : Ctx) (id : AccountId) (owner : PartyId) : IO Unit :=
-  Db.exec ctx.db
-    s!"UPDATE account SET owner_id = {Db.lit owner.val} WHERE id = {Db.lit id.val}"
+  discard <| ctx.commit "system" [.setAccountOwner id owner]
 
 /--
 Rebooks every posting from one account into another and removes the emptied
 account. Balance is untouched: each posting keeps its amount and only changes
 which account it lands in.
 -/
-def mergeInto (ctx : Ctx) (from_ into : AccountId) (_actor : String) : IO Nat := do
-  if from_ == into then throw <| IO.userError "an account cannot be merged into itself"
-  let moved ← Db.scalarInt ctx.db
-    s!"SELECT COUNT(DISTINCT txn_id) FROM posting_all WHERE account_id = {Db.lit from_.val}"
-  ctx.transaction do
-    Db.exec ctx.db s!"UPDATE posting_all SET account_id = {Db.lit into.val}
-                      WHERE account_id = {Db.lit from_.val}"
-    Db.exec ctx.db s!"DELETE FROM account WHERE id = {Db.lit from_.val}"
-    Db.exec ctx.db s!"UPDATE rule SET set_account = {Db.lit into.val}
-                      WHERE set_account = {Db.lit from_.val}"
-  return moved.toNat
+def mergeInto (ctx : Ctx) (from_ into : AccountId) (actor : String) : IO Nat := do
+  -- Counted before the commit, because afterwards there is no account to count
+  -- the postings of. A rule that filed things into the emptied account is
+  -- repointed by the operation itself, and arrives here as a change like any
+  -- other.
+  let before ← ctx.state.get
+  let moved := (before.txnsSorted.filter (fun t => t.postings.any (·.account == from_))).length
+  discard <| ctx.commit actor [.mergeAccounts from_ into] (kind := "move")
+  return moved
 
 /-- Deletes an account. Fails if postings still reference it. -/
-def delete (ctx : Ctx) (id : AccountId) : IO Unit := do
-  let n ← Db.scalarInt ctx.db
-    s!"SELECT COUNT(*) FROM posting_all WHERE account_id = {Db.lit id.val}"
-  if n > 0 then
-    throw <| IO.userError s!"account still has {n} postings; move them first"
-  Db.exec ctx.db s!"DELETE FROM account WHERE id = {Db.lit id.val}"
+def delete (ctx : Ctx) (id : AccountId) : IO Unit :=
+  discard <| ctx.commit "system" [.deleteAccount id]
 
 end Accounts
 
@@ -205,31 +215,43 @@ end Accounts
 
 namespace Labels
 
-private def ofRow (r : LabelRow) : Label := { id := ⟨r.id⟩, name := r.name, colour := r.colour }
+private def ofRow (r : LabelRow) : Label :=
+  { id := ⟨r.id⟩, name := r.name, colour := r.colour, realm := ⟨r.realmId⟩ }
 
 /-- Every label. -/
 def list (ctx : Ctx) : IO (Array Label) := do
-  let rs ← Db.rows LabelRow ctx.db "SELECT id, name, colour FROM label ORDER BY name"
+  let rs ← Db.rows LabelRow ctx.db "SELECT id, name, colour, realm_id FROM label ORDER BY name"
   return rs.map ofRow
 
-/-- Looks up a label by name. -/
-def byName? (ctx : Ctx) (name : String) : IO (Option Label) := do
-  let r ← Db.row? LabelRow ctx.db s!"SELECT id, name, colour FROM label WHERE name = {Db.lit name}"
+/--
+Looks up a label by name inside one realm.
+
+A name is shared vocabulary and a realm is who shares it. Two realms may both
+have a label called `groceries` and they are not the same label — `deleteLabel`
+strips one from the transactions of its own realm, and a lookup that crossed
+realms would find the other realm's and hand it to a part that may not name it.
+-/
+def byName? (ctx : Ctx) (name : String) (realm : RealmId := Realm.selfId) :
+    IO (Option Label) := do
+  let r ← Db.row? LabelRow ctx.db
+    s!"SELECT id, name, colour, realm_id FROM label
+       WHERE name = {Db.lit name} AND realm_id = {Db.lit realm.val} ORDER BY id"
   return r.map ofRow
 
-/-- Returns the label with this name, creating it if absent. -/
-def ensure (ctx : Ctx) (name : String) : IO Label := do
-  match ← byName? ctx name with
+/-- Returns the label of this name in this realm, creating it there if absent. -/
+def ensure (ctx : Ctx) (name : String) (realm : RealmId := Realm.selfId) : IO Label := do
+  match ← byName? ctx name realm with
   | some l => return l
   | none =>
-    let l : Label := { id := ⟨← freshId⟩, name }
-    Db.exec ctx.db
-      s!"INSERT INTO label (id, name, colour) VALUES ({Db.lit l.id.val}, {Db.lit name}, NULL)"
+    let l : Label := { id := ⟨← freshId⟩, name, realm }
+    discard <| ctx.commit "system" [.putLabel l] (realm := realm)
     return l
 
-/-- Deletes a label and its assignments. -/
-def delete (ctx : Ctx) (id : LabelId) : IO Unit :=
-  Db.exec ctx.db s!"DELETE FROM label WHERE id = {Db.lit id.val}"
+/-- Deletes a label, and strips it from every transaction of its realm carrying it. -/
+def delete (ctx : Ctx) (id : LabelId) : IO Unit := do
+  let st ← ctx.state.get
+  let realm := ((st.label? id).map (·.realm)).getD Realm.selfId
+  discard <| ctx.commit "system" [.deleteLabel id] (kind := "categorise") (realm := realm)
 
 end Labels
 
@@ -237,24 +259,27 @@ namespace Parties
 
 private def ofRow (r : PartyRow) : Party :=
   { id := ⟨r.id⟩, name := r.name, iban := r.iban, email := r.email, note := r.note
-    kind := r.kind }
+    kind := r.kind, realm := ⟨r.realmId⟩ }
 
 /-- Every party. -/
 def list (ctx : Ctx) : IO (Array Party) := do
   let rs ← Db.rows PartyRow ctx.db
-    "SELECT id, name, iban, email, note, kind FROM party ORDER BY name"
+    "SELECT id, name, iban, email, note, kind, realm_id FROM party ORDER BY name"
   return rs.map ofRow
 
-/-- Looks up a party by name. -/
-def byName? (ctx : Ctx) (name : String) : IO (Option Party) := do
+/-- Looks up a party by name inside one realm: two realms may know two Annas. -/
+def byName? (ctx : Ctx) (name : String) (realm : RealmId := Realm.selfId) :
+    IO (Option Party) := do
   let r ← Db.row? PartyRow ctx.db
-    s!"SELECT id, name, iban, email, note, kind FROM party WHERE name = {Db.lit name}"
+    s!"SELECT id, name, iban, email, note, kind, realm_id FROM party
+       WHERE name = {Db.lit name} AND realm_id = {Db.lit realm.val} ORDER BY id"
   return r.map ofRow
 
 /-- Looks up a party by id. -/
 def byId? (ctx : Ctx) (id : PartyId) : IO (Option Party) := do
   let r ← Db.row? PartyRow ctx.db
-    s!"SELECT id, name, iban, email, note, kind FROM party WHERE id = {Db.lit id.val}"
+    s!"SELECT id, name, iban, email, note, kind, realm_id FROM party
+       WHERE id = {Db.lit id.val}"
   return r.map ofRow
 
 /--
@@ -264,14 +289,13 @@ New parties default to `merchant`, because the overwhelming caller is an
 importer turning a payee string into a party. Anything you create on purpose
 should say `contact`.
 -/
-def ensure (ctx : Ctx) (name : String) (kind : String := "merchant") : IO Party := do
-  match ← byName? ctx name with
+def ensure (ctx : Ctx) (name : String) (kind : String := "merchant")
+    (realm : RealmId := Realm.selfId) : IO Party := do
+  match ← byName? ctx name realm with
   | some p => return p
   | none =>
-    let p : Party := { id := ⟨← freshId⟩, name, kind }
-    Db.exec ctx.db s!"INSERT INTO party (id, name, iban, email, note, kind)
-                      VALUES ({Db.lit p.id.val}, {Db.lit name}, NULL, NULL, NULL,
-                              {Db.lit kind})"
+    let p : Party := { id := ⟨← freshId⟩, name, kind, realm }
+    discard <| ctx.commit "system" [.putParty p] (realm := realm)
     return p
 
 /--
@@ -286,22 +310,19 @@ def self (ctx : Ctx) : IO Party := do
   | some p => return p
   | none =>
     let p : Party := { id := Party.selfId, name := "me", kind := "self" }
-    Db.exec ctx.db s!"INSERT INTO party (id, name, iban, email, note, kind)
-                      VALUES ({Db.lit p.id.val}, {Db.lit p.name}, NULL, NULL, NULL, 'self')"
+    discard <| ctx.commit "system" [.putParty p]
     return p
 
 /-- Updates a party. -/
 def update (ctx : Ctx) (p : Party) : IO Unit :=
-  Db.exec ctx.db s!"UPDATE party SET name = {Db.lit p.name}, iban = {Db.litOpt p.iban},
-    email = {Db.litOpt p.email}, note = {Db.litOpt p.note}, kind = {Db.lit p.kind}
-    WHERE id = {Db.lit p.id.val}"
+  discard <| ctx.commit "system" [.putParty p]
 
 /--
 The person of this name, as somebody you deal with on purpose.
 
 `ensure` defaults to `merchant` because its overwhelming caller is an importer
 turning a payee string into a party. Anybody who can own an account, be sent a
-share link, or owe you money is a contact, and saying so here keeps them out of
+realm invite, or owe you money is a contact, and saying so here keeps them out of
 the thousand names a bank export produces.
 -/
 def contact (ctx : Ctx) (name : String) : IO Party := do
@@ -322,46 +343,40 @@ clever; it exists so that splitting a weekend's worth of receipts is one command
 per weekend rather than one per receipt.
 -/
 
-/-- A named set of people to split costs with. -/
-structure PartyGroup where
-  name : String
-  members : List String
-  deriving Repr, Inhabited
-
 private structure GroupRow where
   name : String
   members : String
+  realmId : String
   deriving Row
 
 namespace Groups
 
 private def ofRow (r : GroupRow) : PartyGroup :=
-  { name := r.name, members := (r.members.splitOn ",").filter (fun m => !m.isEmpty) }
+  { name := r.name, members := (r.members.splitOn ",").filter (fun m => !m.isEmpty)
+    realm := ⟨r.realmId⟩ }
 
 /-- Every saved group. -/
 def list (ctx : Ctx) : IO (Array PartyGroup) := do
   return (← Db.rows GroupRow ctx.db
-    "SELECT name, members FROM party_group ORDER BY name").map ofRow
+    "SELECT name, members, realm_id FROM party_group ORDER BY name").map ofRow
 
 /-- Looks a group up by name. -/
 def byName? (ctx : Ctx) (name : String) : IO (Option PartyGroup) := do
   return (← Db.row? GroupRow ctx.db
-    s!"SELECT name, members FROM party_group WHERE name = {Db.lit name}").map ofRow
+    s!"SELECT name, members, realm_id FROM party_group WHERE name = {Db.lit name}").map ofRow
 
 /-- Saves a group, replacing any existing one of that name. -/
 def save (ctx : Ctx) (name : String) (members : List String) : IO PartyGroup := do
   if members.isEmpty then throw <| IO.userError "a group needs at least one member"
-  let now ← nowStamp
   for m in members do
     discard <| Parties.ensure ctx m
-  Db.exec ctx.db s!"INSERT INTO party_group (name, members, created_at)
-    VALUES ({Db.lit name}, {Db.lit (String.intercalate "," members)}, {Db.lit now})
-    ON CONFLICT(name) DO UPDATE SET members = excluded.members"
-  return { name, members }
+  let g : PartyGroup := { name, members }
+  discard <| ctx.commit "system" [.putGroup g]
+  return g
 
 /-- Deletes a group. The people and what they owe are untouched. -/
 def delete (ctx : Ctx) (name : String) : IO Unit :=
-  Db.exec ctx.db s!"DELETE FROM party_group WHERE name = {Db.lit name}"
+  discard <| ctx.commit "system" [.deleteGroup name]
 
 end Groups
 
@@ -381,9 +396,9 @@ private def hydrate (ctx : Ctx) (heads : Array TxnRow) : IO (Array Transaction) 
     s!"SELECT txn_id, account_id, minor, commodity, party_id, note, origin, tag FROM posting_all
        WHERE txn_id IN {inList ids} ORDER BY txn_id, idx"
   let labels ← Db.rows PairRow ctx.db
-    s!"SELECT txn_id, label_id FROM txn_label WHERE txn_id IN {inList ids}"
+    s!"SELECT txn_id, label_id FROM txn_label WHERE txn_id IN {inList ids} ORDER BY txn_id, idx"
   let attachments ← Db.rows PairRow ctx.db
-    s!"SELECT txn_id, sha256 FROM txn_attachment WHERE txn_id IN {inList ids}"
+    s!"SELECT txn_id, sha256 FROM txn_attachment WHERE txn_id IN {inList ids} ORDER BY txn_id, idx"
   return heads.map fun h =>
     { id := ⟨h.id⟩
       date := (Date.ofIso? h.date).getD default
@@ -435,65 +450,21 @@ def list (ctx : Ctx) (f : Filter) (s : Filter.SortSpec := {}) (limit : Nat := 10
 def count (ctx : Ctx) (f : Filter) (state : Option TxnState := some .posted) : IO Int :=
   Db.scalarInt ctx.db s!"SELECT COUNT(*) FROM txn t WHERE {stateCond state}{f.toSql}"
 
-/-- Appends an audit record for a transaction. -/
-def recordRevision (ctx : Ctx) (id : TxId) (actor kind : String) (patch : Json) : IO Unit := do
-  let seq ← Db.scalarInt ctx.db
-    s!"SELECT IFNULL(MAX(seq), 0) + 1 FROM revision WHERE txn_id = {Db.lit id.val}"
-  let stamp ← nowStamp
-  Db.exec ctx.db s!"INSERT INTO revision (txn_id, seq, at, actor, kind, patch)
-    VALUES ({Db.lit id.val}, {seq}, {Db.lit stamp}, {Db.lit actor}, {Db.lit kind},
-            {Db.lit patch.compress})"
-
-private def writeRows (ctx : Ctx) (t : Transaction) : IO Unit := do
-  let now ← nowStamp
-  Db.exec ctx.db
-    s!"INSERT INTO txn (id, date, payee, narration, state, source, created_at, updated_at)
-    VALUES ({Db.lit t.id.val}, {Db.lit t.date.toIso}, {Db.litOpt t.payee},
-            {Db.lit t.narration}, {Db.lit t.state.toString}, {Db.lit t.source.encode},
-            {Db.lit now}, {Db.lit now})
-    ON CONFLICT(id) DO UPDATE SET date = excluded.date, payee = excluded.payee,
-      narration = excluded.narration, state = excluded.state, source = excluded.source,
-      updated_at = excluded.updated_at"
-  Db.exec ctx.db s!"DELETE FROM posting_all WHERE txn_id = {Db.lit t.id.val}"
-  Db.exec ctx.db s!"DELETE FROM txn_label WHERE txn_id = {Db.lit t.id.val}"
-  Db.exec ctx.db s!"DELETE FROM txn_attachment WHERE txn_id = {Db.lit t.id.val}"
-  for (p, i) in t.postings.zipIdx do
-    Db.exec ctx.db s!"INSERT INTO posting_all
-      (txn_id, idx, account_id, minor, commodity, party_id, note, origin, tag)
-      VALUES ({Db.lit t.id.val}, {i}, {Db.lit p.account.val}, {p.amount.minor},
-              {Db.lit p.amount.commodity.code}, {Db.litOpt (p.party.map (·.val))},
-              {Db.litOpt p.note}, {Db.litOpt p.origin}, {Db.litOpt p.tag})"
-  for l in t.labels do
-    Db.exec ctx.db s!"INSERT OR IGNORE INTO txn_label (txn_id, label_id)
-                      VALUES ({Db.lit t.id.val}, {Db.lit l.val})"
-  for a in t.attachments do
-    Db.exec ctx.db s!"INSERT OR IGNORE INTO txn_attachment (txn_id, sha256)
-                      VALUES ({Db.lit t.id.val}, {Db.lit a})"
-
 /--
 Writes a transaction, inserting or replacing, and records a revision.
 
 The `Balanced` proof carried by the argument is the reason no unbalanced
-transaction can reach the database.
+transaction can reach the database, and it is checked a second time by the
+operation this becomes: the proof travels with the value, the check travels with
+the write, and neither is trusted on the other's behalf.
 -/
 def put (ctx : Ctx) (t : { t : Transaction // t.Balanced }) (actor : String)
     (kind : String := "write") : IO Unit :=
-  ctx.transaction do
-    writeRows ctx t.val
-    recordRevision ctx t.val.id actor kind (toJson t.val)
+  discard <| ctx.commit actor [.putTransaction t.val] (kind := kind)
 
 /-- Deletes a transaction, leaving its revision history behind. -/
 def delete (ctx : Ctx) (id : TxId) (actor : String) : IO Unit :=
-  ctx.transaction do
-    match ← get? ctx id with
-    | none => throw <| IO.userError s!"no such transaction: {id.val}"
-    | some t =>
-      recordRevision ctx id actor "delete" (toJson t)
-      Db.exec ctx.db s!"DELETE FROM txn WHERE id = {Db.lit id.val}"
-      -- Otherwise the staged rows stay marked promoted, pointing at nothing,
-      -- and the entry can never be brought back without re-importing.
-      Db.exec ctx.db s!"UPDATE staged_entry SET state = 'new', txn_id = NULL
-                        WHERE txn_id = {Db.lit id.val}"
+  discard <| ctx.commit actor [.deleteTransaction id] (kind := "delete")
 
 /-!
 ### Claiming
@@ -577,36 +548,16 @@ for other people.
 def split (ctx : Ctx) (id : TxId) (among : List String) (keepShare : Bool)
     (actor : String) : IO Transaction := do
   if among.isEmpty then throw <| IO.userError "say who to split this with"
-  let some t ← get? ctx id | throw <| IO.userError s!"no such transaction: {id.val}"
-  let accounts ← Accounts.list ctx
-  let funding := (accounts.filter Account.holdsMoney).map (·.id)
+  -- The purses first: the operation divides between accounts, and it has no way
+  -- to create one for somebody it has never heard of.
   let mut targets : List AccountId := []
   for who in among do
     let person ← Parties.contact ctx who
     targets := targets ++ [(← Accounts.purse ctx person).id]
-  let shareCount := among.length + (if keepShare then 1 else 0)
-  let mut postings : List Posting := []
-  for p in t.postings do
-    if funding.contains p.account then
-      postings := postings ++ [p]
-    else
-      let parts := splitParts p.amount.minor shareCount
-      -- Your share, if you are keeping one, stays where the posting already was.
-      let mine := if keepShare then parts.take 1 else []
-      let theirs := if keepShare then parts.drop 1 else parts
-      for m in mine do
-        if m != 0 then
-          postings := postings ++ [{ p with amount := ⟨p.amount.commodity, m⟩ }]
-      for (share, target) in theirs.zip targets do
-        if share != 0 then
-          postings := postings ++
-            [{ p with account := target, amount := ⟨p.amount.commodity, share⟩ }]
-  let divided := { t with postings }
-  match divided.validate with
-  | .error e => throw <| IO.userError s!"splitting would not balance: {e}"
-  | .ok bt =>
-    put ctx bt actor "split"
-    return bt.val
+  let changes ← ctx.commit actor [.splitTransaction id targets keepShare] (kind := "split")
+  match (Change.written changes)[0]? with
+  | some divided => return divided
+  | none => throw <| IO.userError s!"no such transaction: {id.val}"
 
 /-- Splits several transactions the same way, and reports what each became. -/
 def splitAll (ctx : Ctx) (ids : Array TxId) (among : List String) (keepShare : Bool)
@@ -633,78 +584,40 @@ def merge (ctx : Ctx) (ids : Array TxId) (actor : String) (payee : Option String
     (narration : Option String := none) (cancelIn : List String := []) : IO Transaction := do
   if ids.size < 2 then
     throw <| IO.userError "merging needs at least two transactions"
-  let mut sources : Array Transaction := #[]
-  for id in ids do
-    match ← get? ctx id with
-    | some t => sources := sources.push t
-    | none => throw <| IO.userError s!"no such transaction: {id.val}"
-  -- A source's own postings may already carry origins from an earlier import;
-  -- anything unstamped is attributed to the transaction it came from.
-  let stamped := sources.map fun t => t.withOrigin t.id.val
-  let head := stamped[0]!
-  let merged := head.mergeAll (stamped.toList.drop 1)
-  -- The "principal" source is the one carrying the largest movement; its payee
-  -- and narration describe the combined event best.
-  let weight (t : Transaction) : Int :=
-    t.postings.foldl (fun acc p =>
-      let m := p.amount.minor
-      acc + (if m < 0 then -m else m)) 0
-  let principal := sources.foldl (fun best t => if weight t > weight best then t else best) head
   let newId ← freshId
-  let mut result : Transaction :=
-    { merged with
-      id := ⟨newId⟩
-      date := sources.foldl (fun d t => if Date.lt t.date d then t.date else d) head.date
-      payee := payee <|> principal.payee
-      -- The narration of the largest leg, not every source's concatenated: a
-      -- fee line repeats its parent's text, so joining them is pure noise.
-      narration := narration.getD principal.narration }
+  let mut cancel : List AccountId := []
   for name in cancelIn do
     match ← Accounts.byName? ctx name with
-    | some acc => result := result.dropAccount acc.id
+    | some acc => cancel := cancel ++ [acc.id]
     | none => pure ()
-  match result.validate with
-  | .error e => throw <| IO.userError s!"merge would not balance: {e}"
-  | .ok bt =>
-    ctx.transaction do
-      writeRows ctx bt.val
-      recordRevision ctx bt.val.id actor "merge" (toJson bt.val)
-      for t in sources do
-        recordRevision ctx t.id actor "merged-away" (toJson t)
-        Db.exec ctx.db s!"DELETE FROM txn WHERE id = {Db.lit t.id.val}"
-        -- Staged rows keep pointing at whatever they became.
-        Db.exec ctx.db s!"UPDATE staged_entry SET txn_id = {Db.lit newId}
-                          WHERE txn_id = {Db.lit t.id.val}"
-    return bt.val
+  -- Read before the commit: retiring a transaction resets the staged rows that
+  -- point at it, and they have to be pointed at what it became instead.
+  let staged ← Db.rows String ctx.db
+    s!"SELECT id FROM staged_entry WHERE txn_id IN {inList (ids.map (·.val))}"
+  let changes ← ctx.commit actor
+    [.mergeTransactions ids.toList ⟨newId⟩ payee narration cancel]
+    (kinds := fun t => if t.val == newId then some "merge" else some "merged-away")
+  Db.exec ctx.db s!"UPDATE staged_entry SET state = 'promoted', txn_id = {Db.lit newId}
+                    WHERE id IN {inList staged}"
+  match (Change.written changes)[0]? with
+  | some merged => return merged
+  | none => throw <| IO.userError "merging needs at least two transactions"
 
 /-- Splits a merged transaction back into one transaction per origin. -/
 def unmerge (ctx : Ctx) (id : TxId) (actor : String) : IO (Array Transaction) := do
   let some t ← get? ctx id | throw <| IO.userError s!"no such transaction: {id.val}"
-  let origins := t.origins
-  if origins.length < 2 then
-    throw <| IO.userError "this transaction came from a single entry; there is nothing to unmerge"
-  let unstamped := t.postings.filter (fun p => p.origin.isNone)
-  if !unstamped.isEmpty then
-    throw <| IO.userError "some postings have no origin; unmerging would lose them"
   let mut ids : List TxId := []
-  for _ in origins do
+  for _ in t.origins do
     ids := ids ++ [⟨← freshId⟩]
-  let parts := t.unmerge ids
-  let mut checked : Array { t : Transaction // t.Balanced } := #[]
-  for part in parts do
-    match part.validate with
-    | .error e => throw <| IO.userError s!"unmerging would leave an unbalanced part: {e}"
-    | .ok bt => checked := checked.push bt
-  ctx.transaction do
-    for bt in checked do
-      writeRows ctx bt.val
-      recordRevision ctx bt.val.id actor "unmerge" (toJson bt.val)
-    recordRevision ctx id actor "unmerged-away" (toJson t)
-    Db.exec ctx.db s!"DELETE FROM txn WHERE id = {Db.lit id.val}"
-    for (origin, part) in origins.zip parts do
-      Db.exec ctx.db s!"UPDATE staged_entry SET txn_id = {Db.lit part.id.val}
-                        WHERE fingerprint = {Db.lit origin}"
-  return checked.map (·.val)
+  let changes ← ctx.commit actor [.unmergeTransaction id ids]
+    (kinds := fun x => if x == id then some "unmerged-away" else some "unmerge")
+  let parts := Change.written changes
+  -- Each part takes back the bank line it came from, so the statement stays
+  -- promoted rather than reverting to unimported.
+  for (origin, part) in t.origins.zip parts.toList do
+    Db.exec ctx.db s!"UPDATE staged_entry SET state = 'promoted', txn_id = {Db.lit part.id.val}
+                      WHERE fingerprint = {Db.lit origin}"
+  return parts
 
 /--
 Replaces one transaction with the parts it was divided into.
@@ -721,36 +634,17 @@ line stays promoted rather than reverting to unimported.
 -/
 def replaceWith (ctx : Ctx) (id : TxId) (parts : List Transaction) (actor : String)
     (kind : String := "split") : IO (Array Transaction) := do
-  let some t ← get? ctx id | throw <| IO.userError s!"no such transaction: {id.val}"
-  let some first := parts.head?
-    | throw <| IO.userError "a division has to leave something behind"
-  let mut checked : Array { t : Transaction // t.Balanced } := #[]
-  for part in parts do
-    -- A part carrying the original's id would be written and then deleted again
-    -- by the retirement below, taking its money out of the ledger silently.
-    if part.id == id then
-      throw <| IO.userError "a part cannot reuse the id of the transaction being divided"
-    match part.validate with
-    | .error e => throw <| IO.userError s!"a part does not balance: {e}"
-    | .ok bt => checked := checked.push bt
-  let codes := (t.commodityCodes ++ parts.flatMap (·.commodityCodes)).eraseDups
-  let accounts := ((t.postings ++ parts.flatMap (·.postings)).map (·.account)).eraseDups
-  for c in codes do
-    for a in accounts do
-      let before := t.netIn a c
-      let after := (parts.map (fun p => p.netIn a c)).sum
-      if (before < 0 || after < 0) && before != after then
-        throw <| IO.userError
-          s!"the parts do not take the same money out of {a.val} as the original did"
-  ctx.transaction do
-    for bt in checked do
-      writeRows ctx bt.val
-      recordRevision ctx bt.val.id actor kind (toJson bt.val)
-    recordRevision ctx id actor s!"{kind}-away" (toJson t)
-    Db.exec ctx.db s!"DELETE FROM txn WHERE id = {Db.lit id.val}"
-    Db.exec ctx.db s!"UPDATE staged_entry SET txn_id = {Db.lit first.id.val}
-                      WHERE txn_id = {Db.lit id.val}"
-  return checked.map (·.val)
+  let staged ← Db.rows String ctx.db
+    s!"SELECT id FROM staged_entry WHERE txn_id = {Db.lit id.val}"
+  let changes ← ctx.commit actor [.replaceTransaction id parts kind] (kind := kind)
+    (kinds := fun x => if x == id then some s!"{kind}-away" else none)
+  let written := Change.written changes
+  match written[0]? with
+  | some first =>
+    Db.exec ctx.db s!"UPDATE staged_entry SET state = 'promoted', txn_id = {Db.lit first.id.val}
+                      WHERE id IN {inList staged}"
+  | none => pure ()
+  return written
 
 /-- One entry of a transaction's audit trail. -/
 structure Revision where

@@ -606,7 +606,7 @@ def budgetCloseCmd := `[Cli|
   close VIA runBudgetClose;
   "Closes a budget: divides everything still waiting among its participants and \
    raises what that leaves people owing. Nobody can add to a closed budget, \
-   including whoever holds a share link. Reopening and closing again writes a \
+   including everybody else in its realm. Reopening and closing again writes a \
    *new* division covering only what came in since — the earlier one stands, \
    because somebody was told what they owed on the strength of it."
 
@@ -882,15 +882,12 @@ def reportCmd := `[Cli|
 
 def tokenCreateCmd := `[Cli|
   create VIA runTokenCreate;
-  "Mints an API token. The secret is printed once and never stored. With \
-   --budget and --for it mints a share link instead: one person, one budget, \
-   and a route table of its own, so the accounts it can reach are a property \
-   of the token rather than a rule somebody has to remember."
+  "Mints an API token. The secret is printed once and never stored. A token is \
+   a credential of your own; letting somebody else in is 'resources realm \
+   invite', which hands them a key rather than a narrower version of yours."
 
   FLAGS:
     s, scopes : String; "Comma-separated: read, write, import, admin."
-    budget : String;    "Make this a share link for one budget."
-    "for" : String;     "Who the share link is for."
     expires : String;   "ISO date after which it stops working."
 
   ARGS:
@@ -925,6 +922,241 @@ def serveCmd := `[Cli|
     p, port : String; "Port (default 8087)."
     h, host : String; "Bind address (default 127.0.0.1; anything else needs a TLS proxy)."
     w, web : String;  "Directory of built web-client assets to serve at /."
+    "cors" : String;  "One origin allowed to call this API from a browser, for running a dev \
+                       server beside it. Off by default, and never '*'."
+    "insecure-dev";        "Accept RESOURCES_INSECURE_CRYPTO=1, whose suite signs with a \
+                            hash of its own public key and encrypts nothing. Both are \
+                            required: the variable is inherited, this is not."
+]
+
+def sequencerCmd := `[Cli|
+  sequencer VIA runSequencer;
+  "Runs the sequencer: the encrypted, append-only order that clients sync through. \
+   It stores ciphertext and nothing else, so it never sees a ledger. With --web it \
+   serves the thin client from the same origin, so an invite link is one URL."
+
+  FLAGS:
+    p, port : String;      "Port (default 8088)."
+    h, host : String;      "Bind address (default 127.0.0.1; anything else needs a TLS proxy)."
+    d, data : String;      "Directory holding sequencer.db (default $RESOURCES_DIR)."
+    w, web : String;       "Directory of built thin-client assets to serve at /."
+    o, origin : String;    "The URL clients reach this sequencer at; it is bound into every \
+                            authentication challenge (default http://<host>:<port>)."
+    "creator" : String;    "Comma-separated member ids allowed to create a ledger, added to \
+                            $RESOURCES_SEQ_CREATORS. With neither, nobody may."
+    "blob-quota" : String; "How many bytes of receipts one ledger may hold, plainly or with \
+                            a unit: 268435456, 256MiB, 512K (default 256MiB). Nothing \
+                            collects blobs, so this is what makes a full ledger a sentence \
+                            somebody is told."
+]
+
+def identityInitCmd := `[Cli|
+  init VIA runIdentityInit;
+  "Gives this node a key pair and makes it a member of the ledger. The member id \
+   is the hex of the signing key, and the secret keys are encrypted under a \
+   passphrase in identity.json beside the database."
+
+  FLAGS:
+    n, name : String;      "What to call this member in the ledger (default 'me')."
+    "insecure-dev";        "Accept RESOURCES_INSECURE_CRYPTO=1, whose suite signs with a \
+                            hash of its own public key and encrypts nothing. Both are \
+                            required: the variable is inherited, this is not."
+]
+
+def identityShowCmd := `[Cli|
+  "show" VIA runIdentityShow;
+  "Prints this node's public keys and what the ledger knows about them. Asks for \
+   no passphrase: nothing it prints is secret."
+]
+
+def identityCmd := `[Cli|
+  identity NOOP;
+  "The key pair this node signs and receives with."
+
+  SUBCOMMANDS:
+    identityInitCmd; identityShowCmd
+]
+
+def syncInitCmd := `[Cli|
+  init VIA runSyncInit;
+  "Puts this ledger on a sequencer: creates it there with this node as its admin, \
+   creates the realm its books live in, takes that realm's key, and writes \
+   sync.json. What is already here becomes the first entry of the shared order."
+
+  FLAGS:
+    s, sequencer : String; "Base URL of the sequencer, e.g. https://seq.example."
+    l, ledger : String;    "Name for the ledger on it (default 'home')."
+    "insecure-dev";        "Accept RESOURCES_INSECURE_CRYPTO=1, whose suite signs with a \
+                            hash of its own public key and encrypts nothing. Both are \
+                            required: the variable is inherited, this is not."
+]
+
+def syncStatusCmd := `[Cli|
+  status VIA runSyncStatus;
+  "Shows which sequencer this store syncs with and how far it has got."
+
+  FLAGS:
+    "insecure-dev";        "Accept RESOURCES_INSECURE_CRYPTO=1, whose suite signs with a \
+                            hash of its own public key and encrypts nothing. Both are \
+                            required: the variable is inherited, this is not."
+]
+
+def syncJoinCmd := `[Cli|
+  join VIA runSyncJoin;
+  "Spends an invite somebody sent: proves this node holds the link's secret, \
+   re-seals the realm key to this node's own agreement key, and becomes a \
+   member. What this store already held stays its own prehistory and is never \
+   offered to the ledger being joined."
+
+  FLAGS:
+    s, sequencer : String; "Base URL of the sequencer, when it is not the link's host."
+    "insecure-dev";        "Accept RESOURCES_INSECURE_CRYPTO=1, whose suite signs with a \
+                            hash of its own public key and encrypts nothing. Both are \
+                            required: the variable is inherited, this is not."
+
+  ARGS:
+    link : String; "The invite link, or just its fragment."
+]
+
+def syncCmd := `[Cli|
+  sync VIA runSync;
+  "Runs one round of sync: take in what the sequencer has, then offer what it \
+   has not. Does nothing in a store that has no sync.json."
+
+  FLAGS:
+    "insecure-dev";        "Accept RESOURCES_INSECURE_CRYPTO=1, whose suite signs with a \
+                            hash of its own public key and encrypts nothing. Both are \
+                            required: the variable is inherited, this is not."
+
+  SUBCOMMANDS:
+    syncInitCmd; syncStatusCmd; syncJoinCmd
+]
+
+def realmListCmd := `[Cli|
+  list VIA runRealmList;
+  "Lists the realms this ledger holds: who is in each, which generation of its \
+   key it is on, and whether this node still holds that key."
+]
+
+def realmCreateCmd := `[Cli|
+  create VIA runRealmCreate;
+  "Makes a realm: a set of accounts with one key and one set of members. With \
+   --budget it also opens a budget inside it, which is what makes the realm \
+   worth sharing — everybody let in can put what they paid for into it."
+
+  FLAGS:
+    b, budget : String; "Also open a budget of this name in the new realm."
+
+  ARGS:
+    name : String; "What to call the realm."
+]
+
+def realmInviteCmd := `[Cli|
+  invite VIA runRealmInvite;
+  "Offers a realm to somebody who is not a member yet, and prints the link that \
+   redeems it. The secret travels in the link's fragment, which a browser never \
+   sends to a server, and the offer is single-use and expires."
+
+  FLAGS:
+    r, role : String;  "viewer (the default) or admin."
+    expires : String;  "ISO date the offer lapses on; a fortnight from today by default."
+
+  ARGS:
+    realm : String; "The realm's id, as 'resources realm list' prints it."
+    who : String;   "Who the invite is for."
+]
+
+def realmMembersCmd := `[Cli|
+  members VIA runRealmMembers;
+  "Who is in a realm, and — when there is a sequencer to ask — which of them \
+   hold a key for it."
+
+  ARGS:
+    realm : String; "The realm's id."
+]
+
+def realmRevokeCmd := `[Cli|
+  revoke VIA runRealmRevoke;
+  "Puts a member out of a realm: takes their grant away, makes a new key, and \
+   hands it to everybody who is left. What they have already read they keep; \
+   everything written from now on is written under a key they do not hold."
+
+  FLAGS:
+    r, realm : String;     "The realm to re-key (default: this store's own)."
+    m, member : String;    "The member to put out, by id."
+]
+
+def realmRotateCmd := `[Cli|
+  rotate VIA runRealmRotate;
+  "Moves a realm onto a new key without putting anybody out: for a key that has \
+   been somewhere it should not have been, or simply for the calendar."
+
+  FLAGS:
+    r, realm : String;     "The realm to re-key (default: this store's own)."
+]
+
+def realmCmd := `[Cli|
+  realm NOOP;
+  "Realms: the unit of sharing. One key, one set of members."
+
+  SUBCOMMANDS:
+    realmListCmd; realmCreateCmd; realmInviteCmd; realmMembersCmd;
+    realmRevokeCmd; realmRotateCmd
+]
+
+def checkpointCmd := `[Cli|
+  checkpoint VIA runCheckpoint;
+  "Publishes a signed commitment to where each realm's state stands, with the \
+   state itself encrypted beside it, so that a newcomer can start from it \
+   instead of replaying the order. A round of sync does this too."
+
+  FLAGS:
+    r, realm : String;     "Only this realm, instead of every realm a key is held for."
+]
+
+def blobPushCmd := `[Cli|
+  push VIA runBlobPush;
+  "Stores a receipt, encrypts it under a key of its own and uploads the \
+   ciphertext to the sequencer, which can hold it without reading it."
+
+  ARGS:
+    file : String; "The file to store."
+]
+
+def blobGetCmd := `[Cli|
+  get VIA runBlobGet;
+  "Fetches a receipt the ledger knows about, decrypts it and caches it here."
+
+  FLAGS:
+    o, out : String;       "Write the bytes to this file."
+
+  ARGS:
+    sha : String; "The receipt's hash, as the ledger names it."
+]
+
+def blobCmd := `[Cli|
+  blob NOOP;
+  "Receipts as the sequencer holds them: encrypted, addressed by the hash of \
+   their ciphertext, fetched when they are first opened."
+
+  SUBCOMMANDS:
+    blobPushCmd; blobGetCmd
+]
+
+def nodeCmd := `[Cli|
+  node VIA runNode;
+  "Runs the HTTP API and, when there is a sequencer configured, a round of sync \
+   every thirty seconds."
+
+  FLAGS:
+    p, port : String;      "Port (default 8087)."
+    h, host : String;      "Bind address (default 127.0.0.1; anything else needs a TLS proxy)."
+    w, web : String;       "Directory of built web-client assets to serve at /."
+    "cors" : String;       "One origin allowed to call this API from a browser, for running a \
+                            dev server beside it. Off by default, and never '*'."
+    "insecure-dev";        "Accept RESOURCES_INSECURE_CRYPTO=1, whose suite signs with a \
+                            hash of its own public key and encrypts nothing. Both are \
+                            required: the variable is inherited, this is not."
 ]
 
 def moveCmd := `[Cli|
@@ -1015,12 +1247,30 @@ def migrateCmd := `[Cli|
   "Opens the store, applying any pending migrations."
 ]
 
+def rebuildCmd := `[Cli|
+  rebuild VIA runRebuild;
+  "Throws the projected tables away and computes them again from the event log."
+
+  FLAGS:
+    "from-checkpoint"; "Start from the stored snapshot and fold only the events after \
+                        it, instead of folding the whole log. The events it covers stay \
+                        where they are: nothing is archived and nothing is deleted."
+]
+
 def genTypesCmd := `[Cli|
   "gen-types" VIA runGenTypes;
   "Writes TypeScript types for the API, derived from the Lean wire encoders."
 
   FLAGS:
     o, out : String; "Write here instead of stdout (usually web/src/types.ts)."
+]
+
+def genVectorsCmd := `[Cli|
+  "gen-vectors" VIA runGenVectors;
+  "Writes the conformance vectors a port is checked against, from the core's own step."
+
+  FLAGS:
+    o, out : String; "Write here instead of conformance/."
 ]
 
 def apiCmd := `[Cli|
@@ -1049,8 +1299,10 @@ def resourcesCmd : Cmd := `[Cli|
     budgetCmd; claimsCmd; invoiceCmd; tripCmd; reportCmd; tokenCmd; moveCmd; splitCmd;
     groupCmd; contactsCmd;
     claimCmd; tagFeesCmd;
-    serveCmd; statusCmd; migrateCmd;
-    genTypesCmd; apiCmd
+    serveCmd; sequencerCmd; nodeCmd; identityCmd; syncCmd; realmCmd; checkpointCmd; blobCmd;
+    statusCmd; migrateCmd;
+    rebuildCmd;
+    genTypesCmd; genVectorsCmd; apiCmd
 ]
 
 def main (args : List String) : IO UInt32 := do

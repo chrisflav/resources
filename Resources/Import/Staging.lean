@@ -26,17 +26,6 @@ structure StagedEntry where
   txnId : Option TxId
   deriving Repr, ToJson, Inhabited
 
-/-- One run of an importer over one file. -/
-structure ImportBatch where
-  id : BatchId
-  profile : String
-  filename : Option String
-  account : Option AccountId
-  stamp : String
-  total : Nat
-  duplicates : Nat
-  deriving Repr, ToJson
-
 private structure StagedRow where
   id : String
   batchId : String
@@ -61,6 +50,7 @@ private structure BatchRow where
   stamp : String
   total : Int64
   duplicates : Int64
+  realmId : String
   deriving Row
 
 private structure RuleRow where
@@ -71,22 +61,10 @@ private structure RuleRow where
   addLabels : Option String
   setParty : Option String
   priority : Int64
+  realmId : String
   deriving Row
 
 /-! ## Rules -/
-
-/-- A categorisation rule: a filter plus what to do when it matches. -/
-structure Rule where
-  id : RuleId
-  name : String
-  /-- Source text of the filter, so it round-trips through the database. -/
-  filterSrc : String
-  filter : Filter
-  setAccount : Option String
-  addLabels : List String
-  setParty : Option String
-  priority : Int
-  deriving Repr
 
 namespace Rules
 
@@ -95,13 +73,13 @@ private def ofRow (r : RuleRow) : Rule :=
     filter := (Filter.parse r.filter).toOption.getD .all,
     setAccount := r.setAccount,
     addLabels := ((r.addLabels.getD "").splitOn ",").filter (fun s => !s.isEmpty),
-    setParty := r.setParty, priority := r.priority.toInt }
+    setParty := r.setParty, priority := r.priority.toInt, realm := ⟨r.realmId⟩ }
 
 /-- Every rule, highest priority first. -/
 def list (ctx : Ctx) : IO (Array Rule) := do
   let rs ← Db.rows RuleRow ctx.db
-    "SELECT id, name, filter, set_account, add_labels, set_party, priority FROM rule
-     ORDER BY priority DESC, name"
+    "SELECT id, name, filter, set_account, add_labels, set_party, priority, realm_id
+     FROM rule ORDER BY priority DESC, name"
   return rs.map ofRow
 
 /-- Creates a rule. The filter is parsed eagerly so a broken one is rejected at creation. -/
@@ -109,17 +87,16 @@ def add (ctx : Ctx) (name filterSrc : String) (setAccount : Option String := non
     (addLabels : List String := []) (setParty : Option String := none)
     (priority : Int := 0) : IO Rule := do
   let f ← IO.ofExcept (Filter.parse filterSrc)
-  let id ← freshId
-  Db.exec ctx.db s!"INSERT INTO rule
-    (id, name, filter, set_account, add_labels, set_party, priority)
-    VALUES ({Db.lit id}, {Db.lit name}, {Db.lit filterSrc}, {Db.litOpt setAccount},
-            {Db.lit (String.intercalate "," addLabels)}, {Db.litOpt setParty}, {priority})"
-  return { id := ⟨id⟩, name, filterSrc, filter := f, setAccount, addLabels, setParty, priority }
+  let rule : Rule :=
+    { id := ⟨← freshId⟩, name, filterSrc, filter := f, setAccount, addLabels, setParty,
+      priority }
+  discard <| ctx.commit "system" [.putRule rule]
+  return rule
 
-/-- Deletes a rule by id or name. -/
-def delete (ctx : Ctx) (idOrName : String) : IO Unit :=
-  Db.exec ctx.db
-    s!"DELETE FROM rule WHERE id = {Db.lit idOrName} OR name = {Db.lit idOrName}"
+/-- Deletes a rule by id or name. A name that matches nothing is not an error. -/
+def delete (ctx : Ctx) (idOrName : String) : IO Unit := do
+  if (← list ctx).any (fun r => r.id.val == idOrName || r.name == idOrName) then
+    discard <| ctx.commit "system" [.deleteRule idOrName]
 
 end Rules
 
@@ -156,14 +133,16 @@ private def ofStagedRow (r : StagedRow) : StagedEntry :=
 private def ofBatchRow (r : BatchRow) : ImportBatch :=
   { id := ⟨r.id⟩, profile := r.profile, filename := r.filename,
     account := r.accountId.map (⟨·⟩), stamp := r.stamp,
-    total := r.total.toInt.toNat, duplicates := r.duplicates.toInt.toNat }
+    total := r.total.toInt.toNat, duplicates := r.duplicates.toInt.toNat
+    realm := ⟨r.realmId⟩ }
 
 private def stagedCols : String :=
   "SELECT id, batch_id, fingerprint, date, payee, purpose, minor, commodity,
           counter_iban, bank_ref, state, suggested_account, txn_id FROM staged_entry"
 
 private def batchCols : String :=
-  "SELECT id, profile, filename, account_id, at, total, duplicates FROM import_batch"
+  "SELECT id, profile, filename, account_id, at, total, duplicates, realm_id
+   FROM import_batch"
 
 /--
 Stages parsed records against a bank account. Records whose fingerprint is
@@ -173,11 +152,14 @@ def stage (ctx : Ctx) (account : AccountId) (profile : String) (filename : Optio
     (records : Array RawRecord) : IO (ImportBatch × Array StagedEntry) := do
   let batchId ← freshId
   let stamp ← nowStamp
+  -- The batch row is state, and the staged rows are not: a bank line awaiting
+  -- review is not part of the ledger until somebody promotes it.
+  let record (total duplicates : Nat) : IO Unit :=
+    discard <| ctx.commit "import" [.recordImportBatch
+      { id := ⟨batchId⟩, profile, filename, account := some account, stamp, total,
+        duplicates }]
   ctx.transaction do
-    Db.exec ctx.db s!"INSERT INTO import_batch
-      (id, profile, filename, account_id, at, total, duplicates)
-      VALUES ({Db.lit batchId}, {Db.lit profile}, {Db.litOpt filename}, {Db.lit account.val},
-              {Db.lit stamp}, 0, 0)"
+    record 0 0
     let mut dups := 0
     let mut occurrences : Std.HashMap String Nat := {}
     for r in records do
@@ -201,8 +183,7 @@ def stage (ctx : Ctx) (account : AccountId) (profile : String) (filename : Optio
                   {Db.litOpt r.payee}, {Db.litOpt r.purpose}, {r.amount.minor},
                   {Db.lit r.amount.commodity.code}, {Db.litOpt r.counterIban},
                   {Db.litOpt r.bankRef}, 'new', NULL, NULL)"
-    Db.exec ctx.db s!"UPDATE import_batch SET total = {records.size}, duplicates = {dups}
-                      WHERE id = {Db.lit batchId}"
+    record records.size dups
   let batch ← Db.row? BatchRow ctx.db (batchCols ++ s!" WHERE id = {Db.lit batchId}")
   let staged ← Db.rows StagedRow ctx.db
     (stagedCols ++ s!" WHERE batch_id = {Db.lit batchId} ORDER BY date, id")

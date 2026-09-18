@@ -34,6 +34,8 @@ declare_id BatchId
 declare_id StagedId
 declare_id RuleId
 declare_id BudgetId
+declare_id RealmId
+declare_id MemberId
 
 /--
 Generates a fresh identifier: 10 characters of millisecond timestamp followed by

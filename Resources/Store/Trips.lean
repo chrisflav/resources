@@ -17,16 +17,6 @@ open Lean
 
 namespace Resources
 
-/-- A named window of spending someone else pays for. -/
-structure Trip where
-  id : String
-  name : String
-  starts : Date
-  ends : Date
-  payer : String
-  note : Option String
-  deriving Repr, Inhabited
-
 private structure TripRow where
   id : String
   name : String
@@ -34,6 +24,7 @@ private structure TripRow where
   ends : String
   payer : String
   note : Option String
+  realmId : String
   deriving SQLite.Row
 
 namespace Trips
@@ -42,9 +33,9 @@ private def ofRow (r : TripRow) : Trip :=
   { id := r.id, name := r.name
     starts := (Date.ofIso? r.starts).getD default
     ends := (Date.ofIso? r.ends).getD default
-    payer := r.payer, note := r.note }
+    payer := r.payer, note := r.note, realm := ⟨r.realmId⟩ }
 
-private def cols : String := "SELECT id, name, starts, ends, payer, note FROM trip"
+private def cols : String := "SELECT id, name, starts, ends, payer, note, realm_id FROM trip"
 
 /-- Every trip, newest first. -/
 def list (ctx : Ctx) : IO (Array Trip) := do
@@ -66,18 +57,15 @@ def create (ctx : Ctx) (name : String) (starts ends : Date) (payer : String)
   if (← byName? ctx name).isSome then
     throw <| IO.userError s!"a trip called {name} already exists"
   let id ← freshId
-  let now ← nowStamp
-  Db.exec ctx.db s!"INSERT INTO trip (id, name, starts, ends, payer, note, created_at)
-    VALUES ({Db.lit id}, {Db.lit name}, {Db.lit starts.toIso}, {Db.lit ends.toIso},
-            {Db.lit payer}, {Db.litOpt note}, {Db.lit now})"
   let trip : Trip := { id, name, starts, ends, payer, note }
+  discard <| ctx.commit "system" [.putTrip trip]
   discard <| Labels.ensure ctx (label trip)
   discard <| Accounts.purse ctx (← Parties.contact ctx payer)
   return trip
 
 /-- Deletes a trip. The label and the transactions it grouped are left alone. -/
 def delete (ctx : Ctx) (name : String) : IO Unit :=
-  Db.exec ctx.db s!"DELETE FROM trip WHERE name = {Db.lit name}"
+  discard <| ctx.commit "system" [.deleteTrip name]
 
 /-- The transactions already assigned to a trip. -/
 def members (ctx : Ctx) (t : Trip) : IO (Array Transaction) :=

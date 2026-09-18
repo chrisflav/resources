@@ -8,11 +8,12 @@ plaintext is shown once at creation and never again. Scopes are a bitset checked
 in the router before dispatch; the token's id is the actor recorded on every
 revision.
 
-A token may also name a *subject*: one person, on one budget. That is what a
-share link is. It is not a narrower set of scopes — scopes say what a caller may
-do, and the question here is what a caller may touch — so a token with a subject
-is dispatched to a different route table entirely. A list of allowed routes
-fails open the day somebody adds a route; a second table cannot.
+A token once had a second job: a *share link*, one person on one budget,
+dispatched to a route table of its own. Sharing is a realm now — an invite that
+makes somebody a member with a key of their own — so a token is only ever a
+caller's own credential again. The `owner_id` and `budget_id` columns are still
+on the table and nothing reads them; dropping a column is a migration that
+cannot be undone, and an old row saying who a retired link was for is harmless.
 -/
 
 open Lean SQLite
@@ -81,18 +82,6 @@ def parse (s : String) : Except String Scopes := do
 
 end Scopes
 
-/--
-Who a share link speaks for, and about what.
-
-Both halves matter. The owner is whose accounts the holder may post to, and the
-budget is the only thing they may see — so the set of accounts a guest can reach
-is a property of their token rather than a rule somebody has to remember.
--/
-structure Guest where
-  owner : PartyId
-  budget : BudgetId
-  deriving Repr, Inhabited
-
 /-- A token record. The secret itself is never stored. -/
 structure ApiToken where
   id : TokenId
@@ -101,8 +90,6 @@ structure ApiToken where
   createdAt : String
   lastUsedAt : Option String
   expiresAt : Option String
-  /-- Set when this is a share link rather than a token of your own. -/
-  guest : Option Guest
   deriving Repr
 
 private structure TokenRow where
@@ -113,38 +100,29 @@ private structure TokenRow where
   createdAt : String
   lastUsedAt : Option String
   expiresAt : Option String
-  ownerId : Option String
-  budgetId : Option String
   deriving Row
 
 namespace Tokens
 
 private def ofRow (r : TokenRow) : ApiToken :=
   { id := ⟨r.id⟩, name := r.name, scopes := ⟨r.scopes.toInt.toNat.toUInt32⟩,
-    createdAt := r.createdAt, lastUsedAt := r.lastUsedAt, expiresAt := r.expiresAt
-    guest := do
-      let owner ← r.ownerId
-      let budget ← r.budgetId
-      pure { owner := ⟨owner⟩, budget := ⟨budget⟩ } }
+    createdAt := r.createdAt, lastUsedAt := r.lastUsedAt, expiresAt := r.expiresAt }
 
 private def cols : String :=
-  "SELECT id, name, hash, scopes, created_at, last_used_at, expires_at,
-          owner_id, budget_id FROM token"
+  "SELECT id, name, hash, scopes, created_at, last_used_at, expires_at FROM token"
 
 /-- Mints a token. The returned string is the only time the secret is available. -/
 def create (ctx : Ctx) (name : String) (scopes : Scopes)
-    (expiresAt : Option Date := .none) (guest : Option Guest := .none) :
-    IO (ApiToken × String) := do
+    (expiresAt : Option Date := .none) : IO (ApiToken × String) := do
   let secret := "rsrc_" ++ toBase32 (← IO.getRandomBytes 32)
   let id ← freshId
   let now ← nowStamp
   Db.exec ctx.db s!"INSERT INTO token
-    (id, name, hash, scopes, created_at, last_used_at, expires_at, owner_id, budget_id)
+    (id, name, hash, scopes, created_at, last_used_at, expires_at)
     VALUES ({Db.lit id}, {Db.lit name}, {Db.lit (Sha256.hex secret)}, {scopes.mask.toNat},
-            {Db.lit now}, NULL, {Db.litOpt (expiresAt.map (·.toIso))},
-            {Db.litOpt (guest.map (·.owner.val))}, {Db.litOpt (guest.map (·.budget.val))})"
+            {Db.lit now}, NULL, {Db.litOpt (expiresAt.map (·.toIso))})"
   return ({ id := ⟨id⟩, name, scopes, createdAt := now, lastUsedAt := .none,
-            expiresAt := expiresAt.map (·.toIso), guest }, secret)
+            expiresAt := expiresAt.map (·.toIso) }, secret)
 
 /-- Every token, without secrets. -/
 def list (ctx : Ctx) : IO (Array ApiToken) := do
@@ -176,24 +154,16 @@ def verify (ctx : Ctx) (presented : String) (today : Date) : IO (Option ApiToken
       return some tok
   return .none
 
-/-- Whether any token exists at all. -/
-def any (ctx : Ctx) : IO Bool := do
-  return (← Db.scalarInt ctx.db "SELECT COUNT(*) FROM token") > 0
-
 /--
-Whether a token of *your own* exists; this is what decides whether the API is
+Whether any token exists at all, which is what decides whether the API is
 locked down yet.
 
-Share links are excluded deliberately. With no tokens the API is open, so the
-tool works on loopback the moment it starts, and minting your first token is how
-you say you are ready to lock it down. Sharing a budget with somebody is not
-that statement — it grants one person access to one budget — and counting it
-would lock you out of your own client as a side effect of inviting a friend,
-which is a surprise and not a security boundary: a share link widens nothing
-that "no tokens at all" had not already left open.
+With no tokens the API is open, so the tool works on loopback the moment it
+starts, and minting your first token is how you say you are ready to lock it
+down.
 -/
-def anyOwn (ctx : Ctx) : IO Bool := do
-  return (← Db.scalarInt ctx.db "SELECT COUNT(*) FROM token WHERE owner_id IS NULL") > 0
+def any (ctx : Ctx) : IO Bool := do
+  return (← Db.scalarInt ctx.db "SELECT COUNT(*) FROM token") > 0
 
 end Tokens
 

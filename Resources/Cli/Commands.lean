@@ -2,6 +2,12 @@ import Cli
 import Resources.Cli.Client
 import Resources.Api.Server
 import Resources.Api.TsGen
+import Resources.Api.Vectors
+import Resources.Sync.Server
+import Resources.Node.Realms
+import Resources.Node.Rekey
+import Resources.Node.Blobs
+import Resources.Crypto.Sodium
 
 /-!
 # Command line
@@ -81,6 +87,11 @@ def withBackend (f : Backend → IO Unit) : IO UInt32 := do
   try
     let cfg ← ClientConfig.load
     let b ← Backend.open? cfg
+    -- A local store writes as whoever `sync.json` says this node is, so that the
+    -- events it composes are authored by the key that will sign them.
+    let b ← match b with
+      | .direct ctx => pure (Backend.direct (← Node.adopt ctx))
+      | remote => pure remote
     f b
     return 0
   catch e =>
@@ -88,14 +99,14 @@ def withBackend (f : Backend → IO Unit) : IO UInt32 := do
     return 1
 
 /-- Opens the local store directly; used by commands that cannot go over HTTP. -/
-def withLocal (f : Ctx → IO Unit) : IO UInt32 := do
+def withLocal (f : Ctx → IO Unit) (verifyChain : Bool := true) : IO UInt32 := do
   try
     let cfg ← ClientConfig.load
     let storeCfg ←
       match cfg.dataDir with
       | some d => pure (Config.atDir (System.FilePath.mk d))
       | none => Config.default
-    f (← Ctx.open storeCfg)
+    f (← Node.adopt (← Ctx.open storeCfg verifyChain))
     return 0
   catch e =>
     IO.eprintln s!"error: {e}"
@@ -1325,34 +1336,22 @@ def runReportMonthly (p : Parsed) : IO UInt32 := withBackend fun b => do
 /--
 Handler for `token create`.
 
-With `--budget` and `--for` this mints a share link instead: a token that speaks
-for one person on one budget. Its scopes are not what confines it — the guest
-route table is — so they are not asked for.
+A token is a credential of your own. Letting somebody else in is an invite to a
+realm — `resources realm invite` — which hands them a key rather than a narrower
+version of yours.
 -/
 def runTokenCreate (p : Parsed) : IO UInt32 := withBackend fun b => do
   let mut body := Json.mkObj [("name", argStr p "name"), ("scopes", flagStr p "scopes" "read")]
-  for (k, v) in [("budget", flagStr? p "budget"), ("for", flagStr? p "for"),
-                 ("expires", flagStr? p "expires")] do
-    match v with
-    | some x => body := body.setObjVal! k (Json.str x)
-    | none => pure ()
+  match flagStr? p "expires" with
+  | some x => body := body.setObjVal! "expires" (Json.str x)
+  | none => pure ()
   let j ← b.json (Call.post ["tokens"] body)
   let tok := jobj j "token"
-  let link := jstr j "link"
-  if link.isEmpty then
-    IO.println s!"token {jstr tok "name"} created with scopes {jstr tok "scopes"}"
-    IO.println ""
-    IO.println (jstr j "secret")
-    IO.println ""
-    IO.println "This is the only time the secret is shown. Store it now."
-  else
-    IO.println s!"share link for {flagStr p "for" ""} on {flagStr p "budget" ""}"
-    IO.println ""
-    IO.println s!"  {link}"
-    IO.println ""
-    IO.println "Append that to wherever the web client is served from. The secret \
-lives in the fragment, so it never reaches a server log or a Referer header, and \
-it is shown once. Revoke it with `resources token revoke`."
+  IO.println s!"token {jstr tok "name"} created with scopes {jstr tok "scopes"}"
+  IO.println ""
+  IO.println (jstr j "secret")
+  IO.println ""
+  IO.println "This is the only time the secret is shown. Store it now."
 
 /-- Handler for `token list`. -/
 def runTokenList (_p : Parsed) : IO UInt32 := withBackend fun b => do
@@ -1368,12 +1367,653 @@ def runTokenRevoke (p : Parsed) : IO UInt32 := withBackend fun b => do
 
 /-! ## Server, status and the escape hatch -/
 
+/--
+Notes `--insecure-dev`, the second half of asking for the test suite.
+
+`RESOURCES_INSECURE_CRYPTO=1` on its own is no longer enough, and the reason is
+the shape of the two things rather than a belt and braces: an environment
+variable is inherited — by a service manager's children, by a container, by
+every shell started from a profile that once set it for an afternoon — and a
+flag on this command line is not. Something that can arrive without anybody
+deciding it cannot be the thing that decides this, so the decision is taken
+twice, in two kinds of place, and `Node.CryptoSuite.forNode` refuses unless both
+are there.
+
+It is set before anything opens a key, because the routes underneath build a
+suite of their own (`Node/Realms.lean`) and have no command line to read.
+-/
+def noteInsecureDev (p : Parsed) : IO Unit := do
+  if p.hasFlag "insecure-dev" then Node.CryptoSuite.allowInsecureDev
+
 /-- Handler for `serve`. -/
 def runServe (p : Parsed) : IO UInt32 := withLocal fun ctx => do
+  noteInsecureDev p
   Api.serve ctx
     { host := flagStr p "host" "127.0.0.1"
       port := ((flagStr p "port" "8087").toNat?.getD 8087).toUInt16
-      webRoot := (flagStr? p "web").map System.FilePath.mk }
+      webRoot := (flagStr? p "web").map System.FilePath.mk
+      cors := flagStr? p "cors" }
+    Node.Realms.api
+
+/--
+The keys allowed to create a ledger: `--creator`, then `$RESOURCES_SEQ_CREATORS`,
+both comma-separated lists of member ids.
+
+An empty list is a real answer, not a missing one: membership of this service is
+self-serve, so a sequencer that let any key that could authenticate make ledgers
+would let any key on the internet make unlimited ledgers and fill the disk
+through them. A deployment that wants none says so by listing none.
+-/
+private def sequencerCreators (p : Parsed) : IO (Array String) := do
+  let listed := (flagStr p "creator" "").splitOn ","
+  let fromEnv := match ← IO.getEnv "RESOURCES_SEQ_CREATORS" with
+    | some s => s.splitOn ","
+    | none => []
+  return ((listed ++ fromEnv).map (fun s => s.trimAscii.toString.toLower)).toArray.filter
+    (fun s => !s.isEmpty)
+
+/--
+The verifier `resources sequencer` checks signatures with.
+
+`Verifier.ofSuite` over `CryptoSuite.sodium`: Ed25519, checked at the exact
+width the suite declares. This was `Verifier.rejectAll` while no scheme was
+bound, and the line above is the whole of what changed when one was — the
+sequencer is written against `Verifier`, so order, membership, grants and
+checkpoints were all enforced already and none of those routes was opened.
+
+What it can no longer be is the test suite. That used to be reachable with
+`RESOURCES_INSECURE_CRYPTO=1` *and* `--insecure-dev`, plus a check that the bind
+address was loopback — and this project's documented topology is nginx in front
+of a loopback socket, so the one check that was about the network passed in
+exactly the configuration it was written to prevent. Under that suite a
+signature is recomputed from the public key, so anybody who can verify one can
+forge one, and a service whose entire job is to say who appended what cannot
+have a mode where that depends on an inherited environment variable.
+
+So the sequencer binary has no spelling for it at all, and `Sync.Node.make`
+refuses to build one with a verifier that proves nothing unless the caller is a
+test saying so in Lean. The node commands keep `--insecure-dev`, because a node
+running the test suite lies only to itself and to whoever it syncs with.
+-/
+def sequencerVerifier : Sync.Verifier := Sync.Verifier.ofSuite Node.CryptoSuite.sodium
+
+/--
+Handler for `sequencer`.
+
+`--origin` is the URL clients reach this sequencer at, and it is bound into every
+challenge. Getting it wrong does not weaken anything — a client that signs for
+one origin cannot authenticate at another — but it does mean nobody can log in,
+so it is printed at startup.
+
+`--blob-quota` is how many bytes of receipts one ledger may hold, written either
+plainly or with a unit. Nothing collects blobs — the sequencer cannot read an
+entry, so it cannot know which ones the order still points at — so this number
+is what turns "the disk is full" into "this ledger is full", which is a sentence
+somebody can be told and act on. A size this command cannot read is refused
+rather than rounded or ignored: a quota typed with a zero missing is a service
+that stops taking receipts three months later, and one silently dropped is a
+disk that fills.
+-/
+def runSequencer (p : Parsed) : IO UInt32 := do
+  try
+    let dataDir ←
+      match flagStr? p "data" with
+      | some d => pure (System.FilePath.mk d)
+      | none => do pure (← Config.default).dataDir
+    let host := flagStr p "host" "127.0.0.1"
+    let port := ((flagStr p "port" "8088").toNat?.getD 8088).toUInt16
+    let origin := flagStr p "origin" s!"http://{host}:{port}"
+    let log ← Sync.Log.open (Sync.Config.atDir dataDir)
+    let verifier := sequencerVerifier
+    let limits : Sync.Limits ←
+      match flagStr? p "blob-quota" with
+      | none => pure {}
+      | some given =>
+        match Sync.byteSize? given with
+        | some bytes => pure { blobQuotaBytes := bytes }
+        | none =>
+          throw <| IO.userError s!"--blob-quota is a size in bytes, written plainly or with a \
+                                   unit: 268435456, 256MiB, 512K. '{given}' is not one."
+    let creators ← sequencerCreators p
+    -- `testOnly` is not passed and has no spelling here. `make` refuses to build
+    -- a sequencer over a verifier that proves nothing, and the one way past that
+    -- refusal is a test asking for it in Lean.
+    Sync.serve (← Sync.Node.make log verifier limits origin (some creators))
+      { host, port, webRoot := (flagStr? p "web").map System.FilePath.mk }
+    return 0
+  catch e =>
+    IO.eprintln s!"error: {e}"
+    return 1
+
+/-! ## The node: identity, keys and sync -/
+
+/-- Runs `stty` with one flag, and says whether the terminal took it. -/
+private def stty (flag : String) : IO Bool := do
+  try
+    let child ← IO.Process.spawn
+      { cmd := "stty", args := #[flag], stdout := .null, stderr := .null }
+    return (← child.wait) == 0
+  catch _ =>
+    return false
+
+/--
+The passphrase that opens this node's identity and its keys.
+
+`$RESOURCES_PASSPHRASE` for a service and a prompt for a person, and there is no
+third way. `--passphrase` was the third, and it put the one secret that opens
+every realm key this node holds into argv — where `ps` and `/proc/<pid>/cmdline`
+show it to every other user on the machine, and where a shell writes it into a
+history file.
+
+The prompt turns the terminal's echo off around the read by shelling out to
+`stty`, because Lean binds no `tcsetattr`, and turns it back on afterwards
+whatever happened, including when the read threw. A terminal `stty` cannot
+quieten is one the passphrase would be typed into in the clear, and that is said
+out loud rather than pretended about.
+-/
+private def promptPassphrase (label : String) : IO String := do
+  IO.print label
+  (← IO.getStdout).flush
+  let quiet ← stty "-echo"
+  unless quiet do
+    IO.eprintln "warning: this terminal will echo the passphrase as you type it"
+  try
+    return (← (← IO.getStdin).getLine).trimAscii.toString
+  finally
+    if quiet then
+      discard <| stty "echo"
+      IO.println ""
+
+def nodePassphrase (_p : Parsed) : IO String := do
+  match ← IO.getEnv "RESOURCES_PASSPHRASE" with
+  | some given => return given
+  | none => promptPassphrase "passphrase: "
+
+/--
+The passphrase for a file that does not exist yet, typed twice.
+
+Everywhere else a typo costs one refusal and another go, because the file is
+already there and either opens or does not. Here the file is about to be
+*written* under whatever was typed, and nothing else in the world knows the
+secret keys inside it: a slip at this prompt is a member id this machine can
+never sign as again, an identity nobody can revoke because revoking it needs the
+key, and a keyring full of realm keys that open nothing. So it is asked for
+twice and the two are compared.
+
+`$RESOURCES_PASSPHRASE` is asked for once. It was not typed at this prompt, a
+second read of the same variable would compare a string with itself, and there
+is nobody at the terminal to ask in any case.
+-/
+def newPassphrase (p : Parsed) : IO String := do
+  if (← IO.getEnv "RESOURCES_PASSPHRASE").isSome then return ← nodePassphrase p
+  let first ← promptPassphrase "passphrase: "
+  let again ← promptPassphrase "passphrase (again): "
+  unless first == again do
+    throw <| IO.userError "the two passphrases are not the same, so nothing was written; \
+                           run 'resources identity init' again"
+  if first.isEmpty then
+    throw <| IO.userError "an empty passphrase encrypts nothing; nothing was written"
+  return first
+
+/-- Everything a sync command needs, or `none` when this store syncs with nothing. -/
+def openSession (ctx : Ctx) (p : Parsed) : IO (Option Node.Session) := do
+  let settings ← Node.Settings.load ctx.cfg
+  unless settings.configured do return none
+  let suite ← Node.CryptoSuite.forNode
+  let pass ← nodePassphrase p
+  let identity ← Node.Identity.load suite (Node.Identity.pathIn ctx.cfg) pass
+  let keys ← Node.Keys.open suite (Node.Keys.pathIn ctx.cfg) pass identity
+  let transport ← Node.Transport.overCurl suite identity settings.sequencer
+  return some { ctx, suite, keys, transport, ledger := settings.ledger }
+
+/--
+Prints what a round of sync came to, and says so loudly when it stopped early.
+
+A checkpoint this node disagrees with is printed on the error stream and is not
+fatal. Two honest nodes cannot disagree — the projection is a pure fold of the
+same parts in the same order — so a mismatch means somebody is running different
+code or telling a different story, and the useful thing is to say which realm
+and which entry rather than to stop syncing.
+-/
+def reportRound (ctx : Ctx) (pulled : Node.Pulled) (pushed : Node.Pushed)
+    (checkpoints : Array (String × Node.Checkpoint.Outcome) := #[]) : IO Unit := do
+  IO.println s!"pulled    {pulled.applied} applied, {pulled.unreadable} unreadable, \
+                {pulled.rejected.size} rejected"
+  IO.println s!"pushed    {pushed.pushed} appended, {pushed.conflicts} conflicts"
+  if pulled.rekeyed > 0 then
+    IO.println s!"re-keyed  {pulled.rekeyed} realm keys fetched again"
+  IO.println s!"checked   {pulled.checkpointsAgreed} checkpoints agreed"
+  for (realm, outcome) in checkpoints do
+    IO.println s!"published {outcome.describe realm}"
+  IO.println s!"remote    entry {(← Node.remoteHead ctx).seq}"
+  for (seq, why) in pulled.rejected do
+    IO.eprintln s!"rejected  entry {seq}: {why}"
+  for (realm, seq, why) in pulled.checkpointMismatch do
+    IO.eprintln s!"MISMATCH  realm {realm} at entry {seq}: {why}"
+  match pulled.refused with
+  | some (seq, why) => throw <| IO.userError s!"the fetch stopped at entry {seq}: {why}"
+  | none => pure ()
+  match pushed.blocked with
+  | some why => throw <| IO.userError why
+  | none => pure ()
+
+/--
+Handler for `identity init`.
+
+Idempotent in both halves, and the second half is the one worth stating: an
+identity file that exists is opened rather than replaced, and a member the
+ledger already knows is *adopted* rather than added again — `Identity.install`
+asks the state before it writes, and returns the context unchanged when the key
+is already a member. Appending a second `addMember` and a second `grant` for a
+key that has both would open a second bridge account for one person, hand out
+the admin role again over an event somebody else's node has to apply, and put a
+duplicate into every projection downstream. So running it twice costs a
+passphrase and writes nothing.
+-/
+def runIdentityInit (p : Parsed) : IO UInt32 := withLocal fun ctx => do
+  noteInsecureDev p
+  let suite ← Node.CryptoSuite.forNode
+  let path := Node.Identity.pathIn ctx.cfg
+  let existed ← path.pathExists
+  -- Which prompt depends on which half of "idempotent in both halves" this run
+  -- is. An identity that is already there is being opened, and a wrong
+  -- passphrase is one refusal; one that is not is being created, and a wrong
+  -- passphrase is unrecoverable, so it is typed twice.
+  let pass ← if existed then nodePassphrase p else newPassphrase p
+  let identity ←
+    if existed then Node.Identity.load suite path pass else Node.Identity.create suite path pass
+  let adopted ← Node.Identity.install ctx identity (flagStr p "name" "me")
+  Node.Settings.setMember ctx.cfg identity.id
+  IO.println s!"identity  {identity.id}{if existed then "  (already there)" else ""}"
+  IO.println s!"agreement {identity.boxPkHex}"
+  IO.println s!"file      {path}"
+  IO.println s!"member    {adopted.member.val} of realm {Realm.selfId.val}"
+  IO.println "the log's first author stays 'self': the core will not remove the member a \
+              ledger belongs to, and genesis was written before there was a key to sign it"
+
+/-- Handler for `identity show`. -/
+def runIdentityShow (_p : Parsed) : IO UInt32 := withLocal fun ctx => do
+  let path := Node.Identity.pathIn ctx.cfg
+  match ← Node.Identity.publicKeys? path with
+  | none => IO.println s!"no identity at {path}; run 'resources identity init'"
+  | some (signPk, boxPk) =>
+    let st ← ctx.state.get
+    IO.println s!"identity  {signPk}"
+    IO.println s!"agreement {boxPk}"
+    IO.println s!"file      {path}"
+    match st.member? ⟨signPk⟩ with
+    | none => IO.println "member    not a member of this ledger yet"
+    | some m =>
+      let role := match (st.realm? Realm.selfId).bind (fun r => r.roleOf m.id) with
+        | some r => toString r
+        | none => "no role"
+      IO.println s!"member    {m.name} ({role} of realm {Realm.selfId.val})"
+
+/-- Handler for `sync init`. -/
+def runSyncInit (p : Parsed) : IO UInt32 := withLocal fun ctx => do
+  noteInsecureDev p
+  let url := flagStr p "sequencer" ""
+  if url.isEmpty then
+    throw <| IO.userError "a sequencer to sync with: --sequencer https://host"
+  let suite ← Node.CryptoSuite.forNode
+  let pass ← nodePassphrase p
+  let identity ← Node.Identity.load suite (Node.Identity.pathIn ctx.cfg) pass
+  if ((← ctx.state.get).member? identity.memberId).isNone then
+    throw <| IO.userError "this identity is not a member of this ledger; run \
+                           'resources identity init' first"
+  let keys ← Node.Keys.open suite (Node.Keys.pathIn ctx.cfg) pass identity
+  let ledger := flagStr p "ledger" "home"
+  let transport ← Node.Transport.overCurl suite identity url
+  let session ← Node.initAsAdmin { ctx with member := identity.memberId } suite keys transport
+    url ledger
+  IO.println s!"sequencer {url}"
+  IO.println s!"ledger    {ledger}"
+  IO.println s!"member    {session.member}"
+  IO.println s!"realm     {Realm.selfId.val} created, and its key is yours"
+  IO.println s!"pending   {← Node.pendingCount ctx} entries to push"
+
+/--
+An invite link's fragment, read back and checked against what an id may be.
+
+`readInvite?` recovers six fields from one string by splitting it on `:`, which
+is unambiguous exactly as long as no field can contain one. The ledger id is the
+field at risk: it is a name somebody chose, and while it was any string at all,
+`(ledger = "a", realm = "b:c")` and `(ledger = "a:b", realm = "c")` wrote the
+identical fragment and the parser always read the first. An invite that named
+one realm and redeemed another is a key handed to the wrong room.
+
+The sequencer now holds both to `Sync.isPlainId` — `[A-Za-z0-9._-]`, at most 64
+— so a fragment whose ids fall outside that set names nothing that exists there,
+and reading it as an invite could only ever be reading it as the wrong one. This
+refuses instead. It is the client half of the same rule and it is checked here,
+where the string a person pasted turns into a request.
+-/
+def invitation? (fragment : String) : Option Node.Invitation := do
+  let inv ← Node.readInvite? fragment
+  guard (Sync.isPlainId inv.ledger)
+  guard (Sync.isPlainId inv.realm)
+  return inv
+
+/--
+Handler for `sync join`: spends an invite somebody sent.
+
+The link's fragment is never sent to a server, so everything needed to redeem it
+is in the string the user pastes: which ledger, which realm, and the secret that
+seeds the key pair the proof is signed with. The sequencer is read off the link
+too — it is the host serving `/join/` — and `--sequencer` overrides that for a
+node reached by another name.
+-/
+def runSyncJoin (p : Parsed) : IO UInt32 := withLocal fun ctx => do
+  noteInsecureDev p
+  let link := (argStr p "link").trimAscii.toString
+  let fragment := match Str.splitOnce link '#' with
+    | some (_, after) => after
+    | none => link
+  let some inv := invitation? fragment
+    | throw <| IO.userError "that is not an invite link: it has to carry the ledger, the realm, \
+                             the secret, the inviter's signing key, the digest of the realm key \
+                             and the digest of the order's first entry, all of them named the \
+                             way this protocol names things, and this one does not"
+  let url := flagStr p "sequencer" (((link.splitOn "/join/")[0]?).getD "")
+  if url.isEmpty then
+    throw <| IO.userError "the link does not say which sequencer to join on: --sequencer URL"
+  let suite ← Node.CryptoSuite.forNode
+  let pass ← nodePassphrase p
+  let identity ← Node.Identity.load suite (Node.Identity.pathIn ctx.cfg) pass
+  let keys ← Node.Keys.open suite (Node.Keys.pathIn ctx.cfg) pass identity
+  let transport ← Node.Transport.overCurl suite identity url
+  let session ← Node.join { ctx with member := identity.memberId } suite keys transport url inv
+  IO.println s!"sequencer {url}"
+  IO.println s!"ledger    {inv.ledger}"
+  IO.println s!"realm     {inv.realm}, read and written into as a viewer"
+  IO.println s!"member    {session.member}"
+  IO.println s!"inviter   {inv.inviter}, pinned as an admin of that realm until its \
+                membership says otherwise"
+  IO.println s!"genesis   {inv.genesisHash}, which is what this ledger does begin with"
+  IO.println s!"remote    entry {(← Node.remoteHead ctx).seq}"
+  IO.println "what this store already held is its own prehistory and is never offered; \
+the ledger has been told who has arrived, and an admin can widen what you may do"
+
+/-- Handler for `sync`: one round. -/
+def runSync (p : Parsed) : IO UInt32 := withLocal fun ctx => do
+  noteInsecureDev p
+  match ← openSession ctx p with
+  | none =>
+    IO.println "this store syncs with nothing; run 'resources sync init --sequencer URL'"
+  | some session =>
+    let r ← Node.round session
+    discard <| Node.Realms.record r
+    reportRound ctx r.pulled r.pushed r.checkpoints
+
+/--
+Handler for `sync status`.
+
+Three groups of lines are about things nothing else here would show. What each
+*pin* is still worth: a pin is a bootstrap, so it stops counting the moment this
+node's replayed state names an admin of that realm, and a line that still said
+"pinned as an admin" about somebody the ledger has since demoted would be
+describing a rule this node no longer follows. What this node could *not* read:
+a realm some entry carried an unreadable part in is a realm whose projection is
+a fold around a hole, so it is marked `unverified` — it cannot be committed to
+and nobody else's commitment can be checked against it. And where the order
+*begins*, which is what an invite link pins and what every commitment is
+ultimately anchored to.
+
+Two more lines are about what the cryptography here actually is, because
+neither of them is visible from anything else this command prints. `suite` is
+what *this* binary signs and seals with — `resources` ships with no scheme bound,
+so the honest answer is usually that it has none, and the loud one is the test
+suite somebody asked for with an environment variable. `verifier` is what the
+sequencer says it checks signatures with, read off its own `GET health`: a
+deployment running `reject-all` accepts nothing and one running `insecure`
+accepts anything, and neither is something a node can work out by syncing
+successfully.
+-/
+def runSyncStatus (p : Parsed) : IO UInt32 := withLocal fun ctx => do
+  noteInsecureDev p
+  let settings ← Node.Settings.load ctx.cfg
+  if !settings.configured then
+    IO.println s!"local-only; no {Node.Settings.pathIn ctx.cfg}"
+    return
+  let head ← Node.remoteHead ctx
+  -- Both of these are asked for without stopping the command: a sequencer that
+  -- is down, and a build with no scheme bound, are things this is for saying.
+  let suiteName ←
+    try pure (← Node.CryptoSuite.forNode).name
+    catch _ => pure "none bound in this build"
+  let verifier ←
+    try
+      let (code, j) ← Node.Transport.result (Node.Transport.unauthenticated settings.sequencer)
+        (Node.Transport.get ["health"])
+      pure (if code ≥ 400 then s!"unknown; the sequencer answered {code}"
+            else Sync.strField? j "verifier" "unknown; it did not say")
+    catch _ => pure "unknown; the sequencer did not answer"
+  IO.println s!"sequencer {settings.sequencer}"
+  IO.println s!"ledger    {settings.ledger}"
+  IO.println s!"member    {settings.member}"
+  IO.println s!"suite     {suiteName}"
+  IO.println s!"verifier  {verifier}"
+  IO.println s!"remote    entry {head.seq} {head.hash}"
+  IO.println s!"pending   {← Node.pendingCount ctx} entries to push"
+  IO.println s!"local     {(← EventLog.head ctx.db).1} events"
+  if settings.genesisHash.isEmpty then
+    IO.println "genesis   not known here yet"
+  else
+    IO.println s!"genesis   {settings.genesisHash}"
+  unless settings.genesisSeen do
+    IO.println "genesis   never seen here: this store began from a checkpoint rather than \
+                from entry 1"
+  let st ← ctx.state.get
+  for pin in settings.pinned do
+    -- Three answers, and the middle one is the one worth printing at all: a pin
+    -- that has been overtaken is still written down and no longer consulted.
+    let realm := st.realm? ⟨pin.realm⟩
+    let stillAdmin := st.canAdminister ⟨pin.member⟩ ⟨pin.realm⟩
+    let hasAdmins : Bool := match realm with
+      | some r => r.members.any (fun (m, role) => role == .admin && m != Member.selfId)
+      | none => false
+    let standing :=
+      if stillAdmin then "still an admin of it"
+      else if hasAdmins then "no longer an admin of it, so this pin no longer counts"
+      else "the only anchor this node has: it has not read that realm's membership yet"
+    IO.println s!"pinned    {pin.member} on realm {pin.realm} — {standing}"
+  for realm in ← Node.Checkpoint.gappedRealms ctx head.seq do
+    IO.println s!"unverified realm {realm}: some part written in it never opened here, so what \
+                  this node shows of it is a fold around a hole"
+  for stored in ← Checkpoints.all ctx.db do
+    if stored.realm.isEmpty then
+      IO.println s!"snapshot  event {stored.seq}, {stored.stateHash}"
+    else
+      IO.println s!"committed {stored.realm} at entry {stored.seq}, {stored.stateHash}"
+
+/-! ## Realms
+
+Four thin wrappers, like every other command here: the route table is where a
+realm is made, and `resources realm create` is `POST realms` with a nicer table
+at the end of it.
+-/
+
+/-- Handler for `realm list`. -/
+def runRealmList (_p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["realms"])
+  printTable #["realm", "gen", "key", "budget", "members", "id"]
+    ((jarr j).map fun r => #[
+      jstr r "name", jstr r "generation",
+      (if jstr r "hasKey" == "true" then "held" else "-"),
+      jstr r "budget", toString (jarr (jobj r "members")).size, jstr r "id"])
+    (rightAlign := #[1, 4])
+
+/-- Handler for `realm create`. -/
+def runRealmCreate (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let mut body := Json.mkObj [("name", argStr p "name")]
+  match flagStr? p "budget" with
+  | some bn => body := body.setObjVal! "budget" (Json.str bn)
+  | none => pure ()
+  let j ← b.json (Call.post ["realms"] body)
+  IO.println s!"realm     {jstr j "name"}  ({jstr j "id"})"
+  IO.println s!"key       {if jstr j "hasKey" == "true" then "held here" else "not held here"}"
+  let budget := jstr j "budget"
+  unless budget.isEmpty do
+    IO.println s!"budget    {budget}"
+
+/-- Handler for `realm invite`. -/
+def runRealmInvite (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let mut body := Json.mkObj [("for", argStr p "who")]
+  for (k, v) in [("role", flagStr? p "role"), ("expires", flagStr? p "expires")] do
+    match v with
+    | some x => body := body.setObjVal! k (Json.str x)
+    | none => pure ()
+  let j ← b.json (Call.post ["realms", argStr p "realm", "invites"] body)
+  IO.println s!"invite    {jstr j "for"} as {jstr j "role"} of {jstr j "name"}, \
+                until {jstr j "expires"}"
+  IO.println ""
+  IO.println s!"  {jstr j "link"}"
+  IO.println ""
+  IO.println "Send that once. The secret lives in the fragment, so it never reaches a server \
+log or a Referer header, and redeeming it is what makes them a member with a key of their own."
+
+/-- Handler for `realm members`. -/
+def runRealmMembers (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let j ← b.json (Call.get ["realms", argStr p "realm", "members"])
+  let granted := jobj j "granted"
+  let holders := (jarr granted).map (fun x => (x.getStr?.toOption).getD "")
+  printTable #["member", "role", "key", "id"]
+    ((jarr (jobj j "members")).map fun m => #[
+      jstr m "name", jstr m "role",
+      (if granted == Json.null then "?"
+       else if holders.contains (jstr m "id") then "held" else "-"),
+      jstr m "id"])
+
+/-! ## Re-keying a realm, and what this node has committed to -/
+
+/-- Prints what a revoke or a rotation came to. -/
+def reportRekey (out : Node.Rekey.Outcome) : IO Unit := do
+  IO.println s!"realm     {out.realm}"
+  IO.println s!"generation {out.generation} on the sequencer, in the keyring and in the log"
+  match out.revoked with
+  | some who => IO.println s!"revoked   {who}"
+  | none => pure ()
+  IO.println s!"granted   {String.intercalate ", " out.granted.toList}"
+  IO.println s!"pushed    {out.pushed} entries under the new key"
+  for (who, why) in out.stranded do
+    IO.eprintln s!"stranded  {who}: {why}; they will read nothing written from now on"
+
+/-- The session a command that needs a sequencer works through, or a refusal. -/
+def needSession (ctx : Ctx) (p : Parsed) (what : String) : IO Node.Session := do
+  match ← openSession ctx p with
+  | some session => return session
+  | none =>
+    throw <| IO.userError s!"{what} needs a sequencer, and this store syncs with nothing; \
+                             run 'resources sync init --sequencer URL'"
+
+/--
+Handler for `realm revoke`.
+
+The member keeps what they have already read — nobody can take that back — and
+reads nothing written from here on. See `Node/Rekey.lean` for the order the
+three records are moved in and what an interrupted run leaves behind.
+-/
+def runRealmRevoke (p : Parsed) : IO UInt32 := withLocal fun ctx => do
+  let member := flagStr p "member" ""
+  if member.isEmpty then
+    throw <| IO.userError "who is being put out: --member <id>"
+  let session ← needSession ctx p "revoking a grant"
+  reportRekey (← Node.Rekey.revoke session (flagStr p "realm" Realm.selfId.val) member)
+
+/-- Handler for `realm rotate`: a new key for everybody who is already here. -/
+def runRealmRotate (p : Parsed) : IO UInt32 := withLocal fun ctx => do
+  let session ← needSession ctx p "rotating a realm key"
+  reportRekey (← Node.Rekey.rotate session (flagStr p "realm" Realm.selfId.val))
+
+/--
+Handler for `checkpoint`.
+
+One signed sentence per realm this node holds a key for, plus the local snapshot
+`resources rebuild --from-checkpoint` starts from. A round of sync does this
+too; the command exists for the times you want it now.
+-/
+def runCheckpoint (p : Parsed) : IO UInt32 := withLocal fun ctx => do
+  let session ← needSession ctx p "publishing a checkpoint"
+  let outcomes ← Node.checkpoint session (flagStr? p "realm")
+  if outcomes.isEmpty then
+    IO.println "this node holds no realm keys, so there is nothing it can commit to"
+  for (realm, outcome) in outcomes do
+    IO.println (outcome.describe realm)
+  match ← Checkpoints.get? ctx.db "" with
+  | some local' => IO.println s!"local     event {local'.seq}, {local'.stateHash}"
+  | none => pure ()
+
+/-! ## Receipts on the sequencer -/
+
+/-- Handler for `blob push`: stores a file, encrypts it and uploads the ciphertext. -/
+def runBlobPush (p : Parsed) : IO UInt32 := withLocal fun ctx => do
+  let session ← needSession ctx p "uploading a receipt"
+  let file : System.FilePath := argStr p "file"
+  let sha ← Node.Blobs.putFile session file
+  match ← Blobs.meta? ctx sha with
+  | some stored =>
+    IO.println s!"stored    {sha}"
+    IO.println s!"uploaded  {stored.cipherHash.getD "nothing"}"
+  | none => IO.println s!"stored    {sha}"
+
+/--
+Handler for `blob get`: fetches a receipt this node has the metadata for.
+
+Everything that comes back is checked against a hash that arrived in the order,
+so a sequencer that hands back the wrong bytes is caught here rather than
+believed.
+-/
+def runBlobGet (p : Parsed) : IO UInt32 := withLocal fun ctx => do
+  let session ← needSession ctx p "fetching a receipt"
+  let sha := argStr p "sha"
+  match ← Node.Blobs.get? session sha with
+  | none => throw <| IO.userError s!"no receipt {sha} here, and the sequencer has none to give"
+  | some bytes =>
+    match flagStr? p "out" with
+    | some out =>
+      IO.FS.writeBinFile out bytes
+      IO.println s!"wrote {bytes.size} bytes to {out}"
+    | none => IO.println s!"{bytes.size} bytes, cached in {Blobs.path ctx sha}"
+
+/--
+Handler for `node`: the UI server, and a round of sync every half minute.
+
+The loop shares the store with the server, as the server's own request handlers
+share it with each other: one connection, one state in memory, and SQLite's
+locking underneath. It only runs when there is a sequencer to talk to, so a
+local-only node is `resources serve` with a longer name.
+-/
+partial def syncLoop (session : Node.Session) : IO Unit := do
+  IO.sleep 30000
+  try
+    -- Recorded as well as printed, so that a status read between rounds says when
+    -- the last one ran rather than "never".
+    let r ← Node.Realms.record (← Node.round session)
+    if r.applied > 0 || r.pushed > 0 || !r.trouble.isEmpty then
+      IO.eprintln s!"sync: {r.applied} in, {r.pushed} out, at entry {r.seq}"
+    unless r.trouble.isEmpty do
+      IO.eprintln s!"sync: {r.trouble}"
+  catch e =>
+    IO.eprintln s!"sync: {e}"
+  syncLoop session
+
+/-- Handler for `node`. -/
+def runNode (p : Parsed) : IO UInt32 := withLocal fun ctx => do
+  noteInsecureDev p
+  match ← openSession ctx p with
+  | none => IO.eprintln "no sync.json: serving without syncing"
+  | some session =>
+    IO.eprintln s!"syncing with {(← Node.Settings.load ctx.cfg).sequencer} every 30s"
+    -- The routes underneath need the same keys this loop opened, and there is no
+    -- second way to get them: the passphrase was typed once.
+    Node.Realms.hold session
+    discard <| IO.asTask (syncLoop session) Task.Priority.dedicated
+  Api.serve ctx
+    { host := flagStr p "host" "127.0.0.1"
+      port := ((flagStr p "port" "8087").toNat?.getD 8087).toUInt16
+      webRoot := (flagStr? p "web").map System.FilePath.mk
+      cors := flagStr? p "cors" }
+    Node.Realms.api
 
 /-- Handler for `status`. -/
 def runStatus (_p : Parsed) : IO UInt32 := withBackend fun b => do
@@ -1410,10 +2050,65 @@ def runGenTypes (p : Parsed) : IO UInt32 := do
   | none => IO.print Api.TsGen.module
   return 0
 
+/-- Handler for `gen-vectors`. -/
+def runGenVectors (p : Parsed) : IO UInt32 := do
+  let dir : System.FilePath := flagStr p "out" "conformance"
+  IO.FS.createDirAll dir
+  IO.FS.writeFile (dir / "README.md") Api.Vectors.readme
+  IO.FS.writeFile (dir / "format-version") s!"{Api.Vectors.formatVersion}\n"
+  IO.FS.writeFile (dir / "vectors.json") Api.Vectors.vectorsJson
+  IO.FS.writeFile (dir / "rejects.json") Api.Vectors.rejectsJson
+  IO.println s!"wrote {Api.Vectors.vectors.length} vectors and \
+                {Api.Vectors.rejects.length} rejections to {dir}"
+  return 0
+
 /-- Handler for `migrate`. -/
 def runMigrate (_p : Parsed) : IO UInt32 := withLocal fun ctx => do
   let v ← Schema.currentVersion ctx.db
   IO.println s!"schema version {v} at {ctx.cfg.dbPath}"
+
+/--
+Handler for `rebuild`: computes the tables again from the log.
+
+This is the phase-2 claim made executable. If the events are the ledger and the
+tables are a cache of what they add up to, then deleting the cache and writing it
+again from the replayed state has to be a no-op — so the last line printed is the
+interesting one, and any answer but "the tables agreed with the log" is a bug in
+a projection, now fixed.
+
+It is also the one command that opens a store without checking the chain first,
+because it is the command `Ctx.open`'s refusal names. What it can repair is a
+cache: the ledger tables, and `ledger_head`, which is a cache of the end of the
+chain. What it cannot repair is an event, and it does not pretend to — a row
+whose bytes have changed still stops `Replay.events` here, with the same sentence
+`Ctx.open` would have given.
+-/
+def runRebuild (p : Parsed) : IO UInt32 := withLocal (verifyChain := false) fun ctx => do
+  let stored ← Load.fromDb ctx.db
+  let (replayed, from') : State × Nat ←
+    if p.hasFlag "from-checkpoint" then Replay.stateFrom ctx.db
+    else do pure (← Replay.state ctx.db, 0)
+  ctx.transaction do
+    Project.reset ctx.db
+    Project.all ctx.db replayed
+    -- The head is a cache of the end of the chain, like every other table here,
+    -- and this is the command that writes the caches again. `Ctx.open` refuses a
+    -- store whose head has drifted and names this command; that would be an
+    -- empty instruction if this did not put it back.
+    Db.exec ctx.db "DELETE FROM ledger_head"
+    Db.exec ctx.db "INSERT INTO ledger_head (id, seq, hash)
+      SELECT 1, seq, hash FROM event ORDER BY seq DESC LIMIT 1"
+  ctx.state.set replayed
+  -- Read after the repair, so that what is printed is where the log now says it
+  -- has got to rather than what the head claimed on the way in.
+  let (seq, hash) ← EventLog.head ctx.db
+  if from' == 0 then
+    IO.println s!"replayed {seq} events, head {hash}"
+  else
+    IO.println s!"replayed {seq - from'} events after the snapshot at event {from'}, head {hash}"
+    IO.println s!"the {from'} events it covers are still in the log; this phase archives nothing"
+  IO.println (if stored == replayed then "the tables agreed with the log"
+              else "the tables disagreed with the log and have been rebuilt from it")
 
 end Cli
 end Resources

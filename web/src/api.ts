@@ -5,17 +5,22 @@ import type {
   Attachment,
   Balance,
   ImportBatch,
+  Invite,
   Invoice,
   Label,
   Party,
   LineItem,
+  Realm,
+  RealmMembers,
   Revision,
+  Round,
   Rule,
   Budget,
   Claim,
   Participant,
   Standing,
   StagedEntry,
+  SyncStatus,
   Transaction,
   TransactionPage,
 } from './types'
@@ -33,33 +38,6 @@ export interface PeopleRow {
   claims: Claim[]
 }
 
-/** What a share link lets its holder see. */
-export interface GuestView {
-  budget: string
-  note: string
-  closed: boolean
-  you: string
-  total: Amount
-  undivided: Amount
-  costs: {
-    id: string
-    date: string
-    what: string
-    amount: Amount
-    paidBy: string
-    mine: boolean
-  }[]
-  standings: Standing[]
-  claims: {
-    id: string
-    due: string
-    state: string
-    amount: Amount
-    from: string | null
-    to: string | null
-  }[]
-}
-
 /**
  * The token is kept in localStorage rather than a cookie: the API is a plain
  * bearer-token service, and this way the same browser can point at a local
@@ -73,20 +51,6 @@ export function getToken(): string {
   } catch {
     return ''
   }
-}
-
-/**
- * A token for this page only, never written to storage.
- *
- * A share link carries its secret in the fragment, and it belongs to whoever
- * opened the link rather than to the browser they opened it in — so it must not
- * outlive the page, and it must not displace the token of somebody who also
- * uses this browser as themselves.
- */
-let sessionToken: string | null = null
-
-export function useSessionToken(token: string): void {
-  sessionToken = token
 }
 
 export function setToken(token: string): void {
@@ -125,7 +89,7 @@ async function request<T>(
         .join('&')
     : ''
   const headers: Record<string, string> = { ...opts.headers }
-  const token = sessionToken ?? getToken()
+  const token = getToken()
   if (token) headers.authorization = `Bearer ${token}`
   let body: BodyInit | undefined
   if (opts.raw !== undefined) {
@@ -292,7 +256,7 @@ export const api = {
     ),
   // Closing is the moment of decision: it divides everything waiting, asks for
   // what that leaves people owing, and stops anybody adding to it — including
-  // whoever holds a share link. Closing again after reopening writes a new
+  // everybody else in its realm. Closing again after reopening writes a new
   // division covering only what came in since.
   closeBudget: (
     name: string,
@@ -373,15 +337,24 @@ export const api = {
 
   tokens: () => request<ApiToken[]>('GET', 'tokens'),
   createToken: (name: string, scopes: string) =>
-    request<{ token: ApiToken; secret: string; link: string }>('POST', 'tokens', {
+    request<{ token: ApiToken; secret: string }>('POST', 'tokens', {
       body: { name, scopes },
     }),
-  // A share link: one person, one budget, and a route table of its own. The
-  // secret goes in the returned link's fragment, so it never reaches a server
-  // log or a Referer header.
-  createShareLink: (body: { name: string; budget: string; for: string; expires?: string }) =>
-    request<{ token: ApiToken; secret: string; link: string }>('POST', 'tokens', { body }),
   revokeToken: (id: string) => request<{ revoked: boolean }>('DELETE', `tokens/${id}`),
+
+  // A realm is the unit of sharing: one key, one set of members, one thing
+  // somebody can be let into. Making one with a budget inside it is what
+  // "share this budget" means, and an invite is what used to be a share link —
+  // except that redeeming it makes them a member with a key of their own.
+  realms: () => request<Realm[]>('GET', 'realms'),
+  createRealm: (body: { name: string; budget?: string }) =>
+    request<Realm>('POST', 'realms', { body }),
+  realmMembers: (id: string) => request<RealmMembers>('GET', `realms/${id}/members`),
+  inviteToRealm: (id: string, body: { for: string; role?: string; expires?: string }) =>
+    request<Invite>('POST', `realms/${id}/invites`, { body }),
+
+  syncStatus: () => request<SyncStatus>('GET', 'sync/status'),
+  syncNow: () => request<Round>('POST', 'sync', { body: {} }),
 
   trips: () =>
     request<
@@ -487,17 +460,6 @@ export const api = {
     request<{ into: string; count: number }>('POST', 'transactions/claim', {
       body: { who, filter },
     }),
-
-  // What a share link can do, and the whole of it. Everything else the API
-  // offers answers 404 to a guest token, including routes added later.
-  guest: () => request<GuestView>('GET', 'guest'),
-  addGuestExpense: (body: {
-    amount: string
-    narration?: string
-    payee?: string
-    date?: string
-  }) => request<GuestView['costs'][number]>('POST', 'guest/expenses', { body }),
-  dropGuestExpense: (id: string) => request<unknown>('DELETE', `guest/expenses/${id}`),
 
   balances: (at?: string) =>
     request<Balance[]>('GET', 'reports/balances', { query: at ? { at } : {} }),

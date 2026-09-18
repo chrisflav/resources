@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!--
+      The same policy the sequencer sends with every response
+      (`Resources/Sync/Server.lean`, `securityHeaders`), repeated here so that a
+      page opened from a file, from `vite preview`, or from anything else that
+      does not send the header is covered too.
+
+      `base-uri 'none'` is not covered by `default-src` and never falls back to
+      it, so without it a single injected `<base>` retargets every relative URL
+      on the page — including the one this client fetches the sequencer through.
+      `object-src 'none'` and `form-action 'self'` are the other two that do not
+      fall back: a plugin and a form action are both ways out of a policy that
+      only names scripts.
+
+      `frame-ancestors` has no effect in a `<meta>` policy and is kept anyway:
+      the two spellings are meant to be diffable, and the header is what
+      enforces it. There is no `font-src` and no `style-src` allowance for a
+      third party, because there is no third party — the font stack is the
+      system's, so opening a client that holds a realm key no longer tells
+      anybody that it was opened.
+    -->
+    <meta
+      http-equiv="content-security-policy"
+      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'"
+    />
+    <meta name="referrer" content="no-referrer" />
+    <title>Resources</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -245,55 +245,69 @@ The staged rows keep their fingerprints for the life of the store, and a
 posting records the fingerprint it came from, so this works retroactively on
 transactions imported before tagging existed — and stays correct after a fee
 has been moved into a receivable.
+
+Tagging a leg is rewriting the transaction it belongs to, so the rewrites are
+gathered first and committed together. That is not only tidiness: one
+transaction can be reached twice, once for the account its fee now sits in and
+once for the bank line it came from, and the second reading has to see what the
+first decided.
 -/
 def tagFeePostings (ctx : Ctx) : IO Nat := do
   let batches ← Imports.listBatches ctx
   let profiles ← CsvProfile.loadAll (ctx.cfg.dataDir / "profiles")
-  let mut tagged := 0
+  let s ← ctx.state.get
   -- Anything sitting in a fee account is a fee, whatever it was imported by.
   -- This is what catches transactions booked before postings had origins, and
   -- it is safe to repeat: the tag survives the posting being moved elsewhere.
-  let byAccount ← Db.scalarInt ctx.db
-    s!"SELECT COUNT(*) FROM posting p JOIN account a ON a.id = p.account_id
-       WHERE (a.name = {Db.lit "Expenses.Fees"} OR a.name LIKE {Db.lit "Expenses.Fees.%"})
-         AND (p.tag IS NULL OR p.tag != 'fee')"
-  if byAccount > 0 then
-    Db.exec ctx.db
-      s!"UPDATE posting SET tag = 'fee' WHERE account_id IN
-         (SELECT id FROM account WHERE name = {Db.lit "Expenses.Fees"}
-            OR name LIKE {Db.lit "Expenses.Fees.%"})"
-    tagged := tagged + byAccount.toNat
+  let feeAccounts := (s.accountsSorted.filter fun a =>
+    Account.isUnder a.name "Expenses.Fees").map (·.id)
+  let untagged (p : Posting) : Bool := p.tag != some "fee"
+  let mut rewritten : Std.HashMap String Transaction := {}
+  let mut tagged := 0
+  for t in s.ledger do
+    let hits := (t.postings.filter fun p => feeAccounts.contains p.account && untagged p).length
+    if hits > 0 then
+      rewritten := rewritten.insert t.id.val
+        { t with postings := t.postings.map fun p =>
+            if feeAccounts.contains p.account then { p with tag := some "fee" } else p }
+      tagged := tagged + hits
   for batch in batches do
     let some prof := profiles.find? (fun p => p.name == batch.profile) | continue
     if prof.feeWords.isEmpty then continue
     let entries ← Imports.listStaged ctx (some batch.id) none
     for e in entries do
       if !isFee prof.feeWords (ofStaged e) then continue
-      let n ← Db.scalarInt ctx.db
-        s!"SELECT COUNT(*) FROM posting
-           WHERE origin = {Db.lit e.fingerprint} AND (tag IS NULL OR tag != 'fee')"
-      if n > 0 then
-        Db.exec ctx.db
-          s!"UPDATE posting SET tag = 'fee' WHERE origin = {Db.lit e.fingerprint}"
-        tagged := tagged + n.toNat
+      let mut hits := 0
+      for t in s.ledger do
+        let current := rewritten.getD t.id.val t
+        let n := (current.postings.filter fun p =>
+          p.origin == some e.fingerprint && untagged p).length
+        if n > 0 then
+          rewritten := rewritten.insert t.id.val
+            { current with postings := current.postings.map fun p =>
+                if p.origin == some e.fingerprint then { p with tag := some "fee" } else p }
+          hits := hits + n
+      if hits > 0 then
+        tagged := tagged + hits
       else
         -- Transactions promoted before postings carried origins. The staged row
         -- still records which transaction it became, and within that
         -- transaction the fee is the counter leg of exactly its amount — which
         -- finds it even after the leg has been recategorised by hand.
-        match e.txnId with
-        | none => pure ()
-        | some txn =>
-          let counter := -e.raw.amount.minor
-          let hit ← Db.scalarInt ctx.db
-            s!"SELECT COUNT(*) FROM posting WHERE txn_id = {Db.lit txn.val}
-               AND minor = {counter} AND (tag IS NULL OR tag != 'fee')"
-          if hit > 0 then
-            Db.exec ctx.db
-              s!"UPDATE posting SET tag = 'fee' WHERE rowid IN
-                 (SELECT rowid FROM posting WHERE txn_id = {Db.lit txn.val}
-                  AND minor = {counter} AND (tag IS NULL OR tag != 'fee') LIMIT 1)"
-            tagged := tagged + 1
+        let some txn := e.txnId | continue
+        let some original := s.txn? txn | continue
+        if original.state != .posted then continue
+        let current := rewritten.getD txn.val original
+        let counter := -e.raw.amount.minor
+        let some i := current.postings.findIdx? (fun p => p.amount.minor == counter && untagged p)
+          | continue
+        let some leg := current.postings[i]? | continue
+        rewritten := rewritten.insert txn.val
+          { current with postings := current.postings.set i { leg with tag := some "fee" } }
+        tagged := tagged + 1
+  let ops := (sortedValues rewritten).map Op.putTransaction
+  if !ops.isEmpty then
+    discard <| ctx.commit "system" ops (kind := "categorise")
   return tagged
 
 /-! ## Linking transactions that are already in the ledger

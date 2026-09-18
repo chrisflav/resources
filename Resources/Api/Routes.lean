@@ -46,17 +46,66 @@ end Reply
 structure Caller where
   actor : String
   scopes : Scopes
-  /--
-  Set when this caller is a share link rather than you.
 
-  A guest is not a caller with fewer scopes. Scopes say what somebody may *do*;
-  the question a share link raises is what they may *touch*, and no combination
-  of read and write answers it. So a guest is dispatched to a route table of its
-  own, and the property that matters — a guest can only ever post to the budget
-  its token names and to accounts it owns — is true because there is nowhere
-  else to go, rather than because every route remembered to check.
+/--
+What the node half of this binary can do, handed to the route table from above.
+
+These routes sit *below* the node in the import order and cannot reach it: the
+sequencer's own table is written over `Api.Req` too, so `Node.Transport` imports
+this file and nothing here may import `Node`. What a route wants of a node —
+where it syncs, which keys it holds, a key for a realm just made, an invite, a
+receipt sealed or a receipt's key moved into another realm — therefore arrives
+as a value. `Resources/Node/Realms.lean` is
+what fills it in, and `Backend.direct` and `resources node` are what hand it
+over.
+
+The defaults are the honest answers for a store with no node in it: no
+sequencer, no keys, nothing to sync, and a realm that is real in the ledger and
+nowhere else.
+-/
+structure NodeApi where
+  /-- The sequencer this store syncs with, or empty when it syncs with nothing. -/
+  sequencer : Ctx → IO String := fun _ => pure ""
+  /-- Every realm key this node holds, as realm id and generation. -/
+  keysHeld : Ctx → IO (Array (String × Nat)) := fun _ => pure #[]
+  /--
+  Realms this node missed a part of somewhere in the shared order.
+
+  Empty is the honest default for a store with no node in it: nothing was ever
+  withheld from a ledger nobody else writes to, so nothing it shows is a fold
+  around a hole.
   -/
-  guest : Option Guest := none
+  unverified : Ctx → IO (Array String) := fun _ => pure #[]
+  /-- Takes a freshly made realm's key, and puts the realm on the sequencer. -/
+  created : Ctx → RealmId → IO Unit := fun _ _ => pure ()
+  /-- Mints an invite to a realm and returns the link that redeems it. -/
+  invited : Ctx → RealmId → (role : String) → (expires : String) → IO String :=
+    fun _ _ _ _ => throw <| IO.userError "this store has no sequencer to redeem an invite on"
+  /-- Which members the sequencer holds a grant for, or `none` when it was not asked. -/
+  granted : Ctx → RealmId → IO (Option (Array String)) := fun _ _ => pure none
+  /--
+  Stores a file, sealing it under a realm key when this node holds one.
+
+  The default is the local store's own `Blobs.put`, which encrypts nothing: a
+  store with no node in it uploads nothing and has nobody to hide the bytes
+  from.
+  -/
+  stored : Ctx → ByteArray → (mime : String) → Option String → IO String :=
+    fun ctx bytes mime origName => Blobs.put ctx bytes mime origName
+  /--
+  Links a receipt to a transaction, bringing the file's key into that
+  transaction's realm when it is wrapped under another.
+
+  The default links and nothing more, because a store with one realm has nowhere
+  to bring a key from.
+  -/
+  attached : Ctx → TxId → String → IO Unit := fun ctx txn sha => Blobs.attach ctx txn sha
+  /-- Where this store syncs, and how far it has got. -/
+  status : Ctx → IO Wire.SyncStatus := fun ctx => do
+    return { events := (← EventLog.head ctx.db).1 }
+  /-- One round of sync. -/
+  round : Ctx → IO Wire.Round :=
+    fun _ => throw <| IO.userError "this store syncs with nothing"
 
 /-- Everything a route needs from the transport. -/
 structure Req where
@@ -83,7 +132,10 @@ def withHeaders (r : Req) (kvs : List (String × String)) : Req :=
   { r with header := fun k => (kvs.find? (·.1.toLower == k.toLower)).map (·.2) }
 
 /-- Attaches a JSON body. -/
-def withJson (r : Req) (j : Json) : Req := { r with body := j.compress.toUTF8 }
+def withJson (r : Req) (j : Json) : Req :=
+  { r with body := j.compress.toUTF8,
+           header := fun k =>
+             if k.toLower == "content-type" then some "application/json" else r.header k }
 
 /-- Attaches a raw body. -/
 def withBody (r : Req) (b : ByteArray) : Req := { r with body := b }
@@ -179,84 +231,191 @@ private def hubOf (ctx : Ctx) (j : Json) : IO (Option PartyId) := do
     if who == "me" then return some Party.selfId
     return some (← Parties.contact ctx who).id
 
-/--
-The whole of what a share link can do.
+/-! ## What a browser may do to this origin
 
-Four routes. Everything else is a 404, including every route the ordinary table
-grows in future, which is the point of writing it out separately.
+Two rules, and both are about a request the person at the keyboard did not make.
 -/
-def guestHandle (ctx : Ctx) (actor : String) (g : Guest) (r : Req) : IO Reply := do
-  let some b ← Budgets.get? ctx g.budget.val
-    | return .json 404 (Json.mkObj [("error", "this link no longer points at anything")])
-  let some who ← Parties.byId? ctx g.owner
-    | return .json 404 (Json.mkObj [("error", "this link no longer points at anybody")])
-  let acc ← Budgets.account ctx b
-  let accounts ← Accounts.list ctx
-  let theirs := accounts.filter (·.owner == g.owner)
-  -- The reachable set, written down once: this budget, and accounts belonging to
-  -- whoever holds the link. Nothing below widens it.
-  let reachable (t : Transaction) : Bool :=
-    t.postings.all fun p => p.account == acc.id || theirs.any (·.id == p.account)
-  match r.method, r.segments with
-  | "GET", ["guest"] => do
-    let env ← Wire.NameEnv.load ctx
-    let costs ← Budgets.costs ctx b
-    let mut rows : Array Json := #[]
-    let mut total : Int := 0
-    for t in costs do
-      let amount := t.netIn acc.id "EUR"
-      total := total + amount
-      -- Whoever's money account the cost came out of paid for it.
-      let payer := t.postings.findSome? fun p =>
-        match accounts.find? (·.id == p.account) with
-        | some a => if a.holdsMoney && p.amount.minor < (0 : Int) then some a.owner else none
-        | none => none
-      let paidBy := (payer.map env.party).getD "somebody"
-      rows := rows.push
-        (Wire.guestCostJson t ⟨Commodity.eur, amount⟩ paidBy ((payer == some g.owner)))
-    let claims := (← Budgets.claims ctx b).filter fun t =>
-      t.postings.any fun p =>
-        match accounts.find? (·.id == p.account) with
-        | some a => a.owner == g.owner
-        | none => false
-    return .json 200 (Wire.guestJson b who.name (← Budgets.balance ctx b)
-      ⟨Commodity.eur, total⟩ rows (← Budgets.standings ctx b)
-      (claims.map (Wire.guestClaimJson env)))
-  | "POST", ["guest", "expenses"] => do
-    if b.closed then
-      throw <| IO.userError "this budget is closed"
-    let j ← bodyJson r.body
-    let from_ ← Accounts.purse ctx who
-    let commodity := Commodity.ofCode ((j.getObjValAs? String "commodity").toOption.getD "EUR")
-    let t ← Budgets.contribute ctx b from_ ⟨commodity, ← amountOf j commodity⟩
-      (← dateOf j "date") ((j.getObjValAs? String "narration").toOption.getD "")
-      actor ((j.getObjValAs? String "payee").toOption)
-    return .json 201 (Wire.guestCostJson t ⟨commodity, t.netIn acc.id commodity.code⟩
-      who.name true)
-  | "DELETE", ["guest", "expenses", id] => do
-    if b.closed then
-      throw <| IO.userError "this budget is closed"
-    let some t ← Txns.get? ctx ⟨id⟩
-      | return .json 404 (Json.mkObj [("error", "no such expense")])
-    if !reachable t then
-      return .json 404 (Json.mkObj [("error", "no such expense")])
-    -- Once part of it has been divided it is not theirs to withdraw: somebody
-    -- has already been told whose that spending was.
-    let left := (← Budgets.remaining ctx b).find? fun (x, _) => x.id == t.id
-    let whole := t.netIn acc.id "EUR"
-    if (left.map (fun (_, n) => n)).getD 0 != whole then
-      throw <| IO.userError "this has already been divided up, so it cannot be withdrawn"
-    Txns.delete ctx t.id actor
-    return .json 200 (Json.mkObj [("deleted", id)])
-  | "GET", ["health"] =>
-    return .json 200 (Json.mkObj [("status", "ok"), ("guest", Json.bool true)])
-  | _, _ => return .json 404 (Json.mkObj [("error", "no such route")])
+
+/-- Whether a method is one that changes something. -/
+def mutating (method : String) : Bool :=
+  !(method == "GET" || method == "HEAD" || method == "OPTIONS")
+
+/-- A content type without its parameters, lowercased: `application/json; charset=x`. -/
+private def baseType (value : String) : String :=
+  ((value.splitOn ";").headD "").trimAscii.toString.toLower
+
+/--
+The three content types a cross-origin form can send without a preflight.
+
+They are the whole of the cross-site request forgery surface a JSON API has:
+anything else is preflighted, and with cross-origin access off the preflight is
+refused before the request is made.
+-/
+private def simpleType (value : String) : Bool :=
+  ["application/x-www-form-urlencoded", "multipart/form-data", "text/plain"].contains
+    (baseType value)
+
+/--
+Whether a mutating request carries a content type a browser could not have
+forged.
+
+Almost everything here takes JSON and is required to say so. The two routes that
+take a file are the exceptions and are answered differently, because the type of
+a body that is a file is the file's. A receipt arrives by `PUT`, which is not a
+method a form can use at all, so nothing more is asked of it; an import arrives
+by `POST`, so what is asked of it is a content type no form can send — which
+`text/csv` is and `text/plain` is not.
+
+Both exemptions are keyed on the method *and* the path, and that is the whole of
+the change from version 2, which keyed the first on the path alone. The argument
+for letting `attachments` through untyped is entirely about `PUT`: a form cannot
+issue one. Written as "any mutating method at this path", the exemption was a
+statement about a route that does not exist yet, and the day somebody adds
+`POST /attachments` it would have quietly become a hole in a file nobody was
+editing. An exemption should name what it exempts.
+-/
+def wellTyped (method : String) (segments : List String) (contentType : String) : Bool :=
+  if method == "PUT" && segments == ["attachments"] then true
+  else if method == "POST" && segments == ["imports"] then
+    !contentType.isEmpty && !simpleType contentType
+  else baseType contentType == "application/json"
+
+/--
+Whether the Host header names this machine.
+
+A request that presents no credentials is the caller with every scope until the
+first token is minted, which is what makes the tool work out of the box. That is
+only defensible while the request really did come from here, and "from here" is
+two conditions rather than one:
+
+* the connection arrived from a loopback address — `Api.Server` reads that off
+  the socket, and it is the half a caller cannot write down. A header saying
+  `Host: localhost` is free, and version 2 asked for nothing else: a node bound
+  with `--host 0.0.0.0`, or proxied with the client's `Host` preserved, handed
+  `read,write,import,admin` to anybody who could open a socket — the ledger,
+  and an invite link carrying the secret that unwraps a realm key;
+* *and* the `Host` header names this machine, which is this function. That is
+  the other direction, and it is a browser rather than a socket: a name in
+  somebody else's DNS that resolves to 127.0.0.1 rebinds a page into a local
+  client, and its request really does arrive from loopback. What such a page
+  cannot do is send a `Host` it did not mean to.
+
+Neither condition implies the other, so both are asked. It is compared without
+its port.
+-/
+def loopbackHost (host : String) : Bool :=
+  if host.startsWith "[::1]" then true
+  else
+    let name := (host.splitOn ":").headD host
+    name == "localhost" || name == "127.0.0.1" || name.startsWith "127."
+
+/--
+The token an `authorization` header presents, if it presents one as a bearer.
+
+RFC 7235 makes the scheme name case-insensitive, so `bearer` and `BEARER` are
+the same word as `Bearer`, and a conforming client that sends one of the others
+was being told its token was missing rather than wrong. The prefix is matched on
+the lowercased header and the token is taken from the original, because the
+token itself is a secret compared byte for byte and lowercasing it would be
+comparing something else. `Sync.Node.caller?` asks the same question of the
+sequencer; this is the node API's side of it.
+-/
+def bearerToken? (auth : String) : Option String :=
+  let scheme := "bearer "
+  if auth.toLower.startsWith scheme then some (auth.drop scheme.length).copy else none
+
+/-- An account name nothing holds yet, by adding a number to `base` until one is free. -/
+private def freeAccountName (s : State) (base : String) : String := Id.run do
+  let taken (name : String) : Bool := s.accounts.toList.any (fun (_, a) => a.name == name)
+  if !taken base then return base
+  let mut n := 2
+  while taken s!"{base}{n}" && n < 1000 do
+    n := n + 1
+  return s!"{base}{n}"
+
+/--
+How many bytes a route will read.
+
+The same defence, and the same shape, as the sequencer's `Sync.bodyLimit`, and
+for the same reason: the expensive things a request can be — bytes to hash,
+base64 to decode, JSON to parse — all run before the route is reached, so the
+number has to be read off the method and the path and nothing else. The
+transport uses it to stop reading, and `handle` checks it again, because the CLI
+in local mode calls this table directly and never goes near a socket.
+
+Two routes carry a file and are generous: `PUT attachments`, which is a receipt
+being uploaded, and `POST imports`, which is a bank's CSV export. Writing
+transactions is a megabyte, which is a few thousand postings of JSON and far more
+than any client sends. Everything else is 64 KiB, which is a large JSON body and
+a small allocation.
+-/
+def bodyLimit (method : String) (segments : List String) : Nat :=
+  match method, segments with
+  | "PUT", ["attachments"] => 16 * 1024 * 1024
+  | "POST", ["imports"] => 16 * 1024 * 1024
+  | "POST", "transactions" :: _ => 1024 * 1024
+  | _, _ => 64 * 1024
+
+/-! ## Naming a file in a header
+
+The name an attachment is offered under is not this node's: it arrives in an
+`x-filename` header, or in a `registerBlob` op written by any member of a realm
+this node reads, and it is put into a response header. Version 2 took the quotes
+out of it and nothing else.
+-/
+
+/--
+Whether a character is one a header value may carry.
+
+Everything below a space goes, CR and LF first: a header value carrying one is a
+response split on a same-origin endpoint, if whatever builds the response does
+not catch it. So does `DEL`, and so does the C1 block `\u0080`–`\u009f`, which
+some decoders still read as controls.
+-/
+private def headerSafe (c : Char) : Bool :=
+  c.toNat ≥ 0x20 && c.toNat != 0x7f && !(c.toNat ≥ 0x80 && c.toNat ≤ 0x9f)
+
+/--
+The `filename` parameter of a `content-disposition` header, for a name nobody
+here chose.
+
+The name arrives in an `x-filename` header or in a `registerBlob` op written by
+any member of a realm this node reads, and version 2 took the quotes out of it
+and nothing else — which left CR and LF in a response header.
+
+Two parameters, because one cannot do both jobs. `filename=` is the one every
+client understands and it is a quoted ASCII string, so it gets the name with
+every control character gone and then the three characters that end a quoted
+string or start another parameter — `"`, `\\` and `;` — gone as well.
+`filename*=` is RFC 5987, and it carries the name as it really is: the same
+name, still without its control characters, as percent-encoded UTF-8. It is
+emitted only when the two differ, which is exactly when the ASCII one lost
+something worth having, and never for a name that was nothing but controls.
+
+A name that survives none of this is not a name, and the digest is used instead.
+The digest is always a name.
+-/
+def contentDispositionName (name fallback : String) : String :=
+  let clean := String.ofList (name.toList.filter headerSafe)
+  let ascii := String.ofList (clean.toList.filter fun c =>
+    c.toNat < 0x7f && c != '"' && c != '\\' && c != ';')
+  let plain := if ascii.trimAscii.toString.isEmpty then fallback else ascii
+  let extended := String.join (clean.toUTF8.toList.map fun b =>
+    let c := Char.ofNat b.toNat
+    if c.isAlphanum || c == '-' || c == '.' || c == '_' || c == '~' then c.toString
+    else
+      let digits := "0123456789ABCDEF".toList.toArray
+      s!"%{digits[b.toNat / 16]!}{digits[b.toNat % 16]!}")
+  s!"; filename=\"{plain}\""
+    ++ (if clean.isEmpty || plain == clean then "" else s!"; filename*=UTF-8''{extended}")
 
 /--
 Handles one request. Errors are thrown as `IO.userError` and turned into 400s by
 the caller, so individual routes stay readable.
 -/
-def handle (ctx : Ctx) (caller : Caller) (r : Req) : IO Reply := do
+def handle (ctx : Ctx) (caller : Caller) (r : Req) (node : NodeApi := {}) : IO Reply := do
+  if r.body.size > bodyLimit r.method r.segments then
+    return .json 413 (Json.mkObj [("error", "the body is larger than this route accepts")])
   let needs (s : Scope) : IO Unit :=
     if caller.scopes.has s then pure ()
     else throw <| IO.userError s!"token lacks the '{s}' scope"
@@ -264,8 +423,14 @@ def handle (ctx : Ctx) (caller : Caller) (r : Req) : IO Reply := do
   let created (j : Json) : IO Reply := return .json 201 j
   let notFound (what : String) : IO Reply :=
     return .json 404 (Json.mkObj [("error", s!"no such {what}")])
-  if let some g := caller.guest then
-    return ← guestHandle ctx caller.actor g r
+  -- Cross-site request forgery, closed the way a JSON API closes it: see
+  -- `wellTyped`. This is checked before the route is looked at, because a
+  -- request nobody meant to make should not reach one.
+  if mutating r.method then
+    unless wellTyped r.method r.segments ((r.header "content-type").getD "") do
+      return .json 415 (Json.mkObj [("error",
+        "a request that changes something is 'content-type: application/json', and a request \
+         that carries a file says what the file is")])
   match r.method, r.segments with
   | "GET", ["health"] =>
     ok (Json.mkObj [("status", "ok"), ("schema", jint Schema.targetVersion),
@@ -543,7 +708,7 @@ def handle (ctx : Ctx) (caller : Caller) (r : Req) : IO Reply := do
     needs .write
     let j ← bodyJson r.body
     let sha := (j.getObjValAs? String "sha256").toOption.getD ""
-    Blobs.attach ctx ⟨id⟩ sha
+    node.attached ctx ⟨id⟩ sha
     ok (Json.mkObj [("txn", id), ("sha256", sha)])
   | "POST", ["transactions", id, "divide"] => do
     needs .write
@@ -816,7 +981,7 @@ def handle (ctx : Ctx) (caller : Caller) (r : Req) : IO Reply := do
   | "PUT", ["attachments"] => do
     needs .write
     let mime := (r.header "content-type").getD "application/octet-stream"
-    let sha ← Blobs.put ctx r.body mime ((r.query "filename") <|> (r.header "x-filename"))
+    let sha ← node.stored ctx r.body mime ((r.query "filename") <|> (r.header "x-filename"))
     match ← Blobs.meta? ctx sha with
     | some m => created (Wire.attachmentJson m)
     | none => created (Json.mkObj [("sha256", sha)])
@@ -824,9 +989,21 @@ def handle (ctx : Ctx) (caller : Caller) (r : Req) : IO Reply := do
     needs .read
     match ← Blobs.get? ctx sha, ← Blobs.meta? ctx sha with
     | some data, some info =>
-      return .bytes 200 info.mime data
-        [("content-disposition", s!"inline; filename=\"{info.origName.getD sha}\""),
-         ("cache-control", "public, max-age=31536000, immutable")]
+      -- The stored MIME arrives over sync, from any member of a realm this node
+      -- reads, and `mimeOfExtension` can produce `text/html` or
+      -- `image/svg+xml`. Served inline from this origin, one of those is script
+      -- running against the whole API. So only the inert types are shown in
+      -- place; everything else is handed over as a file, under a type no
+      -- browser executes, and nothing is ever sniffed into something else.
+      let inert := ["image/png", "image/jpeg", "image/webp", "image/gif", "application/pdf"]
+      let showable := inert.contains (baseType info.mime)
+      return .bytes 200 (if showable then info.mime else "application/octet-stream") data
+        [("content-disposition",
+           (if showable then "inline" else "attachment")
+             ++ contentDispositionName (info.origName.getD sha) sha),
+         ("x-content-type-options", "nosniff"),
+         ("content-security-policy", "sandbox; default-src 'none'"),
+         ("cache-control", "private, max-age=31536000, immutable")]
     | _, _ => notFound "attachment"
   | "POST", ["attachments", "gc"] => do
     needs .write
@@ -1211,6 +1388,130 @@ is booked already divided as it goes in"
       ((r.query "commodity").getD "EUR")
     ok (Json.arr (rows.map fun (m, v) => Json.mkObj [("month", m), ("minor", jint v)]))
 
+  /- ## Realms, invites and sync
+
+  A realm is the unit of sharing: one key, one set of members, one thing
+  somebody can be let into. Making one is a ledger write and two node acts —
+  take its key, and tell the sequencer the realm exists — and only the first of
+  those happens in a store that syncs with nothing.
+  -/
+  | "GET", ["realms"] => do
+    needs .read
+    let st ← ctx.state.get
+    let held ← node.keysHeld ctx
+    -- What this node could not read is as much a part of the answer as what it
+    -- could: a realm with a gap is one whose projection is not the realm's.
+    let gaps ← node.unverified ctx
+    ok (Json.arr (st.realmsSorted.map fun rl =>
+      Wire.realmJson st ctx.member rl (held.contains (rl.id.val, rl.generation))
+        (gaps.contains rl.id.val)).toArray)
+  | "POST", ["realms"] => do
+    needs .admin
+    let j ← bodyJson r.body
+    let name := ((j.getObjValAs? String "name").toOption.getD "").trimAscii.toString
+    if name.isEmpty then throw <| IO.userError "a realm needs a name"
+    let st ← ctx.state.get
+    if st.realmsSorted.any (·.name == name) then
+      throw <| IO.userError s!"there is a realm called '{name}' already"
+    let me := ctx.member
+    let id : RealmId := ⟨← freshId⟩
+    -- The creator is written into the realm as its admin rather than granted
+    -- afterwards, because `grant` is itself something only an admin may do: a
+    -- realm nobody administers is one nobody could ever be let into.
+    --
+    -- `addMember` goes first, and it is not redundant. These parts are this
+    -- realm's whole history, and the only history somebody let in later will
+    -- ever read — the member record itself lives in the ledger's own realm,
+    -- which they hold no key for. A realm that named a member nobody joining it
+    -- had heard of would be a realm they could not replay at all.
+    let mine := (st.member? me).getD { id := me, name := me.val }
+    let mut ops : List Op :=
+      [.addMember mine, .createRealm { id, name, members := [(me, .admin)] }]
+    let budgetName := ((j.getObjValAs? String "budget").toOption.getD "").trimAscii.toString
+    unless budgetName.isEmpty do
+      -- A budget is shared by being *made* inside a realm. One that already
+      -- exists cannot be moved into one: an account changing realms is money
+      -- moving out from under the key it was written under, which `Core`
+      -- refuses and is right to.
+      --
+      -- Asked of the realm being made, because that is the only realm the name
+      -- has to be free in. A pot of this name in somebody else's realm is their
+      -- pot, held under a key this one knows nothing about, and refusing to open
+      -- yours because of it was the projection speaking rather than the books:
+      -- `account.name` was unique across the whole table, so a realm pulled in
+      -- that reused a name could not be written down at all. Migration 25 makes
+      -- it unique per realm, which is what `Core` has always said.
+      --
+      -- The realm here is new and holds nothing, so this asks a question whose
+      -- answer is known. It stays because the answer stops being known the
+      -- moment this route opens a budget in a realm that already exists, and a
+      -- `Core` refusal reached from in here is a 500 where this is a sentence.
+      if (st.accountByNameIn? id (Budget.accountName budgetName)).isSome then
+        throw <| IO.userError s!"{Budget.accountName budgetName} is already an account in that \
+                                realm, and a budget cannot move between realms — that would move \
+                                money out from under the key it was written under. Make the \
+                                realm first, and lend costs into the budget it holds."
+      -- The bridge is how the realm's own admin holds a balance in it, and it is
+      -- what a contribution to the budget comes out of. Everybody let in later
+      -- gets one the same way, from the grant their invite writes.
+      let bridge : Account :=
+        { id := ⟨← freshId⟩, name := freeAccountName st s!"Assets.Purse.{mine.name}.{name}",
+          kind := .asset, owner := mine.party, realm := id, bridgeOf := some me }
+      let budget : Budget :=
+        { id := ⟨← freshId⟩, name := Budget.accountName budgetName, note := none, closed := false }
+      let account : Account := { id := ⟨← freshId⟩, name := budget.name, kind := .equity }
+      ops := ops ++ [.grant id me .admin bridge, .openBudget budget account]
+    discard <| ctx.commit caller.actor ops "realm" (fun _ => none) id
+    -- Written in the ledger is half of it. The key everything in this realm will
+    -- be encrypted under lives in the keyring, and the sequencer has to know the
+    -- realm exists before anything can be appended to it.
+    node.created ctx id
+    let after ← ctx.state.get
+    let held ← node.keysHeld ctx
+    let some made := after.realm? id | throw <| IO.userError "the realm was not written"
+    created (Wire.realmJson after me made (held.contains (id.val, made.generation)))
+  | "POST", ["realms", id, "invites"] => do
+    needs .admin
+    let st ← ctx.state.get
+    let some realm := st.realm? ⟨id⟩ | notFound "realm"
+    -- An invite is a pending grant on a sequencer: a realm key sealed to a key
+    -- whose secret half travels in the link's fragment. Without a sequencer
+    -- there is nowhere to leave it and nowhere for anybody to redeem it.
+    let sequencer ← node.sequencer ctx
+    if sequencer.isEmpty then
+      throw <| IO.userError "an invite is redeemed on a sequencer, and this store syncs with \
+                            none — run 'resources sync init --sequencer URL' first"
+    let j ← bodyJson r.body
+    let who := ((j.getObjValAs? String "for").toOption.getD "").trimAscii.toString
+    if who.isEmpty then throw <| IO.userError "say who the invite is for"
+    let role := ((j.getObjValAs? String "role").toOption.getD "viewer").trimAscii.toString
+    if (RealmRole.ofString? role).isNone then
+      throw <| IO.userError s!"a role is 'viewer' or 'admin', not '{role}'"
+    let today ← Date.today
+    let expires :=
+      (((j.getObjValAs? String "expires").toOption).bind Date.ofIso?).getD (today.plusDays 14)
+    -- They go in the address book now, so that the link can be sent to a name
+    -- rather than to a key nobody holds yet.
+    let person ← Parties.contact ctx who
+    let link ← node.invited ctx realm.id role s!"{expires.toIso}T00:00:00"
+    created (Wire.inviteJson realm person.name role expires.toIso link)
+  | "GET", ["realms", id, "members"] => do
+    needs .read
+    let st ← ctx.state.get
+    let some realm := st.realm? ⟨id⟩ | notFound "realm"
+    -- Two different questions, kept apart. The ledger says who is in the realm;
+    -- the sequencer says who holds a key for it, which is what decides whether
+    -- they can read a word of it. `granted` is null when nobody was asked.
+    ok (Wire.realmMembersJson st ctx.member realm (← node.granted ctx realm.id))
+
+  /- ## Sync -/
+  | "GET", ["sync", "status"] => do
+    needs .read
+    ok (Wire.syncStatusJson (← node.status ctx))
+  | "POST", ["sync"] => do
+    needs .admin
+    ok (Wire.roundJson (← node.round ctx))
+
   /- ## Tokens -/
   | "GET", ["tokens"] => do
     needs .admin
@@ -1218,43 +1519,53 @@ is booked already divided as it goes in"
   | "POST", ["tokens"] => do
     needs .admin
     let j ← bodyJson r.body
-    -- A share link: one person, one budget. Its scopes are not what confines
-    -- it — the guest route table is — so they are not read from the request.
-    let guest ←
-      match (j.getObjValAs? String "budget").toOption with
-      | none => pure none
-      | some name => do
-        let some b ← Budgets.get? ctx name
-          | throw <| IO.userError s!"no such budget: {name}"
-        let who := ((j.getObjValAs? String "for").toOption.getD "").trimAscii.toString
-        if who.isEmpty then
-          throw <| IO.userError "say who the link is for"
-        let person ← Parties.contact ctx who
-        if person.id == Party.selfId then
-          throw <| IO.userError "a share link is for somebody else"
-        -- Created up front so the link works before they have spent anything.
-        discard <| Accounts.purse ctx person
-        pure (some ({ owner := person.id, budget := b.id } : Guest))
+    -- A token is a credential of your own and nothing else. Sharing one budget
+    -- with one person is an invite to a realm, which is a key rather than a
+    -- narrower caller: see `POST realms/{id}/invites`.
     let scopes ←
-      if guest.isSome then pure (Scopes.ofList [.read, .write])
-      else IO.ofExcept (Scopes.parse ((j.getObjValAs? String "scopes").toOption.getD "read"))
+      IO.ofExcept (Scopes.parse ((j.getObjValAs? String "scopes").toOption.getD "read"))
     let (tok, secret) ← Tokens.create ctx
       ((j.getObjValAs? String "name").toOption.getD "token") scopes
-      ((j.getObjValAs? String "expires").toOption.bind Date.ofIso?) guest
-    created (Json.mkObj [("token", Wire.tokenJson tok), ("secret", secret),
-                         ("link", Json.str (if guest.isSome then s!"/s/#{secret}" else ""))])
+      ((j.getObjValAs? String "expires").toOption.bind Date.ofIso?)
+    created (Json.mkObj [("token", Wire.tokenJson tok), ("secret", secret)])
   | "DELETE", ["tokens", id] => do
     needs .admin
     ok (Json.mkObj [("revoked", Json.bool (← Tokens.revoke ctx id))])
 
   | _, _ => return .json 404 (Json.mkObj [("error", "no such route")])
 
-/-- Runs a request, turning thrown errors into 400 replies. -/
-def handleSafe (ctx : Ctx) (caller : Caller) (r : Req) : IO Reply := do
+/--
+Runs a request, and says what to answer when it threw.
+
+Two kinds of failure, and they are told apart the way the sequencer tells them
+apart. A route that refuses its caller does it with `IO.userError`, and that
+sentence *is* the answer — "that account does not exist", "postings do not
+balance", "a realm needs a name" are the whole of what this API is for saying.
+Anything else is somebody else's business entirely: SQLite naming a table and a
+column, `IO.FS` naming a path on this machine, a transport giving up. Reflecting
+those back told whoever asked about the shape of the database and the layout of
+the disk, in exchange for nothing — nobody can act on them but the person
+running the node.
+
+So they are answered with a sentence that says nothing and an eight-character
+correlation id, and the detail goes to stderr beside that id. "Which request was
+that?" then has an answer without the answer being on the wire.
+
+The classification is by `IO.Error` kind rather than by reading the message,
+which is why `Store/Db.lean` raises what SQLite tells it as `otherError`: a
+library that happens to use `userError` for its own failures would otherwise be
+speaking in this API's voice.
+-/
+def handleSafe (ctx : Ctx) (caller : Caller) (r : Req) (node : NodeApi := {}) : IO Reply := do
   try
-    handle ctx caller r
-  catch e =>
-    return .json 400 (Json.mkObj [("error", toString e)])
+    handle ctx caller r node
+  catch
+  | .userError msg => return .json 400 (Json.mkObj [("error", msg)])
+  | e =>
+    let code := toHex (← IO.getRandomBytes 4)
+    IO.eprintln s!"api: {r.method} /{String.intercalate "/" r.segments} failed ({code}): {e}"
+    return .json 500 (Json.mkObj [("error", "the request could not be completed"),
+                                  ("code", code)])
 
 /-- The caller used when no tokens have been minted yet. -/
 def bootstrapCaller : Caller :=

@@ -1,4 +1,4 @@
-import Resources.Api.Routes
+import Resources.Node.Realms
 
 /-!
 # CLI backends
@@ -8,6 +8,14 @@ same route table the server does, so there is no second implementation to drift.
 Remote mode speaks HTTP with a bearer token — via `curl`, because `Std.Http`
 ships a server but not yet a client. Everything goes through `Backend.call`, so
 replacing `curl` with a native client later touches one function.
+
+The `curl` invocation itself is `Node.Transport.curlFetch`, which is also what
+the node talks to its sequencer with: the token travels in a config file this
+user alone can read rather than in argv, the response comes back on stdout
+rather than through a world-readable temporary file, path segments are
+percent-encoded, `--` ends the options and a plaintext transfer to anywhere but
+this machine is refused. `config.json` holds a bearer token in the clear, so it
+is written 0600 like everything else that opens a ledger.
 -/
 
 open Lean
@@ -48,11 +56,9 @@ def load : IO ClientConfig := do
            token := (← IO.getEnv "RESOURCES_TOKEN") <|> base.token
            dataDir := (← IO.getEnv "RESOURCES_DIR") <|> base.dataDir }
 
-/-- Writes the configuration file. -/
+/-- Writes the configuration file, mode 0600: it holds a bearer token in the clear. -/
 def save (c : ClientConfig) : IO Unit := do
-  let p ← path
-  IO.FS.createDirAll (p.parent.getD ".")
-  IO.FS.writeFile p ((toJson c).pretty ++ "\n")
+  Files.writeSecret (← path) ((toJson c).pretty ++ "\n")
 
 end ClientConfig
 
@@ -81,22 +87,18 @@ def patch (path : List String) (j : Json) : Call :=
   { method := "PATCH", path, body := j.compress.toUTF8,
     headers := [("content-type", "application/json")] }
 
-/-- A DELETE. -/
-def delete (path : List String) : Call := { method := "DELETE", path }
+/--
+A DELETE.
+
+It carries the JSON content type with no body, because the route table asks for
+it on everything that changes something — see `Api.mutating`. A `DELETE` from a
+browser is preflighted anyway; saying so here is what keeps the local backend and
+the remote one one command surface rather than two.
+-/
+def delete (path : List String) : Call :=
+  { method := "DELETE", path, headers := [("content-type", "application/json")] }
 
 end Call
-
-/-- Percent-encodes a query value. -/
-def urlEncode (s : String) : String := Id.run do
-  let hexDigits := "0123456789ABCDEF".toList.toArray
-  let mut out := ""
-  for b in s.toUTF8 do
-    let c := Char.ofNat b.toNat
-    if c.isAlphanum || c == '-' || c == '_' || c == '.' || c == '~' then
-      out := out.push c
-    else
-      out := out.push '%' |>.push hexDigits[b.toNat / 16]! |>.push hexDigits[b.toNat % 16]!
-  return out
 
 /-- Where CLI commands send their requests. -/
 inductive Backend
@@ -124,48 +126,18 @@ def describe : Backend → String
   | .remote base _ => s!"remote {base}"
 
 private def remoteCall (base : String) (token : Option String) (c : Call) : IO Api.Reply := do
-  let query :=
-    if c.query.isEmpty then ""
-    else "?" ++ String.intercalate "&"
-      (c.query.map fun (k, v) => urlEncode k ++ "=" ++ urlEncode v)
-  let url := base ++ "/api/v1/" ++ String.intercalate "/" c.path ++ query
-  let tmpRoot : System.FilePath := ((← IO.getEnv "TMPDIR").getD "/tmp")
-  let nonce ← freshId
-  let outPath := tmpRoot / s!"resources-out-{nonce}"
-  let bodyPath := tmpRoot / s!"resources-body-{nonce}"
-  let hasBody := c.body.size > 0
-  if hasBody then IO.FS.writeBinFile bodyPath c.body
-  let mut args := #["-s", "-S", "-X", c.method, "-o", outPath.toString, "-w", "%{http_code}"]
-  for (k, v) in c.headers do
-    args := args ++ #["-H", k ++ ": " ++ v]
-  match token with
-  | some t => args := args ++ #["-H", "authorization: Bearer " ++ t]
-  | none => pure ()
-  if hasBody then
-    args := args ++ #["--data-binary", "@" ++ bodyPath.toString]
-  args := args.push url
-  try
-    let res ← IO.Process.output { cmd := "curl", args }
-    if res.exitCode != 0 then
-      throw <| IO.userError s!"curl failed: {res.stderr}"
-    let code := (res.stdout.trimAscii.toString.toNat?).getD 0
-    let bytes ← IO.FS.readBinFile outPath
-    match String.fromUTF8? bytes with
-    | some text =>
-      match Json.parse text with
-      | .ok j => return .json code j
-      | .error _ => return .bytes code "text/plain" bytes
-    | none => return .bytes code "application/octet-stream" bytes
-  finally
-    if ← outPath.pathExists then IO.FS.removeFile outPath
-    if ← bodyPath.pathExists then IO.FS.removeFile bodyPath
+  let url := base ++ "/api/v1/" ++ Node.Transport.urlPath c.path
+    ++ Node.Transport.urlQuery c.query
+  let (code, bytes) ← Node.Transport.curlFetch
+    { url, method := c.method, headers := c.headers, token, body := c.body }
+  return Node.Transport.curlReply code bytes
 
 /-- Runs a call against this backend. -/
 def call (b : Backend) (c : Call) : IO Api.Reply := do
   match b with
   | .direct ctx =>
     let caller ←
-      if ← Tokens.anyOwn ctx then
+      if ← Tokens.any ctx then
         pure { actor := "cli", scopes := Scopes.ofList [.read, .write, .import, .admin]
                : Api.Caller }
       else pure Api.bootstrapCaller
@@ -173,7 +145,9 @@ def call (b : Backend) (c : Call) : IO Api.Reply := do
       { method := c.method, segments := c.path, body := c.body
         query := fun k => (c.query.find? (·.1 == k)).map (·.2)
         header := fun k => (c.headers.find? (·.1.toLower == k.toLower)).map (·.2) }
-    Api.handleSafe ctx caller r
+    -- A direct backend *is* the node, so it hands the routes the node's own
+    -- keys and sequencer rather than the do-nothing defaults.
+    Api.handleSafe ctx caller r Node.Realms.api
   | .remote base token => remoteCall base token c
 
 /-- Runs a call and returns its JSON, raising the API's own error message on failure. -/

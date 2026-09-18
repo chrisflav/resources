@@ -138,14 +138,11 @@ export interface Rule {
 }
 
 export interface ApiToken {
-  budget: string | null
   createdAt: string
   expiresAt: string | null
-  guest: boolean
   id: string
   lastUsedAt: string | null
   name: string
-  owner: string | null
   scopes: string
 }
 
@@ -231,4 +228,63 @@ export interface Budget {
   outstanding: Amount
   shortName: string
   standings: Standing[]
+}
+
+export interface RealmMember {
+  id: string
+  mine: boolean
+  name: string
+  role: string
+}
+
+export interface Realm {
+  admin: boolean
+  budget: string | null
+  generation: number
+  hasKey: boolean
+  id: string
+  members: RealmMember[]
+  name: string
+  unverified: boolean
+}
+
+export interface RealmMembers {
+  granted: string[] | null
+  members: RealmMember[]
+  name: string
+  realm: string
+}
+
+export interface Invite {
+  expires: string
+  for: string
+  link: string
+  name: string
+  realm: string
+  role: string
+}
+
+export interface Round {
+  applied: number
+  at: string
+  conflicts: number
+  pushed: number
+  rejected: number
+  seq: number
+  trouble: string
+  unreadable: number
+}
+
+export interface SyncStatus {
+  boxPk: string
+  configured: boolean
+  events: number
+  hash: string
+  lastRound: Round | null
+  ledger: string
+  member: string
+  pending: number
+  seq: number
+  sequencer: string
+  unverified: string[]
 }

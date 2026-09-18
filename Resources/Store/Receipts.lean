@@ -26,34 +26,6 @@ open Lean
 
 namespace Resources
 
-/--
-One priced line printed on a receipt.
-
-Amounts are signed: a till prints a correction as a negative line, and dropping
-the sign would make the lines add up to something that was never charged.
--/
-structure LineItem where
-  description : String
-  /-- How many, when the line opens with a count. -/
-  qty : Option Int := none
-  amount : Amount
-  deriving Repr, Inhabited
-
-/-- What was read off a scanned receipt. -/
-structure Extracted where
-  merchant : Option String := none
-  date : Option Date := none
-  total : Option Amount := none
-  /--
-  The priced lines, in the order they were printed. These are not required to
-  add up to `total`: a service charge, a fold in the paper or a torn corner all
-  leave a remainder, and pretending otherwise would lose the part that is known.
-  -/
-  items : List LineItem := []
-  rawText : String := ""
-  extractor : String := ""
-  deriving Repr, Inhabited
-
 /-- How to turn a file into text, and text into fields. -/
 structure ExtractorConfig where
   /-- Argv template; `{file}` is replaced with the path. -/
@@ -264,25 +236,13 @@ def items (ctx : Ctx) (sha : String) : IO (Array LineItem) := do
     { description := r.description, qty := r.qty.map (·.toInt)
       amount := ⟨Commodity.ofCode r.commodity, r.minor.toInt⟩ }
 
-private def recordFields (ctx : Ctx) (sha : String) (e : Extracted) : IO Unit :=
-  Db.exec ctx.db s!"UPDATE attachment SET
-      merchant = {Db.litOpt e.merchant},
-      doc_date = {Db.litOpt (e.date.map (·.toIso))},
-      total_minor = {(e.total.map (·.minor)).getD 0},
-      commodity = {Db.litOpt (e.total.map (·.commodity.code))},
-      raw_text = {Db.lit (Str.clamp e.rawText 20000)},
-      extractor = {Db.lit e.extractor}
-    WHERE sha256 = {Db.lit sha}"
+/-! ## What a receipt says
 
-/-- Replaces a receipt's lines, numbering them afresh so positions stay contiguous. -/
-private def writeItems (ctx : Ctx) (sha : String) (its : List LineItem) : IO Unit := do
-  Db.exec ctx.db s!"DELETE FROM attachment_item WHERE sha256 = {Db.lit sha}"
-  for (item, i) in its.zipIdx do
-    Db.exec ctx.db s!"INSERT INTO attachment_item
-      (sha256, idx, description, qty, minor, commodity)
-      VALUES ({Db.lit sha}, {i}, {Db.lit item.description},
-              {(item.qty.map toString).getD "NULL"}, {item.amount.minor},
-              {Db.lit item.amount.commodity.code})"
+Reading is SQL, because the rows are indexed and a query is the right tool for a
+question. Writing is not: what was read off a receipt, and the lines somebody
+edits afterwards, are state like anything else, so each of them is an operation
+and the tables follow.
+-/
 
 private structure TotalRow where
   totalMinor : Option Int64
@@ -331,6 +291,8 @@ def addItem (ctx : Ctx) (sha : String) (description : String) (qty : Option Int)
   let amount ← match Amount.parseDigits commodity amountText with
     | .ok a => pure a
     | .error e => throw <| IO.userError s!"{amountText}: {e}"
+  -- The operation refuses an overrun too; what it cannot say is how much room
+  -- is left, which is the part somebody correcting a typo actually needs.
   match stated with
   | some t =>
     let used := (its.toList.map (·.amount.minor)).sum
@@ -340,7 +302,7 @@ def addItem (ctx : Ctx) (sha : String) (description : String) (qty : Option Int)
            {(Amount.mk commodity (t.minor - used)).render} is left"
   | none => pure ()
   let item : LineItem := { description, qty, amount }
-  writeItems ctx sha (its.toList ++ [item])
+  discard <| ctx.commit "system" [.setReceiptLines sha (its.toList ++ [item])]
   return item
 
 /-- Removes a line by its position, as `receipt items` numbers them. -/
@@ -348,13 +310,19 @@ def removeItem (ctx : Ctx) (sha : String) (n : Nat) : IO LineItem := do
   let its ← items ctx sha
   if n < 1 || n > its.size then
     throw <| IO.userError s!"there is no line {n}; this receipt has {its.size}"
-  writeItems ctx sha (its.toList.eraseIdx (n - 1))
+  discard <| ctx.commit "system" [.setReceiptLines sha (its.toList.eraseIdx (n - 1))]
   return its[n - 1]!
 
-/-- Stores what was read off a receipt, replacing whatever was read before. -/
+/--
+Stores what was read off a receipt, replacing whatever was read before.
+
+The raw text is clamped here rather than in the operation: what it is for is
+showing somebody the page a figure came from, and a scan of a long bill would
+otherwise put a novel in every row of the table.
+-/
 def record (ctx : Ctx) (sha : String) (e : Extracted) : IO Unit := do
-  recordFields ctx sha e
-  writeItems ctx sha e.items
+  let read := { e with rawText := Str.clamp e.rawText 20000 }
+  discard <| ctx.commit "system" [.recordExtraction sha read]
 
 /-! ## Matching a receipt to spending -/
 
@@ -474,31 +442,6 @@ def toCashTransaction (ctx : Ctx) (sha : String) (from_ into : String) (actor : 
 /-! ## Dividing a payment by its printed lines -/
 
 /--
-A claim on one printed line: all of it, or a count of what it covers.
-
-A line is not always one thing. `18 FORFAIT 1/2 PENSION à 68.00` is eighteen
-nights that may belong to eighteen different people, and the bill prints them
-once. Rather than storing eighteen identical lines -- which would misdescribe
-the paper, and would force a rounding decision for a line whose total does not
-divide evenly -- a share says how many of the units it takes, and `splitParts`
-hands them out without losing a minor unit.
--/
-structure ItemShare where
-  /-- Position in the receipt's item list, numbered from one as `receipt items` shows. -/
-  line : Nat
-  /-- How many of the line's units, or all that are left of it when absent. -/
-  qty : Option Nat := none
-  deriving Repr, Inhabited
-
-/-- One part of a division: which printed lines go together, and where they belong. -/
-structure ItemGroup where
-  /-- The lines, or parts of lines, that belong together. -/
-  items : List ItemShare
-  /-- The account this part's spending belongs in. -/
-  into : String
-  deriving Repr, Inhabited
-
-/--
 Divides a payment into the things it paid for.
 
 One bill is rarely one thing, but only the payment reaches the bank, so the
@@ -511,108 +454,31 @@ remainder, because they belong to the payment and not to any one thing bought.
 def divideByItems (ctx : Ctx) (id : TxId) (groups : List ItemGroup) (actor : String) :
     IO (Array Transaction) := do
   if groups.isEmpty then throw <| IO.userError "say which lines go together: --group 1+2=Account"
-  let some t ← Txns.get? ctx id | throw <| IO.userError s!"no such transaction: {id.val}"
-  let some sha := t.attachments.head?
-    | throw <| IO.userError "this transaction has no receipt to take lines from"
-  let lines ← items ctx sha
-  if lines.isEmpty then
-    throw <| IO.userError
-      "no lines were read off that receipt; run 'resources receipt scan' on it first"
-  let commodity := lines[0]!.amount.commodity
-  let code := commodity.code
-  -- How many units a line covers, and how its total divides between them.
-  let unitsOf (n : Nat) : Nat := max 1 (((lines[n - 1]!).qty.map Int.natAbs).getD 1)
-  let partsOf (n : Nat) : List Int := splitParts (lines[n - 1]!).amount.minor (unitsOf n)
-  -- Check the whole division before writing any of it: no line may be claimed
-  -- for more than it covers, or the same money would be booked twice and the
-  -- remainder would absorb the difference in silence.
-  let mut taken : Array Nat := (List.replicate lines.size 0).toArray
+  -- The accounts the parts will be booked into, and one identifier per part
+  -- plus one for the remainder: the three things the operation cannot mint for
+  -- itself. Everything else about the division — which line covers how many
+  -- units, what is left over, whether the lines overrun the payment — is
+  -- arithmetic, and it is `Op.divideByItems` that does it.
+  let mut resolved : List ItemGroup := []
   for g in groups do
-    for sh in g.items do
-      if sh.line < 1 || sh.line > lines.size then
-        throw <| IO.userError s!"there is no line {sh.line}; this receipt has {lines.size}"
-      let units := unitsOf sh.line
-      let want := sh.qty.getD (units - taken[sh.line - 1]!)
-      if want < 1 then
-        throw <| IO.userError s!"line {sh.line}: a share has to be at least one"
-      if taken[sh.line - 1]! + want > units then
-        throw <| IO.userError
-          s!"line {sh.line} covers {units}, and {taken[sh.line - 1]! + want} are spoken for"
-      taken := taken.set! (sh.line - 1) (taken[sh.line - 1]! + want)
-  -- The lines are priced in the receipt's currency, and the parts have to be
-  -- booked in the payment's. When a Swiss bill is settled by a euro card these
-  -- differ, and nothing here knows the rate the bank used.
-  if !(t.commodityCodes.contains code) then
-    throw <| IO.userError
-      s!"this payment moved {String.intercalate ", " t.commodityCodes.eraseDups}, but the \
-         receipt is priced in {code}; dividing needs them to agree"
-  -- One account the money left, one it landed in. A transaction carrying more
-  -- than that has been merged with something, and which leg a line belongs to
-  -- is then a guess rather than a reading.
-  let accounts := (t.postings.map (·.account)).eraseDups
-  let moving := accounts.filter (fun a => t.netIn a code != 0)
-  let some src := moving.find? (fun a => t.netIn a code < 0)
-    | throw <| IO.userError s!"nothing in {code} leaves this transaction"
-  let some dst := moving.find? (fun a => t.netIn a code > 0)
-    | throw <| IO.userError s!"nothing in {code} arrives in this transaction"
-  if moving.length != 2 then
-    throw <| IO.userError
-      "dividing by lines needs one account the money left and one it landed in; \
-       this transaction touches more, so unmerge it first"
-  -- Carve from the largest leg on each side, leaving fees and the rest alone.
-  let biggest (a : AccountId) (sign : Int) : Nat := Id.run do
-    let mut best := 0
-    let mut bestMag : Int := -1
-    for (p, i) in t.postings.zipIdx do
-      if p.account == a && p.amount.commodity.code == code && sign * p.amount.minor > bestMag then
-        best := i; bestMag := sign * p.amount.minor
-    return best
-  let srcIdx := biggest src (-1)
-  let dstIdx := biggest dst 1
-  let srcPost := t.postings[srcIdx]!
-  let dstPost := t.postings[dstIdx]!
-  let mut parts : List Transaction := []
-  let mut carved : Int := 0
-  -- Hand the units out in order, so two groups claiming the same line get
-  -- different slices of it and together take exactly what the line came to.
-  let mut cursor : Array Nat := (List.replicate lines.size 0).toArray
-  for g in groups do
-    let mut amount : Int := 0
-    let mut names : List String := []
-    for sh in g.items do
-      let units := unitsOf sh.line
-      let from_ := cursor[sh.line - 1]!
-      let want := sh.qty.getD (units - from_)
-      amount := amount + (((partsOf sh.line).drop from_).take want).sum
-      cursor := cursor.set! (sh.line - 1) (from_ + want)
-      let desc := (lines[sh.line - 1]!).description
-      names := names ++ [if want == units then desc else s!"{want} × {desc}"]
     let target ← Accounts.ensure ctx g.into
-    let nid ← freshId
-    carved := carved + amount
-    parts := parts ++ [{ t with
-      id := ⟨nid⟩
-      narration := String.intercalate ", " names
-      postings :=
-        [{ srcPost with amount := ⟨commodity, -amount⟩ },
-         { dstPost with account := target.id, amount := ⟨commodity, amount⟩ }] }]
-  if carved > -srcPost.amount.minor then
-    throw <| IO.userError
-      s!"those lines come to more than the \
-         {(Amount.mk commodity (-srcPost.amount.minor)).render} this payment moved"
-  -- What no group claimed stays where it was, carrying the legs nobody divided.
-  let rest := t.postings.zipIdx.map fun (p, i) =>
-    if i == srcIdx then { p with amount := ⟨commodity, p.amount.minor + carved⟩ }
-    else if i == dstIdx then { p with amount := ⟨commodity, p.amount.minor - carved⟩ }
-    else p
-  -- When the lines account for the whole payment there is nothing left to keep.
-  -- The remainder needs an id of its own: it is a new transaction like any
-  -- other part, and reusing the original's would put it in the way of the
-  -- deletion that retires it.
-  if rest.any (fun p => p.amount.minor != 0) then
-    let rid ← freshId
-    parts := parts ++ [{ t with id := ⟨rid⟩, postings := rest }]
-  Txns.replaceWith ctx id parts actor "divide"
+    resolved := resolved ++ [{ g with into := target.id.val }]
+  let mut newIds : List TxId := []
+  for _ in [0 : groups.length + 1] do
+    newIds := newIds ++ [⟨← freshId⟩]
+  -- Read before the commit: retiring a transaction resets the staged row that
+  -- points at it, and it has to be pointed at the first part instead so the
+  -- bank line stays promoted rather than reverting to unimported.
+  let staged ← Db.rows String ctx.db
+    s!"SELECT id FROM staged_entry WHERE txn_id = {Db.lit id.val}"
+  let changes ← ctx.commit actor [.divideByItems id resolved newIds] (kind := "divide")
+    (kinds := fun x => if x == id then some "divide-away" else none)
+  let written := Change.written changes
+  if let some first := written[0]? then
+    for row in staged do
+      Db.exec ctx.db s!"UPDATE staged_entry SET state = 'promoted',
+                        txn_id = {Db.lit first.id.val} WHERE id = {Db.lit row}"
+  return written
 
 end Receipts
 
