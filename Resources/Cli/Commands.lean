@@ -2141,6 +2141,47 @@ def runMigrate (_p : Parsed) : IO UInt32 := withLocal fun ctx => do
   IO.println s!"schema version {v} at {ctx.cfg.dbPath}"
 
 /--
+Handler for `upgrade-format`: makes this store readable by a binary whose format
+has moved past the one its log was written at.
+
+Nothing is rewritten and nothing is thrown away. The log keeps every byte it
+had, still chained, still hashing to what it says; what is added beside it is a
+state to start folding from, written at the format this binary speaks. That is
+the same bargain a newcomer already makes with a checkpoint, and it is why a
+format change does not have to mean a new ledger: the identity, the order, the
+members and the links all stay exactly as they were.
+
+The state it writes down is the one in the tables, which is the projection the
+*old* binary maintained -- the only reading of those entries anybody still has.
+So this is run once, with the new binary, before anything asks the log to fold.
+-/
+def runUpgradeFormat (_p : Parsed) : IO UInt32 := withLocal (verifyChain := true) fun ctx => do
+  let boundary ← Replay.formatBoundary ctx.db
+  let (seq, _) ← EventLog.head ctx.db
+  if seq == 0 then
+    IO.println "this log is empty; there is nothing to upgrade"
+    return
+  if boundary == 0 then
+    IO.println s!"every entry in this log was written at format {Encode.formatVersion}, \
+                  which is the one this binary speaks; there is nothing to upgrade"
+    return
+  Node.Checkpoint.recordLocal ctx
+  IO.println s!"entries 1 to {boundary} were written before format {Encode.formatVersion}"
+  IO.println s!"wrote a checkpoint at entry {seq}, from the state the tables hold"
+  IO.println "the log is untouched: every entry is still there and still verifies"
+  -- The other half is for everybody else. A member joining, or replaying from
+  -- the order rather than from these tables, needs a checkpoint of their realm
+  -- published on the sequencer -- and this node cannot compute one, because
+  -- computing it means reading the very entries it has grown past.
+  match ← Node.Realms.session? ctx with
+  | none => pure ()
+  | some _ =>
+    IO.println ""
+    IO.println "this store syncs with a sequencer, and everybody else reading that ledger has"
+    IO.println "to upgrade too — each of them runs this against their own tables. A published"
+    IO.println "checkpoint cannot stand in for that yet."
+
+/--
 Handler for `rebuild`: computes the tables again from the log.
 
 This is the phase-2 claim made executable. If the events are the ledger and the
@@ -2158,8 +2199,13 @@ whose bytes have changed still stops `Replay.events` here, with the same sentenc
 -/
 def runRebuild (p : Parsed) : IO UInt32 := withLocal (verifyChain := false) fun ctx => do
   let stored ← Load.fromDb ctx.db
+  -- Folding from the beginning is what a rebuild means, and it is possible
+  -- exactly while nothing in the log was written before this binary's format.
+  -- Past that line the checkpoint is not a shortcut but the only reading there
+  -- is, so it is taken without having to be asked for.
+  let boundary ← Replay.formatBoundary ctx.db
   let (replayed, from') : State × Nat ←
-    if p.hasFlag "from-checkpoint" then Replay.stateFrom ctx.db
+    if p.hasFlag "from-checkpoint" || boundary > 0 then Replay.stateFrom ctx.db
     else do pure (← Replay.state ctx.db, 0)
   ctx.transaction do
     Project.reset ctx.db

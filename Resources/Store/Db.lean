@@ -1090,6 +1090,26 @@ CREATE INDEX budget_claim_txn ON budget_claim(txn_id);
 -- in the shared realm are the same money -- so the tables have to be able to
 -- say it too, or `rebuild` finds a difference every time.
 ALTER TABLE account ADD COLUMN mirror_of TEXT;
+"),
+  (33, "
+-- Which format an entry's bytes were written at.
+--
+-- The canonical encoding has no framing: a field added to a record makes the
+-- old bytes for it undecodable, and from inside the decoder an old shape and a
+-- corrupt one look exactly alike. That is what used to make a format change
+-- mean starting a ledger again -- the genesis could not be read by the binary
+-- that had grown past it, and a genesis is only a genesis at position 1.
+--
+-- The version does not have to live in the bytes to fix that. It lives here,
+-- beside them, outside everything the hash and the signature cover: the chain
+-- still verifies exactly as it did, and a reader can now say 'entries up to 5
+-- were written at format 7 and I speak 8' rather than 'event 1 cannot be
+-- decoded'. What it then does is fold from a checkpoint at or past the last of
+-- them, which is what `resources upgrade-format` leaves behind.
+--
+-- NULL is an entry from before this column existed, which is the same thing as
+-- an entry older than this binary's format and is treated that way.
+ALTER TABLE event ADD COLUMN format INTEGER;
 ")
 ]
 

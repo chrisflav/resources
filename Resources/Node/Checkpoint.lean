@@ -151,7 +151,23 @@ def remoteEvents (ctx : Ctx) (upTo : Nat) : IO (List Event) := do
   let rows ← Db.rows BytesRow ctx.db
     s!"SELECT bytes FROM event WHERE remote_seq >= 1 AND remote_seq <= {upTo}
        ORDER BY remote_seq"
-  return rows.toList.filterMap fun r => (Codec.decode r.bytes : Option Event)
+  let mut out : List Event := []
+  for r in rows do
+    -- Refused rather than skipped. An entry this binary cannot decode is an
+    -- entry written before its format, and folding around one would produce a
+    -- projection of a realm's history with a hole in it -- which is exactly
+    -- what a checkpoint must never be, because the whole point of publishing
+    -- one is that another reader compares it with their own and one of them is
+    -- wrong. This is the same rule `missedParts` applies to a part whose key
+    -- this node lacks, for the same reason.
+    let some e := (Codec.decode r.bytes : Option Event)
+      | throw <| IO.userError
+          "this node cannot read every entry of the shared order: some were written before \
+           the format it speaks, so it cannot say what any realm's state was at the head. \
+           A checkpoint it published from what it *can* read would be a projection with a \
+           hole in it."
+    out := out ++ [e]
+  return out
 
 /-- The hash this node stored for the envelope at a position in the remote order. -/
 def remoteHashAt (ctx : Ctx) (seq : Nat) : IO (Option String) := do

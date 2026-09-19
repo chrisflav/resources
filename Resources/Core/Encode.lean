@@ -121,6 +121,25 @@ that proof and has to make all three checks itself.
 -/
 instance : Wellformed Date := ⟨Date.inRange⟩
 
+namespace Encode
+
+/--
+The version this binary writes.
+
+It is a fact about the *bytes*, not about the ledger: a tag added to or
+renumbered within a sum, a field added to a record, a change to the primitives.
+Every event this binary appends is stamped with it, which is what lets a reader
+say "that entry was written before my format" rather than inferring it from a
+decoder that will not parse -- an old shape and a corrupt one look identical
+from inside `ofBytes`, and only one of them is somebody's fault.
+
+`conformance/format-version` is this number, and the README beside it says when
+to move it.
+-/
+def formatVersion : Nat := 8
+
+end Encode
+
 /-! ## Identifiers -/
 
 /-- Declares the codec for a string-backed identifier: the string, and nothing else. -/

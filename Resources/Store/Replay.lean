@@ -68,10 +68,12 @@ def append (db : SQLite) (e : Event) : IO (Nat × String) := do
   let bytes := Encode.eventBytes e
   let hash := Encode.hashEvent e
   let next := seq + 1
+  -- Stamped with the format that wrote it, which is the one thing about an entry
+  -- that its own bytes cannot say.
   Db.execBlob db s!"INSERT INTO event
-    (seq, id, author, composed_at, based_on, prev_hash, hash, bytes)
+    (seq, id, author, composed_at, based_on, prev_hash, hash, bytes, format)
     VALUES ({next}, {Db.lit e.id}, {Db.lit e.author.val}, {Db.lit e.composedAt},
-            {e.basedOn}, {Db.lit prev}, {Db.lit hash}, ?)" bytes
+            {e.basedOn}, {Db.lit prev}, {Db.lit hash}, ?, {Encode.formatVersion})" bytes
   Db.exec db s!"INSERT INTO ledger_head (id, seq, hash) VALUES (1, {next}, {Db.lit hash})
     ON CONFLICT(id) DO UPDATE SET seq = excluded.seq, hash = excluded.hash"
   return (next, hash)
@@ -185,6 +187,21 @@ def eventsAfter (db : SQLite) (after : Nat) (prevHash : String) : IO (Array Even
 /-- Every event in the log, in order, with the chain checked from its first link. -/
 def events (db : SQLite) : IO (Array Event) := eventsAfter db 0 EventLog.zeroHash
 
+/--
+The last entry written before this binary's format, or zero when there is none.
+
+`format` is NULL for everything appended before the column existed, which is the
+same thing as an entry this binary's decoder has grown past: both are entries
+whose bytes are still in the chain, still hash to what the log says, and no
+longer parse. What they are *not* is corrupt, and this is the only place that
+difference can be seen -- from inside `ofBytes` the two are identical.
+-/
+def formatBoundary (db : SQLite) : IO Nat := do
+  let seq ← Db.scalarInt db
+    s!"SELECT IFNULL(MAX(seq), 0) FROM event
+       WHERE format IS NULL OR format < {Encode.formatVersion}"
+  return seq.toNat
+
 /-- The sequence number and hash `ledger_head` claims, if the row is there. -/
 private structure HeadRow where
   seq : Int64
@@ -251,6 +268,22 @@ def state (db : SQLite) : IO State := do
   return Resources.replay log.toList
 
 /--
+The sentence to refuse with when the fold cannot start where it has to.
+
+A log whose older entries predate this binary's format can still be *checked* --
+the chain is over bytes and needs no decoder -- but it cannot be folded from the
+beginning by anything that has grown past it. What stands in for those entries
+is a checkpoint at or past the last of them: a state somebody who could read
+them wrote down, which is the same bargain a newcomer already makes.
+-/
+def beyondFormat (boundary : Nat) : String :=
+  s!"the first {boundary} entries of this log were written before format \
+     {Encode.formatVersion}, which this binary speaks, and no checkpoint covers them. \
+     Their bytes are intact and the chain still verifies; what is missing is a state to \
+     start folding from. 'resources upgrade-format' writes one at the head, from the \
+     tables, and nothing has to be re-entered."
+
+/--
 The state the log adds up to, starting from the stored snapshot if there is one.
 
 The saving is the fold, not the reading: the events before the checkpoint stay
@@ -268,9 +301,17 @@ Returns the state and the position it started folding from, which is 0 when it
 folded everything.
 -/
 def stateFrom (db : SQLite) : IO (State × Nat) := do
-  let fallback : IO (State × Nat) := do return (← state db, 0)
+  -- Folding everything is the right answer whenever it is possible, and it is
+  -- possible exactly when nothing in the log predates this binary's format.
+  -- Past that line it is not a fallback at all, and saying so is better than a
+  -- decoder failing three screens later on a byte string nobody has touched.
+  let boundary ← formatBoundary db
+  let fallback : IO (State × Nat) := do
+    if boundary > 0 then throw <| IO.userError (beyondFormat boundary)
+    return (← state db, 0)
   let some cp ← Checkpoints.get? db "" | fallback
   if cp.seq == 0 then fallback
+  else if cp.seq < boundary then fallback
   else if Sha256.hexBytes cp.bytes != cp.stateHash then fallback
   else
     let some (start : State) := (Codec.decode cp.bytes : Option State) | fallback

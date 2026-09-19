@@ -1295,6 +1295,16 @@ def migrateCmd := `[Cli|
   "Opens the store, applying any pending migrations."
 ]
 
+def upgradeFormatCmd := `[Cli|
+  "upgrade-format" VIA runUpgradeFormat;
+  "Makes a store readable by a binary whose byte format has moved past the one \
+   its log was written at. Nothing is rewritten and nothing is deleted: the log \
+   keeps every byte, still chained and still verifying, and what is written \
+   beside it is a state to start folding from — which is what a checkpoint has \
+   always been. The ledger keeps its identity, its order and its members, so a \
+   format change costs a command rather than a new ledger and new links."
+]
+
 def rebuildCmd := `[Cli|
   rebuild VIA runRebuild;
   "Throws the projected tables away and computes them again from the event log."
@@ -1349,7 +1359,7 @@ def resourcesCmd : Cmd := `[Cli|
     claimCmd; tagFeesCmd;
     serveCmd; sequencerCmd; nodeCmd; identityCmd; syncCmd; realmCmd; checkpointCmd; blobCmd;
     statusCmd; migrateCmd;
-    rebuildCmd;
+    rebuildCmd; upgradeFormatCmd;
     genTypesCmd; genVectorsCmd; apiCmd
 ]
 

@@ -210,11 +210,20 @@ export interface Gap {
  * this refusal; what follows says which entry and which generation, because a
  * reader who is told only that something is missing cannot ask anybody for the
  * right thing.
+ *
+ * Two things put an entry out of reach and the answer to both is the same
+ * checkpoint: a part sealed under a key this browser was never given, and a
+ * part written before the byte format this browser speaks. From in here they
+ * are indistinguishable — an old shape and a wrong key both come out of
+ * `openPart`/`decode` as a failure — so the sentence names both rather than
+ * guessing which.
  */
 export function gapMessage(gap: Gap): string {
   return (
     `cannot verify: no checkpoint covers the parts you cannot read — entry ${gap.seq} of this ` +
-    `realm is sealed under generation ${gap.generation}, which this browser holds no key for`
+    `realm is sealed under generation ${gap.generation}, which this browser either holds no ` +
+    'key for or cannot read at the byte format it speaks. Whoever administers the realm can ' +
+    'publish a checkpoint past it, and an older client is upgraded rather than re-invited'
   )
 }
 

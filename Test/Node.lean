@@ -947,6 +947,52 @@ def nodeTests (r : Report) : IO Report := do
       (← Db.scalarInt a.ctx.db "SELECT COUNT(*) FROM event")
       ((← EventLog.head a.ctx.db).1)
 
+    /- ## A log written before the format this binary speaks
+
+    A format change used to mean a new ledger: the genesis could not be read by
+    a binary that had grown past it, and a genesis is only a genesis at position
+    1. What makes that unnecessary is that "which format wrote this" is a fact
+    about the *row* rather than about the bytes -- kept beside them, outside
+    everything the hash and the signature cover -- so a reader can say "these
+    entries predate me" instead of "event 1 cannot be decoded", and fold from a
+    checkpoint at or past the last of them. Every byte stays where it was. -/
+    let beforeUpgrade ← a.ctx.state.get
+    Db.exec a.ctx.db "UPDATE event SET format = NULL"
+    let boundary ← Replay.formatBoundary a.ctx.db
+    r := checkEq r "every entry written before this format is behind the boundary"
+      boundary ((← EventLog.head a.ctx.db).1)
+    -- The checkpoint from the section above is at an earlier position than the
+    -- boundary, so it does not cover it and is not accepted in its place.
+    Checkpoints.put a.ctx.db "" (boundary - 1) (Encode.hashState beforeUpgrade)
+      (Codec.encode beforeUpgrade)
+    let short ← try
+      let _ ← Replay.stateFrom a.ctx.db
+      pure false
+    catch _ => pure true
+    r := check r "a checkpoint that stops short of the boundary is not a way to read the log"
+      short
+    -- What `upgrade-format` writes: a checkpoint at the head, from the tables.
+    Node.Checkpoint.recordLocal a.ctx
+    let (upgraded, startedFrom) ← Replay.stateFrom a.ctx.db
+    r := checkEq r "with one at the head the log reads again, from there"
+      startedFrom ((← EventLog.head a.ctx.db).1)
+    r := check r "and it reads to exactly the state the tables held"
+      (upgraded == beforeUpgrade)
+    r := checkEq r "the entries it covers are untouched: every one still in the log"
+      (← Db.scalarInt a.ctx.db "SELECT COUNT(*) FROM event")
+      ((← EventLog.head a.ctx.db).1)
+    r := checkEq r "and the chain over them still verifies, which needs no decoder at all"
+      (← Replay.chainError? a.ctx.db) none
+    -- Written after the upgrade, so stamped with this format and folded as the
+    -- tail of the checkpoint.
+    discard <| a.ctx.commit "test"
+      [.putLabel { id := ⟨"lbl-after"⟩, name := "after-the-upgrade" }]
+    let (later, _) ← Replay.stateFrom a.ctx.db
+    r := check r "and what is written afterwards folds onto it"
+      ((later.label? ⟨"lbl-after"⟩).isSome)
+    r := checkEq r "the boundary does not move for an entry written at this format"
+      (← Replay.formatBoundary a.ctx.db) boundary
+
     /- ## A race the node will not settle by itself
 
     `Rebase.check` is a decision about syntax, and it is conservative on

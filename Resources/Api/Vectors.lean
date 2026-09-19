@@ -1644,8 +1644,8 @@ def misfits : List String :=
 
 /-! ## The files -/
 
-/-- The version the format carries. Bumped by the rules the README states. -/
-def formatVersion : Nat := 8
+/-- The version the format carries, which is the one the encoder stamps events with. -/
+def formatVersion : Nat := Encode.formatVersion
 
 /-- A string, escaped the way JSON escapes one. -/
 private def jsonStr (s : String) : String := (Lean.Json.str s).compress
