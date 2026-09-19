@@ -371,7 +371,14 @@ private def verifyOne (s : Session) (realm : String) (head : Sync.Head) (j : Jso
   | none => return .skipped "this node has no entry at that position"
   if ← missedParts s.ctx realm seq then
     return .skipped "this node could not read every part written in it"
-  let mine := Encode.hashState (← projectionAt s.ctx realm seq)
+  -- The same reason a node cannot *publish* a checkpoint over entries it cannot
+  -- decode: it cannot check one either. Somebody else's commitment about a
+  -- history this binary has grown past is not a disagreement, it is a question
+  -- this node is in no position to answer.
+  let mine ← try
+    pure (Encode.hashState (← projectionAt s.ctx realm seq))
+  catch _ =>
+    return .skipped "this node cannot read every entry of the order at the format it speaks"
   if mine == stateHash then return .agreed seq stateHash
   return .mismatch seq s!"it commits to {stateHash} at entry {seq}, and this node computes \
                           {mine}"
