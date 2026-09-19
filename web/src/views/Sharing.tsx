@@ -530,17 +530,31 @@ export default function Sharing({
       members.reload()
     })
 
-  const syncNow = () =>
-    guard(async () => {
-      const r = await api.syncNow()
-      setNotice(
-        r.trouble ||
-          `${r.applied} in, ${r.pushed} out; the shared order stands at entry ${r.seq}`,
-      )
+  // Said beside the button as well as at the top of the page. A round is run
+  // from the bottom of a long two-column view, and a banner above the fold that
+  // the reader never scrolls back to is indistinguishable from a button that
+  // does nothing — which is exactly how a failing round looked.
+  const [syncSaid, setSyncSaid] = useState<{ trouble: boolean; text: string } | null>(null)
+
+  const syncNow = async () => {
+    setSyncSaid(null)
+    await guard(async () => {
+      try {
+        const r = await api.syncNow()
+        const text =
+          r.trouble || `${r.applied} in, ${r.pushed} out; the shared order stands at entry ${r.seq}`
+        setSyncSaid({ trouble: r.trouble !== '', text })
+        setNotice(text)
+      } catch (e) {
+        const text = e instanceof Error ? e.message : String(e)
+        setSyncSaid({ trouble: true, text })
+        throw e
+      }
       sync.reload()
       realms.reload()
       budgets.reload()
     })
+  }
 
   const writeUp = () =>
     guard(async () => {
@@ -1336,9 +1350,12 @@ export default function Sharing({
                   </div>
                   <div className="row">
                     <button className="btn quiet" disabled={busy} onClick={() => void syncNow()}>
-                      Sync now
+                      {busy ? 'Syncing…' : 'Sync now'}
                     </button>
                   </div>
+                  {syncSaid && (
+                    <div className={syncSaid.trouble ? 'error' : 'muted'}>{syncSaid.text}</div>
+                  )}
                 </>
               ) : (
                 <div className="muted">
