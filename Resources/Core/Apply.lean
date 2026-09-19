@@ -1803,10 +1803,25 @@ def applyChecked (s : State) (author : MemberId) (realm : RealmId) (op : Op) :
     -- are, and for nothing else.
     --
     -- "Who they are" is the whole of it, and the party is part of who they are.
-    -- A self-introduction naming somebody else's party — or the ledger's own —
-    -- would attribute the newcomer's spending to that person in every budget
-    -- standing and every invoice, so a newcomer may only name a party nobody
-    -- has yet, or the one already recorded for them.
+    -- A self-introduction naming somebody else's party would attribute the
+    -- newcomer's spending to that person in every budget standing and every
+    -- invoice, so a newcomer may only name a party nobody has yet, or the one
+    -- already recorded for them.
+    --
+    -- `Party.selfId` is the one party name that means somebody different to
+    -- every reader: it is whoever is reading. A ledger's owner writes it for
+    -- themselves and it says "me" there, which is what `Account.mine` tests;
+    -- the same record read by anybody else would hand them the author's
+    -- spending in every budget standing and every invoice. So it is a name
+    -- only the node whose books these are may use. Written by anybody else it
+    -- is read as a party of that member's own, keyed by their key: the record
+    -- says "the person this key belongs to", and away from home that is what
+    -- it means. Whose books these are is not a question about the reader but
+    -- about the state they hold — nobody else administers the realm a ledger
+    -- keeps for itself — so every reader of one log reads it the same way.
+    let m := if m.party == Party.selfId && !s.canAdminister author Realm.selfId then
+        { m with party := ⟨m.id.val⟩ }
+      else m
     if !s.canAdminister author realm then
       match s.member? m.id with
       | some existing =>
@@ -1816,11 +1831,8 @@ def applyChecked (s : State) (author : MemberId) (realm : RealmId) (op : Op) :
         if existing.party != m.party then
           throw "a member cannot change the party their spending lands on"
       | none =>
-        -- A newcomer. `Party.selfId` is what `Account.mine` tests, so taking it
-        -- would make their spending the ledger owner's; taking somebody else's
-        -- would attribute it to that person in every budget standing.
-        if m.party == Party.selfId then
-          throw "a member cannot introduce themselves as the ledger's own party"
+        -- A newcomer. Taking somebody else's party would attribute their
+        -- spending to that person in every budget standing and every invoice.
         if (sortedValues s.members).any (fun x => x.party == m.party) then
           throw "that party is already somebody else's"
         if (s.party? m.party).isSome then

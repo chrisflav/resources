@@ -114,6 +114,7 @@ import {
   minYear,
   selfMemberId,
   selfPartyId,
+  selfRealmId,
 } from './types'
 
 /** What applying one part came to. */
@@ -2402,48 +2403,58 @@ function run(s: State, author: string, realm: string, op: Op): [State, Change[]]
       // who they are, and for nothing else.
       //
       // "Who they are" is the whole of it, and the party is part of who they
-      // are. A self-introduction naming somebody else's party — or the ledger's
-      // own — would attribute the newcomer's spending to that person in every
-      // budget standing and every invoice, so a newcomer may only name a party
-      // nobody has yet, or the one already recorded for them.
+      // are. A self-introduction naming somebody else's party would attribute
+      // the newcomer's spending to that person in every budget standing and
+      // every invoice, so a newcomer may only name a party nobody has yet, or
+      // the one already recorded for them.
+      //
+      // `selfPartyId` is the one party name that means somebody different to
+      // every reader: it is whoever is reading. A ledger's owner writes it for
+      // themselves and it says "me" there, which is what `accountIsMine`
+      // tests; the same record read by anybody else would hand them the
+      // author's spending in every budget standing and every invoice. So it is
+      // a name only the node whose books these are may use. Written by anybody
+      // else it is read as a party of that member's own, keyed by their key.
+      // Whose books these are is not a question about the reader but about the
+      // state they hold — nobody else administers the realm a ledger keeps for
+      // itself — so every reader of one log reads it the same way.
+      const member =
+        op.member.party === selfPartyId && !canAdminister(s, author, selfRealmId)
+          ? { ...op.member, party: op.member.id }
+          : op.member
       if (!canAdminister(s, author, realm)) {
-        const existing = memberOfId(s, op.member.id)
+        const existing = memberOfId(s, member.id)
         if (existing !== null) {
           // Somebody the ledger already knows is saying so again, which is what
           // the owner of a ledger does when they open a second realm. The party
           // is the one thing they may not revise.
-          if (existing.party !== op.member.party) {
+          if (existing.party !== member.party) {
             throw new Error('a member cannot change the party their spending lands on')
           }
         } else {
-          // A newcomer. `selfPartyId` is what `accountIsMine` tests, so taking
-          // it would make their spending the ledger owner's; taking somebody
-          // else's would attribute it to that person in every budget standing.
-          if (op.member.party === selfPartyId) {
-            throw new Error('a member cannot introduce themselves as the ledger\'s own party')
-          }
-          if (sortedValues(s.members).some((x) => x.party === op.member.party)) {
+          // A newcomer. Taking somebody else's party would attribute their
+          // spending to that person in every budget standing and every invoice.
+          if (sortedValues(s.members).some((x) => x.party === member.party)) {
             throw new Error('that party is already somebody else\'s')
           }
-          if (partyOfId(s, op.member.party) !== null) {
+          if (partyOfId(s, member.party) !== null) {
             throw new Error('that party is already in the books; an admin has to write you in')
           }
         }
       }
       const st = cloneState(s)
-      st.members.set(op.member.id, op.member)
-      if (partyOfId(s, op.member.party) !== null) {
-        return [st, [{ tag: 1, kind: 'member', member: op.member }]]
+      st.members.set(member.id, member)
+      if (partyOfId(s, member.party) !== null) {
+        return [st, [{ tag: 1, kind: 'member', member }]]
       }
       // A member names the party their own spending lands on, and a remote
-      // reader has no other record of a newcomer. Writing the party here is what
-      // keeps that reference from dangling for everybody downstream.
-      // A member names the party their own spending lands on, and it is written
-      // in the realm the part names — the one everybody who can read this can
-      // read.
+      // reader has no other record of a newcomer. Writing the party here is
+      // what keeps that reference from dangling for everybody downstream, and
+      // it is written in the realm the part names — the one everybody who can
+      // read this can read.
       const party: Party = {
-        id: op.member.party,
-        name: op.member.name,
+        id: member.party,
+        name: member.name,
         iban: null,
         email: null,
         note: null,
@@ -2455,7 +2466,7 @@ function run(s: State, author: string, realm: string, op: Op): [State, Change[]]
         st,
         [
           { tag: 7, kind: 'party', party },
-          { tag: 1, kind: 'member', member: op.member },
+          { tag: 1, kind: 'member', member },
         ],
       ]
     }

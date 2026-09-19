@@ -1228,10 +1228,12 @@ private def rightsScenarios : List Scenario :=
       (.recordImportBatch { id := ⟨"bat-x"⟩, profile := "dkb", filename := none
                             account := none, stamp := "", total := 0, duplicates := 0 }) true
     -- Members and realms: what a newcomer may say about themselves.
-  , asMember "refuses-a-newcomer-taking-the-ledgers-party"
-      "A member's party is what their spending is attributed to, so it may not be yours."
+  , asMember "reads-a-newcomers-claim-on-the-ledgers-party-as-their-own"
+      "A member's party is what their spending is attributed to, and the ledger's own party \
+       is whoever is reading, so a record naming it that this node did not write is read as \
+       a party of that member's own, keyed by their key."
       ⟨"zoe"⟩ base
-      (.addMember { id := ⟨"zoe"⟩, name := "Zoe", party := Party.selfId }) true
+      (.addMember { id := ⟨"zoe"⟩, name := "Zoe", party := Party.selfId })
   , asMember "refuses-a-newcomer-taking-somebody-elses-party"
       "Nor anybody else's: it would put their movements in that person's standing."
       ⟨"zoe"⟩ base

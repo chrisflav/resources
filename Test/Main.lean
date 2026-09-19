@@ -2438,11 +2438,37 @@ private def coreTests (r : Report) : Report := Id.run do
     (Str.containsCI (coreError viewer (.rotateRealmKey ⟨"realm-other"⟩))
       "only change the realm it names")
   -- A self-introduction is about who you are, and the party is part of that.
-  r := check r "a newcomer may not introduce themselves as the ledger's own party"
-    (Str.containsCI
-      (coreErrorAs "zoe" Realm.selfId s0
-        (.addMember { id := ⟨"zoe"⟩, name := "Zoe", party := Party.selfId }))
-      "ledger's own party")
+  r := check r "a newcomer naming the ledger's own party is read as a party of their own"
+    (match applyOp s0 ⟨"zoe"⟩ Realm.selfId
+        (.addMember { id := ⟨"zoe"⟩, name := "Zoe", party := Party.selfId }) with
+     | .ok (s', _) =>
+       ((s'.member? ⟨"zoe"⟩).map (·.party) == some ⟨"zoe"⟩)
+         && ((s'.party? ⟨"zoe"⟩).map (·.name) == some "Zoe")
+     | .error _ => false)
+  -- And the whole of a shared realm's history, read by somebody who was not
+  -- there: the four parts a node writes when it opens a realm to share a budget
+  -- in, replayed from nothing the way a guest replays them.
+  let sharedRealm : RealmId := ⟨"realm-shared"⟩
+  let hostParts : List Op :=
+    [ .addMember { id := ⟨"host"⟩, name := "me", party := Party.selfId }
+    , .createRealm { id := sharedRealm, name := "Trip"
+                     members := [(⟨"host"⟩, .admin)], generation := 0 }
+    , .grant sharedRealm ⟨"host"⟩ .admin (coreAccount "acc-host" "Assets.Purse.me.Trip" .asset)
+    , .openBudget { id := ⟨"b-trip"⟩, name := "Trip", note := none, closed := false }
+        (coreAccount "acc-trip" "Trip" .equity) ]
+  let asGuest : Except String State :=
+    hostParts.foldlM (fun st op => (applyOp st ⟨"host"⟩ sharedRealm op).map (·.1)) State.init
+  r := check r "a guest replays the whole history of a realm somebody else opened"
+    (match asGuest with
+     | .ok st =>
+       ((st.realm? sharedRealm).map (·.name) == some "Trip")
+         && ((st.member? ⟨"host"⟩).map (·.party) == some ⟨"host"⟩)
+         && ((st.budget? ⟨"b-trip"⟩).map (·.realm) == some sharedRealm)
+     | .error _ => false)
+  r := check r "and the purse the realm's own admin holds there is not the guest's"
+    (match asGuest with
+     | .ok st => (st.account? ⟨"acc-host"⟩).map (·.mine) == some false
+     | .error _ => false)
   r := check r "nor as somebody else's"
     (Str.containsCI
       (coreErrorAs "zoe" Realm.selfId viewer
