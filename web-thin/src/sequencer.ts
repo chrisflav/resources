@@ -227,6 +227,17 @@ export interface Session {
  * after an hour, and a client that has to authenticate again loses a round trip
  * and nothing else.
  */
+/**
+ * Whether a path is one of the two a non-member may ask about a ledger.
+ *
+ * Everything not under `ledgers/` is unscoped — health, the challenge, the
+ * token — and open to anybody.
+ */
+export function openBeforeJoining(path: string): boolean {
+  if (!path.startsWith('ledgers/')) return true
+  return path.endsWith('/redeem') || path.endsWith('/join')
+}
+
 export class Sequencer {
   private token: string | null = null
 
@@ -267,6 +278,28 @@ export class Sequencer {
     }
   }
 
+  /**
+   * Whether this client is still outside the ledger it is talking to.
+   *
+   * A sequencer answers a non-member asking anything about a ledger with *no
+   * such ledger*, deliberately: "there is no such ledger" and "that one is not
+   * yours" have to be the same answer, or the names people choose can be
+   * enumerated. Exactly two routes are open before membership, and they are the
+   * two halves of spending an invite.
+   *
+   * So a join that asks a ledger-scoped question first does not get a diagnosis
+   * — it is told the ledger does not exist, which sends the reader looking for
+   * a link that was never wrong. This client used to publish its agreement key
+   * before joining and failed in exactly that way, so the rule is a flag rather
+   * than a comment: set while joining, cleared by the join itself.
+   */
+  private joining = false
+
+  /** Marks this client as outside the ledger until `join` succeeds. */
+  notAMemberYet(): void {
+    this.joining = true
+  }
+
   /** The bearer token in play, if any. */
   get session(): string | null {
     return this.token
@@ -297,6 +330,14 @@ export class Sequencer {
     } else if (opts.body !== undefined) {
       headers['content-type'] = 'application/json'
       body = JSON.stringify(opts.body)
+    }
+    if (this.joining && !openBeforeJoining(path)) {
+      throw new SeqError(
+        `this client asked the sequencer about ledger data before it had joined: '${path}'. ` +
+          'Only redeeming an invite and the join itself are open to a non-member; anything ' +
+          'else is answered "no such ledger" whether or not there is one.',
+        0,
+      )
     }
     const res = await fetch(`${this.base}/${path}${query}`, { method, headers, body })
     const text = await res.text()
@@ -607,6 +648,8 @@ export class Sequencer {
         },
       },
     )
+    // In, so everything else about this ledger is open from here.
+    this.joining = false
     return {
       generation: Number(j.generation ?? 0),
       grant: grantOfJson((j.grant ?? {}) as Record<string, unknown>),

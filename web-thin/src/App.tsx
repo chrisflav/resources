@@ -561,6 +561,10 @@ function Join({
       const inviteSignPk = toHex(keys.signPk)
       const identity = generateIdentity()
       const seq = new Sequencer()
+      // Outside the ledger until the join goes through, and the client holds
+      // itself to that: anything ledger-scoped asked before then is refused
+      // here, with the reason, rather than coming back as "no such ledger".
+      seq.notAMemberYet()
       const health = await seq.health()
       seq.checkOrigin(health.origin, 'health route')
       const c = await seq.challenge(identity.id)
@@ -591,11 +595,21 @@ function Join({
       if (realmKeyHash(realmKey) !== invite.keyHash) {
         throw new Error('the key this invite opens is not the one the link names')
       }
-      // This member's own agreement key, published with their own signature,
-      // before anything is sealed to it — including by them.
-      await publishOwnBoxPk(seq, identity, ledger)
-      const mine = await verifiedBoxPk(seq, ledger, identity.id)
-      const wrapped = wrapKey(realmKey, mine)
+      // Sealed to this browser's own agreement key, which it generated a moment
+      // ago and holds in hand. Reading it back off the sequencer first — which
+      // is what this did — asks a *ledger-scoped* question, and the one thing a
+      // joiner is not yet is a member of the ledger: `GET ledgers/…/members`
+      // answers a non-member with "no such ledger", deliberately, so that names
+      // cannot be enumerated. So every join through this client failed on the
+      // step before the join, with a sentence about the ledger not existing.
+      //
+      // Nothing is lost by sealing to it directly. The check that round trip
+      // performed is that the server has not substituted somebody's published
+      // key for one of its own, which is worth doing when sealing to *another*
+      // member — and is vacuous for a key this browser made itself. The key is
+      // published once the join has made a member record to publish it on,
+      // which is the order `Node/Sync.lean` has always used.
+      const wrapped = wrapKey(realmKey, identity.boxPk)
       // The grant a joiner writes is the one case where a grant's issuer is its
       // holder, and it is sound because the key inside it is one they already
       // hold: the invite handed it to them, and re-sealing it to themselves
@@ -658,6 +672,10 @@ function Join({
       if (guest) saveGuestIdentity(identity)
       else saveIdentity(identity, passphrase)
       saveRealmRef(ref)
+      // Now a member, so now there is a member record to publish a key on —
+      // which is what lets anybody else seal anything to this browser later,
+      // and is the step that cannot be taken before the join.
+      await publishOwnBoxPk(seq, identity, ledger)
       window.history.replaceState(null, '', '/')
       // The sequencer now holds a grant, which is what let this part through;
       // the realm's own history still says nothing about the newcomer. These

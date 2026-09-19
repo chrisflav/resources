@@ -18,7 +18,7 @@
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { toHex } from './bytes'
 import { generateIdentity, ready, signBoxPk } from './crypto'
-import { SeqError, Sequencer } from './sequencer'
+import { SeqError, Sequencer, openBeforeJoining } from './sequencer'
 import {
   loadRealmRef,
   noteKeyGeneration,
@@ -26,6 +26,38 @@ import {
   seenKeyGeneration,
 } from './store'
 import { verifiedBoxPk } from './App'
+
+describe('what a client may ask before it has joined', () => {
+  it('names the two routes that are open to a non-member', () => {
+    expect(openBeforeJoining('health')).toBe(true)
+    expect(openBeforeJoining('challenge')).toBe(true)
+    expect(openBeforeJoining('ledgers/home/realms/r/invites/ab/redeem')).toBe(true)
+    expect(openBeforeJoining('ledgers/home/realms/r/join')).toBe(true)
+    expect(openBeforeJoining('ledgers/home/members')).toBe(false)
+    expect(openBeforeJoining('ledgers/home/head')).toBe(false)
+    expect(openBeforeJoining('ledgers/home/realms/r/checkpoint')).toBe(false)
+  })
+
+  it('refuses the question itself rather than letting the server say "no such ledger"', async () => {
+    const seq = new Sequencer('/seq/v2')
+    seq.notAMemberYet()
+    const original = globalThis.fetch
+    let asked = 0
+    globalThis.fetch = (async () => {
+      asked += 1
+      return new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+    try {
+      // This is the call the join used to make first, and the sequencer's
+      // answer to it — "no such ledger" — sent everybody looking for a bad
+      // link. It does not reach the sequencer at all now.
+      await expect(seq.members('home')).rejects.toThrow(/before it had joined/)
+      expect(asked).toBe(0)
+    } finally {
+      globalThis.fetch = original
+    }
+  })
+})
 
 describe('the origin a client dialled', () => {
   it('is the origin of the base URL, resolved against the page', () => {
