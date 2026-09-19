@@ -226,12 +226,13 @@ def heldRealms (s : Session) : IO (Array String) := do
 /--
 Computes a realm's projection, seals it, signs the commitment and PUTs it.
 
-The three refusals are three different things and are answered differently. A
-realm this node holds no key for is not this node's to commit to. A realm whose
-history this node has holes in is one it cannot honestly speak about — see the
-header. And a sequencer that says no is a fact worth reporting, never a reason
-to stop the round: a checkpoint is an optimisation for other readers, and a node
-that failed to publish one has still pushed and pulled everything.
+The refusals are different things and are answered differently. A realm this
+node holds no key for is not this node's to commit to. A realm whose history
+this node has holes in — a part it could not open, or one written before the
+format it speaks — is one it cannot honestly speak about; see the header. And a
+sequencer that says no is a fact worth reporting, never a reason to stop the
+round: a checkpoint is an optimisation for other readers, and a node that failed
+to publish one has still pushed and pulled everything.
 -/
 def publish (s : Session) (realm : String) (head : Sync.Head) : IO Outcome := do
   let some (generation, key) ← Keys.latest s.keys realm
@@ -239,7 +240,14 @@ def publish (s : Session) (realm : String) (head : Sync.Head) : IO Outcome := do
   if head.seq == 0 then return .skipped "the order is empty"
   if ← missedParts s.ctx realm head.seq then
     return .skipped "this node could not read every part written in it"
-  let projected ← projectionAt s.ctx realm head.seq
+  -- A fourth refusal, and the same kind as the second: entries written before
+  -- the format this binary speaks are history it cannot honestly speak about
+  -- either. Skipped rather than raised, because a round that pushed and pulled
+  -- everything has done its job whether or not a checkpoint came out of it.
+  let projected ← try
+    projectionAt s.ctx realm head.seq
+  catch _ =>
+    return .skipped "this node cannot read every entry of the order at the format it speaks"
   let bytes := Codec.encode projected
   let stateHash := Encode.hashState projected
   let nonce ← s.suite.randomBytes s.suite.nonceSize
