@@ -102,6 +102,22 @@ inductive Op
   | reopenBudget (budget : BudgetId)
   /-- Removes a budget. -/
   | deleteBudget (budget : BudgetId)
+  /--
+  Takes a cost of a budget: says that it was yours to bear.
+
+  For yourself and nobody else -- the author of the part is who the claim is
+  recorded against -- and only while the budget is open. Several people taking
+  one cost is that cost split equally between them; a cost nobody takes is
+  divided among the participants by weight, which is what a budget did before
+  anybody could take anything.
+  -/
+  | claimCost (budget : BudgetId) (txn : TxId)
+  /--
+  Gives a cost back: your own, or -- for an admin of the budget's realm --
+  anybody's, because somebody has to be able to correct a list people filled in
+  themselves.
+  -/
+  | releaseCost (budget : BudgetId) (txn : TxId) (member : MemberId)
   -- Invoices
   /-- Issues an invoice; its number comes from the counters inside `applyOp`. -/
   | issueInvoice (inv : Invoice) (sources : List TxId)
@@ -238,6 +254,9 @@ def Op.rights : Op → Rights
   -- Budgets
   | .openBudget .. | .setParticipants .. | .contribute .. | .allocate .. | .settle ..
   | .closeBudget .. | .reopenBudget _ | .deleteBudget _ => .admin
+  -- Taking a cost and giving it back are what everybody in the realm is there to
+  -- do, and `applyOp` checks that they take it for themselves.
+  | .claimCost .. | .releaseCost .. => .member
   -- Invoices
   | .issueInvoice .. | .setInvoiceStatus .. | .settleInvoice .. | .deleteInvoice _ => .admin
   -- Attachments
@@ -278,6 +297,15 @@ def maxQty : Nat := 100000
 
 /-- The largest weight a participant's share may carry. -/
 def maxWeight : Nat := 10000
+
+/--
+The most claims one budget may carry.
+
+One per person per cost, and a budget holds costs and people in numbers a person
+chose; this is what a long trip between a large group honestly comes to, and it
+bounds the fold a division does over them.
+-/
+def maxClaims : Nat := 2000
 
 /-- The longest an identifier or a name may be. -/
 def maxIdLength : Nat := 200

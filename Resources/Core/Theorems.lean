@@ -1282,6 +1282,10 @@ theorem inv_applyOp {s s' : State} {author : MemberId} {r : RealmId} {op : Op} {
   | recordExtraction sha e => plain_op hok h
   | setReceiptLines sha items => plain_op hok h
   | forgetBlob sha => plain_op hok h
+  -- Taking a cost and giving it back write a budget and nothing else: what they
+  -- say is whose a cost was, not where any money went.
+  | claimCost budget txn => plain_op hok h
+  | releaseCost budget txn member => plain_op hok h
   | recordImportBatch b => plain_op hok h
   | addMember m => plain_op hok h
   | removeMember id => plain_op hok h

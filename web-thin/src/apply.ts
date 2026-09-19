@@ -102,6 +102,7 @@ import {
   claimTag,
   maxExponent,
   maxIdLength,
+  maxClaims,
   maxLines,
   maxParticipants,
   maxParts,
@@ -258,6 +259,11 @@ export function rightsOf(op: Op): Rights {
     case 'reopenBudget':
     case 'deleteBudget':
       return 'admin'
+    // Taking a cost and giving it back are what everybody in the realm is there
+    // to do, and the case itself checks that they take it for themselves.
+    case 'claimCost':
+    case 'releaseCost':
+      return 'member'
     // Invoices
     case 'issueInvoice':
     case 'setInvoiceStatus':
@@ -700,6 +706,15 @@ export function checkBounds(op: Op): void {
     case 'reopenBudget':
     case 'deleteBudget':
       boundedName('a budget id', op.budget)
+      return
+    case 'claimCost':
+      boundedName('a budget id', op.budget)
+      boundedName('a transaction id', op.txn)
+      return
+    case 'releaseCost':
+      boundedName('a budget id', op.budget)
+      boundedName('a transaction id', op.txn)
+      boundedName('a member id', op.member)
       return
     case 'issueInvoice':
       boundedName('an invoice id', op.invoice.id)
@@ -1871,6 +1886,7 @@ function run(s: State, author: string, realm: string, op: Op): [State, Change[]]
       const opened: BudgetState = {
         budget: { ...op.budget, name: full, closed: false },
         participants: [],
+        claims: [],
         realm,
         account: acc.id,
         label: lbl === null ? '' : lbl.id,
@@ -2022,6 +2038,65 @@ function run(s: State, author: string, realm: string, op: Op): [State, Change[]]
       const st = cloneState(s)
       st.budgets.delete(op.budget)
       return [st, [{ tag: 17, kind: 'budgetDeleted', id: bs.budget.id }]]
+    }
+
+    case 'claimCost': {
+      const bs = budgetOf(s, op.budget)
+      ofThisRealm('that budget', realm, bs.realm)
+      // Membership rather than `checkBudget`: taking a cost is what everybody in
+      // the realm is there to do, and it is the one thing about a budget that is
+      // not an admin's.
+      if (!isMemberOf(s, author, realm)) {
+        throw new Error('only somebody in that realm may take a cost of its budget')
+      }
+      if (bs.budget.closed) {
+        throw new Error(`${shortName(bs.budget)} is closed; what everybody bore is decided`)
+      }
+      const t = txnOf(s, op.txn)
+      // A cost *of this budget*: something with a leg on its account.
+      if (!t.postings.some((p) => p.account === bs.account)) {
+        throw new Error('that is not a cost in this budget')
+      }
+      if (bs.claims.some((c) => c.txn === op.txn && c.member === author)) {
+        throw new Error('you have taken that one already')
+      }
+      if (bs.claims.length >= maxClaims) {
+        throw new Error(`a budget carries at most ${maxClaims} claims`)
+      }
+      const taken: BudgetState = {
+        ...bs,
+        claims: [...bs.claims, { txn: op.txn, member: author }],
+      }
+      const st = cloneState(s)
+      st.budgets.set(op.budget, taken)
+      return [st, [{ tag: 16, kind: 'budget', budget: taken }]]
+    }
+
+    case 'releaseCost': {
+      const bs = budgetOf(s, op.budget)
+      ofThisRealm('that budget', realm, bs.realm)
+      if (!isMemberOf(s, author, realm)) {
+        throw new Error('only somebody in that realm may give back a cost of its budget')
+      }
+      if (bs.budget.closed) {
+        throw new Error(`${shortName(bs.budget)} is closed; what everybody bore is decided`)
+      }
+      // Your own, or anybody's if you run the budget.
+      if (op.member !== author && !canAdminister(s, author, realm)) {
+        throw new Error(
+          'only the person who took a cost, or an admin of that realm, may give it back',
+        )
+      }
+      if (!bs.claims.some((c) => c.txn === op.txn && c.member === op.member)) {
+        throw new Error('there is nothing of theirs on that cost to give back')
+      }
+      const given: BudgetState = {
+        ...bs,
+        claims: bs.claims.filter((c) => !(c.txn === op.txn && c.member === op.member)),
+      }
+      const st = cloneState(s)
+      st.budgets.set(op.budget, given)
+      return [st, [{ tag: 16, kind: 'budget', budget: given }]]
     }
 
     /* ---------------- invoices ---------------- */
@@ -2672,7 +2747,15 @@ function divideByItems(
 ): [State, Change[]] {
   if (groups.length === 0) throw new Error('say which lines go together: --group 1+2=Account')
   const t = txnOf(s, id)
-  let lines: readonly LineItem[]
+  const parts = itemParts(t, linesOf(s, t), groups, newIds)
+  return replaceParts(s, author, realm, id, parts)
+}
+
+/**
+ * The lines a payment is divisible by: the ones it was left with when it is
+ * itself a part of a division, and its receipt's otherwise.
+ */
+function linesOf(s: State, t: Transaction): readonly LineItem[] {
   if (t.items !== null) {
     if (t.items.length === 0) {
       throw new Error(
@@ -2680,14 +2763,28 @@ function divideByItems(
           'into; there is nothing left here to divide',
       )
     }
-    lines = t.items
-  } else {
-    const sha = t.attachments[0]
-    if (sha === undefined) throw new Error('this transaction has no receipt to take lines from')
-    const blob = s.blobs.get(sha)
-    if (blob === undefined) throw new Error(`no such receipt: ${sha}`)
-    lines = blob.items
+    return t.items
   }
+  const sha = t.attachments[0]
+  if (sha === undefined) throw new Error('this transaction has no receipt to take lines from')
+  const blob = s.blobs.get(sha)
+  if (blob === undefined) throw new Error(`no such receipt: ${sha}`)
+  return blob.items
+}
+
+/**
+ * The parts a payment divides into, as the lines group them. `Core.itemParts`.
+ *
+ * Nothing here touches the state: the parts are handed to `replaceParts`, which
+ * is what writes them, so a division that cannot be carried out is a sentence
+ * rather than a half-written ledger.
+ */
+function itemParts(
+  t: Transaction,
+  lines: readonly LineItem[],
+  groups: readonly { items: readonly { line: number; qty: number | null }[]; into: string }[],
+  newIds: readonly string[],
+): Transaction[] {
   if (lines.length === 0) {
     throw new Error("no lines were read off that receipt; run 'resources receipt scan' on it first")
   }
@@ -2865,7 +2962,7 @@ function divideByItems(
     }
     parts.push({ ...t, id: rid, narration, postings: rest, items: left })
   }
-  return replaceParts(s, author, realm, id, parts)
+  return parts
 }
 
 /* ------------------------------------------------------------------ */

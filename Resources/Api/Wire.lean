@@ -105,7 +105,7 @@ def postingJson (e : NameEnv) (p : Posting) : Json :=
 
 /-- One priced line read off a receipt. -/
 def lineItemJson (i : LineItem) : Json :=
-  Json.mkObj [("description", i.description),
+  Json.mkObj [("id", i.id), ("description", i.description),
               ("qty", match i.qty with | some q => jint q | none => Json.null),
               ("amount", amountJson i.amount)]
 
@@ -170,6 +170,34 @@ def batchJson (b : ImportBatch) : Json :=
 def attachmentJson (a : Attachment) : Json :=
   Json.mkObj [("sha256", a.sha256), ("mime", a.mime), ("bytes", jint a.bytes),
               ("origName", jopt a.origName), ("createdAt", a.createdAt)]
+
+/--
+What people have said was theirs, cost by cost.
+
+The same list twice over: `budgetClaimsJson` is the whole answer for a request
+about one budget, and `takenJson` is the array of it that rides inside a budget.
+
+One entry per cost anybody has taken, naming everybody who took it -- which is
+also how much of it each of them bears, since a cost is divided equally between
+whoever took it.
+-/
+def takenJson (st : State) (bs : BudgetState) : Json :=
+  let nameOf (m : MemberId) : String := ((st.member? m).map (·.name)).getD m.val
+  let costJson (txn : TxId) : Json :=
+    let who := bs.claimantsOf txn
+    Json.mkObj [
+      ("txn", txn.val),
+      ("narration", ((st.txn? txn).map (·.narration)).getD ""),
+      ("date", ((st.txn? txn).map (·.date.toIso)).getD ""),
+      ("who", Json.arr (who.map (fun m => Json.str (nameOf m))).toArray),
+      ("members", Json.arr (who.map (fun m => Json.str m.val)).toArray)]
+  Json.arr (bs.claimed.map costJson).toArray
+
+/-- The same, as the whole answer to a request about one budget. -/
+def budgetClaimsJson (st : State) (bs : BudgetState) : Json :=
+  Json.mkObj [
+    ("budget", bs.budget.name), ("id", bs.budget.id.val),
+    ("costs", takenJson st bs)]
 
 /-- A rule. -/
 def ruleJson (r : Rule) : Json :=
@@ -476,8 +504,8 @@ decided about. It is the whole reason a budget is worth naming, and it is also
 what has to reach zero before a settlement can be planned at all.
 -/
 def budgetJson (e : NameEnv) (b : Budget) (outstanding allocated : Amount) (costs : Nat)
-    (among : Array Participant) (standings : Array Standing) (claims : Array Transaction) :
-    Json :=
+    (among : Array Participant) (standings : Array Standing) (claims : Array Transaction)
+    (taken : Json := Json.arr #[]) : Json :=
   Json.mkObj [
     ("id", Json.str b.id.val), ("name", Json.str b.name),
     ("shortName", Json.str (Budget.shortName b)),
@@ -487,7 +515,11 @@ def budgetJson (e : NameEnv) (b : Budget) (outstanding allocated : Amount) (cost
     ("costs", Json.num (JsonNumber.fromNat costs)),
     ("among", Json.arr (among.map participantJson)),
     ("standings", Json.arr (standings.map standingJson)),
-    ("claims", Json.arr (claims.map (claimJson e)))]
+    ("claims", Json.arr (claims.map (claimJson e))),
+    -- What people said was theirs, which is the other half of how a budget is
+    -- divided: these costs are borne by whoever took them, and only the rest is
+    -- divided by the shares above.
+    ("taken", taken)]
 
 end Wire
 end Resources

@@ -479,6 +479,152 @@ def allocate (ctx : Ctx) (b : Budget) (among : List Participant) (actor : String
   | none => return none
   | some divided => return some (divided, written.filter (·.id != txnId))
 
+/-! ## Sharing a budget -/
+
+/--
+Moves a budget's costs into a realm other people can read.
+
+An account cannot be in two realms, and the reason is arithmetic rather than
+policy: a realm is a key, a balance is a fold over the postings a reader can
+decrypt, and an account whose postings were spread across two realms would give
+everybody holding one key a number that is wrong and looks right. So the costs
+are *re-entered* rather than relabelled, in the shape the ledger already has for
+money that is true in two rooms at once -- a purse and the bridge it mirrors.
+
+Each cost becomes one transaction in two parts. Your realm keeps the payment and
+sends what it bought to a mirror account: `Assets.Cash -50, Assets.Shared.Trip
++50`. The shared realm sees your bridge funding the budget there: `Purse.you
+-50, Budget.Trip +50`. Each part balances on its own, which is what makes it
+readable by somebody holding one of the two keys, and the mirror and the bridge
+move by equal and opposite amounts, which is what makes the pair neither create
+money nor destroy it.
+
+What it is *for* is that everybody let into that realm can now see the costs and
+say which were theirs. What comes back is the new budget, which is the one to
+divide.
+-/
+def shareInto (ctx : Ctx) (b : Budget) (realm : RealmId) (bridge : Account) (actor : String) :
+    IO (Budget × Nat) := do
+  let here ← realmOf ctx b
+  if here != Realm.selfId then
+    throw <| IO.userError s!"{Budget.shortName b} is already in a realm of its own"
+  let old ← account ctx b
+  -- The budget again, in the realm the people are in. A new one rather than the
+  -- same one: the account is what holds the costs, and an account stays in the
+  -- realm it was written in.
+  let shared : Budget := { id := ⟨← freshId⟩, name := b.name, note := b.note, closed := false }
+  let sharedAccount : Account :=
+    { id := ⟨← freshId⟩, name := b.name, kind := .equity, realm }
+  discard <| ctx.commit actor [.openBudget shared sharedAccount] (kind := "share") (realm := realm)
+  -- Your side of the bridge, in your own books. Written here rather than by
+  -- `Accounts.ensure` because `mirrorOf` is only ever set when the account is
+  -- made: it is what says the two are the same money, and changing it later
+  -- would be saying that about a different pair.
+  let st ← ctx.state.get
+  -- A name nothing else has taken, since a name is unique inside a realm.
+  let base := s!"Assets.Shared.{Budget.shortName b}"
+  let taken (n : String) : Bool := (st.accountByNameIn? Realm.selfId n).isSome
+  let mut name := base
+  let mut n := 2
+  while taken name && n < 1000 do
+    name := s!"{base}{n}"
+    n := n + 1
+  let mirror : Account :=
+    { id := ⟨← freshId⟩, name, kind := .asset, realm := Realm.selfId
+      mirrorOf := some bridge.id }
+  discard <| ctx.commit actor [.putAccount mirror] (kind := "share")
+  let mut moved := 0
+  for (t, _) in ← remaining ctx b Commodity.eur do
+    let held := (t.postings.filterMap fun p =>
+      if p.account == old.id then some p.amount.minor else none).sum
+    if held == 0 then continue
+    let commodity := ((t.postings.find? (·.account == old.id)).map (·.amount.commodity)).getD
+      Commodity.eur
+    -- Two entries rather than one in two parts, and the reason is the guard on
+    -- rewriting a transaction: a part may only touch an entry that already has a
+    -- leg in the realm it names, which is what stops anybody hanging legs of
+    -- their own off somebody else's entry. So the shared realm gets an entry of
+    -- its own, and the two point at each other.
+    let sharedId : TxId := ⟨← freshId⟩
+    let mine : Transaction :=
+      { t with postings := t.postings.map fun p =>
+          if p.account == old.id then
+            { p with account := mirror.id, origin := p.origin <|> some sharedId.val }
+          else p }
+    let theirs : Transaction :=
+      { t with
+        id := sharedId,
+        postings :=
+          [{ account := bridge.id, amount := ⟨commodity, -held⟩, origin := some t.id.val },
+           { account := sharedAccount.id, amount := ⟨commodity, held⟩,
+             origin := some t.id.val }] }
+    -- One event, both realms: the two have to be told at the same time, or the
+    -- pair is a statement only one of them heard.
+    discard <| ctx.commitParts actor
+      [(Realm.selfId, .putTransaction mine), (realm, .putTransaction theirs)] "share"
+    moved := moved + 1
+  -- The old pot is empty now, and two budgets of one name would make "the Trip
+  -- budget" a question with two answers. What it recorded has moved, so it goes.
+  if (← remaining ctx b Commodity.eur).isEmpty then
+    discard <| ctx.commit actor [.deleteBudget b.id] (kind := "share")
+  return (shared, moved)
+
+/-! ## What people said was theirs -/
+
+/-- Takes a cost of a budget, as this node's member. -/
+def claimCost (ctx : Ctx) (b : Budget) (txn : TxId) (actor : String) : IO BudgetState := do
+  discard <| ctx.commit actor [.claimCost b.id txn] (kind := "claim") (realm := ← realmOf ctx b)
+  let st ← ctx.state.get
+  let some bs := st.budget? b.id | throw <| IO.userError "the budget is gone"
+  return bs
+
+/-- Gives one back: your own, or anybody's if you administer the realm. -/
+def releaseCost (ctx : Ctx) (b : Budget) (txn : TxId) (member : MemberId) (actor : String) :
+    IO BudgetState := do
+  discard <| ctx.commit actor [.releaseCost b.id txn member] (kind := "claim")
+    (realm := ← realmOf ctx b)
+  let st ← ctx.state.get
+  let some bs := st.budget? b.id | throw <| IO.userError "the budget is gone"
+  return bs
+
+/--
+Settles what people said was theirs, by dividing each of those costs between
+them.
+
+This is `splitTransaction` and nothing else: the cost's own leg in the budget is
+cut into equal shares and moved onto the purses of whoever took it, leaving the
+funding leg alone -- so the pot is left holding only what nobody claimed, and
+that is what the division by weights then divides.
+
+A member's purse in the budget's realm is their bridge: the one account there
+that is theirs. Costs already settled this way are skipped rather than refused,
+which is what makes closing a budget twice, or after somebody takes one more
+cost, the ordinary thing it should be.
+-/
+def settleClaims (ctx : Ctx) (b : Budget) (actor : String) : IO (Array Transaction) := do
+  let st ← ctx.state.get
+  let some bs := st.budget? b.id | throw <| IO.userError s!"no such budget: {b.id.val}"
+  let realm ← realmOf ctx b
+  let mut written : Array Transaction := #[]
+  for txn in bs.claimed do
+    let some t := st.txn? txn | continue
+    -- Only what is still in the pot: a cost divided already has no leg here.
+    unless t.postings.any (fun p => p.account == bs.account) do continue
+    let mut targets : List AccountId := []
+    for m in bs.claimantsOf txn do
+      let some purse := (sortedValues st.accounts).find?
+        (fun a => a.realm == realm && a.bridgeOf == some m)
+        | throw <| IO.userError
+            s!"{m.val} has taken a cost of {Budget.shortName b} but has no purse in its realm"
+      targets := targets ++ [purse.id]
+    if targets.isEmpty then continue
+    -- `keepShare := false`: everybody who bears this cost is in `targets`,
+    -- including whoever paid for it if they took it too.
+    let changes ← ctx.commit actor [.splitTransaction txn targets false]
+      (kind := "claim") (realm := realm)
+    written := written ++ Change.written changes
+  return written
+
 /--
 Closes a budget: divides everything still waiting, and asks for what that leaves
 people owing.
@@ -508,6 +654,10 @@ def close (ctx : Ctx) (b : Budget) (actor : String) (commodity : Commodity := Co
   if people.isEmpty then
     throw <| IO.userError
       s!"say who shares {Budget.shortName b} first: budget among {Budget.shortName b} anna= …"
+  -- What people said was theirs comes out of the pot first, each of those costs
+  -- divided between whoever took it. What is left is what nobody claimed, and
+  -- that is what the weights divide.
+  discard <| settleClaims ctx b actor
   if !(← remaining ctx b commodity).isEmpty then
     discard <| targetsOf ctx b people
   let lbl ← labelOf ctx b

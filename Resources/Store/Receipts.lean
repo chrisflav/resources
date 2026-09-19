@@ -221,6 +221,7 @@ def extract (ctx : Ctx) (sha : String) : IO Extracted := do
            rawText := text, extractor := "builtin" }
 
 private structure ItemRow where
+  lineId : String
   description : String
   qty : Option Int64
   minor : Int64
@@ -230,10 +231,10 @@ private structure ItemRow where
 /-- The lines read off a receipt, in the order they were printed. -/
 def items (ctx : Ctx) (sha : String) : IO (Array LineItem) := do
   let rows ← Db.rows ItemRow ctx.db
-    s!"SELECT description, qty, minor, commodity FROM attachment_item
+    s!"SELECT line_id, description, qty, minor, commodity FROM attachment_item
        WHERE sha256 = {Db.lit sha} ORDER BY idx"
   return rows.map fun r =>
-    { description := r.description, qty := r.qty.map (·.toInt)
+    { id := r.lineId, description := r.description, qty := r.qty.map (·.toInt)
       amount := ⟨Commodity.ofCode r.commodity, r.minor.toInt⟩ }
 
 /-! ## What a receipt says
@@ -301,7 +302,8 @@ def addItem (ctx : Ctx) (sha : String) (description : String) (qty : Option Int)
         s!"that would take the lines past the {t.render} on this receipt; \
            {(Amount.mk commodity (t.minor - used)).render} is left"
   | none => pure ()
-  let item : LineItem := { description, qty, amount }
+  let lineId ← freshId
+  let item : LineItem := { id := lineId, description, qty, amount }
   discard <| ctx.commit "system" [.setReceiptLines sha (its.toList ++ [item])]
   return item
 
@@ -321,7 +323,16 @@ showing somebody the page a figure came from, and a scan of a long bill would
 otherwise put a novel in every row of the table.
 -/
 def record (ctx : Ctx) (sha : String) (e : Extracted) : IO Unit := do
-  let read := { e with rawText := Str.clamp e.rawText 20000 }
+  -- Every line gets an id here, where there is an `IO` to mint one in: what a
+  -- claim on a line names is the id, and the core has no way to invent one.
+  let mut lines : List LineItem := []
+  for l in e.items do
+    if l.id.isEmpty then
+      let fresh ← freshId
+      lines := lines ++ [{ l with id := fresh }]
+    else
+      lines := lines ++ [l]
+  let read := { e with items := lines, rawText := Str.clamp e.rawText 20000 }
   discard <| ctx.commit "system" [.recordExtraction sha read]
 
 /-! ## Matching a receipt to spending -/
@@ -459,6 +470,14 @@ read with: what it says is a fact about the paper.
 def divideByItems (ctx : Ctx) (id : TxId) (groups : List ItemGroup) (actor : String) :
     IO (Array Transaction) := do
   if groups.isEmpty then throw <| IO.userError "say which lines go together: --group 1+2=Account"
+  -- The realm the payment is in, which is not always yours: a cost shared into a
+  -- realm of a budget's own is divided there, and the parts stay where the
+  -- people who can see them are. Read off the transaction's own accounts rather
+  -- than assumed, because a part may only speak about one realm and this one has
+  -- to speak about the payment's.
+  let st ← ctx.state.get
+  let some t := st.txn? id | throw <| IO.userError s!"no such transaction: {id.val}"
+  let realm := ((t.postings.head?).bind (fun p => st.realmOf p.account)).getD Realm.selfId
   -- The accounts the parts will be booked into, and one identifier per part
   -- plus one for the remainder: the three things the operation cannot mint for
   -- itself. Everything else about the division — which line covers how many
@@ -466,7 +485,7 @@ def divideByItems (ctx : Ctx) (id : TxId) (groups : List ItemGroup) (actor : Str
   -- arithmetic, and it is `Op.divideByItems` that does it.
   let mut resolved : List ItemGroup := []
   for g in groups do
-    let target ← Accounts.ensure ctx g.into
+    let target ← Accounts.ensure ctx g.into (realm := realm)
     resolved := resolved ++ [{ g with into := target.id.val }]
   let mut newIds : List TxId := []
   for _ in [0 : groups.length + 1] do
@@ -477,7 +496,7 @@ def divideByItems (ctx : Ctx) (id : TxId) (groups : List ItemGroup) (actor : Str
   let staged ← Db.rows String ctx.db
     s!"SELECT id FROM staged_entry WHERE txn_id = {Db.lit id.val}"
   let changes ← ctx.commit actor [.divideByItems id resolved newIds] (kind := "divide")
-    (kinds := fun x => if x == id then some "divide-away" else none)
+    (kinds := fun x => if x == id then some "divide-away" else none) (realm := realm)
   let written := Change.written changes
   if let some first := written[0]? then
     for row in staged do

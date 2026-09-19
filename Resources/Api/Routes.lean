@@ -1025,19 +1025,23 @@ def handle (ctx : Ctx) (caller : Caller) (r : Req) (node : NodeApi := {}) : IO R
     for b in bs do
       let held ← Budgets.balance ctx b
       let costs ← Budgets.costs ctx b
+      let st ← ctx.state.get
+      let taken := ((st.budget? b.id).map (Wire.takenJson st)).getD (Json.arr #[])
       out := out.push (Wire.budgetJson env b held (← Budgets.allocated ctx b) costs.size
         (← Budgets.participants ctx b).toArray
-        (← Budgets.standings ctx b) (← Budgets.claims ctx b))
+        (← Budgets.standings ctx b) (← Budgets.claims ctx b) taken)
     ok (Json.arr out)
   | "GET", ["budgets", name] => do
     needs .read
     let env ← Wire.NameEnv.load ctx
     let some b ← Budgets.get? ctx name | notFound "budget"
     let costs ← Budgets.costs ctx b
+    let st ← ctx.state.get
+    let taken := ((st.budget? b.id).map (Wire.takenJson st)).getD (Json.arr #[])
     ok (Json.mkObj [
       ("budget", Wire.budgetJson env b (← Budgets.balance ctx b) (← Budgets.allocated ctx b)
         costs.size (← Budgets.participants ctx b).toArray
-        (← Budgets.standings ctx b) (← Budgets.claims ctx b)),
+        (← Budgets.standings ctx b) (← Budgets.claims ctx b) taken),
       ("items", Json.arr (costs.map (Wire.txnJson env)))])
   | "POST", ["budgets"] => do
     needs .write
@@ -1158,6 +1162,66 @@ is booked already divided as it goes in"
       ("division", jopt (divided.map (·.id.val))),
       ("standings", Json.arr ((← Budgets.standings ctx b commodity).map Wire.standingJson)),
       ("claims", Json.arr (claims.map (Wire.claimJson env)))])
+  | "POST", ["budgets", name, "share"] => do
+    needs .write
+    let j ← bodyJson r.body
+    let some b ← Budgets.get? ctx name | notFound "budget"
+    let st ← ctx.state.get
+    let me := ctx.member
+    -- A link is a pending grant on a sequencer, so ask before anything moves.
+    let named := ((j.getObjValAs? (Array String) "with").toOption.getD #[]).toList.filterMap
+      fun w => let n := w.trimAscii.toString; if n.isEmpty then none else some n
+    unless named.isEmpty do
+      if (← node.sequencer ctx).isEmpty then
+        throw <| IO.userError "a link is redeemed on a sequencer, and this store syncs with \
+                              none — run 'resources sync init --sequencer URL' first, or \
+                              share the budget without naming anybody"
+    -- The realm the people are let into: made the way `POST realms` makes one,
+    -- because everything about a realm somebody joins is its own history.
+    let realmName := Str.clamp ((j.getObjValAs? String "realm").toOption.getD
+      s!"Shared.{Budget.shortName b}") 60
+    if st.realmsSorted.any (·.name == realmName) then
+      throw <| IO.userError s!"there is a realm called '{realmName}' already"
+    let realmId : RealmId := ⟨← freshId⟩
+    let mine := (st.member? me).getD { id := me, name := me.val }
+    let bridge : Account :=
+      { id := ⟨← freshId⟩, name := freeAccountName st s!"Assets.Purse.{mine.name}.{realmName}",
+        kind := .asset, owner := mine.party, realm := realmId, bridgeOf := some me }
+    discard <| ctx.commit caller.actor
+      [.addMember mine,
+       .createRealm { id := realmId, name := realmName, members := [(me, .admin)] },
+       .grant realmId me .admin bridge] "realm" (fun _ => none) realmId
+    node.created ctx realmId
+    let (shared, moved) ← Budgets.shareInto ctx b realmId bridge caller.actor
+    let today ← Date.today
+    let expires :=
+      (((j.getObjValAs? String "expires").toOption).bind Date.ofIso?).getD (today.plusDays 14)
+    let mut links : Array Json := #[]
+    for who in named do
+      let person ← Parties.contact ctx who
+      let link ← node.invited ctx realmId "viewer" s!"{expires.toIso}T00:00:00"
+      links := links.push (Wire.inviteJson { id := realmId, name := realmName }
+        person.name "viewer" expires.toIso link)
+    created (Json.mkObj [
+      ("budget", Json.str shared.name), ("realm", Json.str realmId.val),
+      ("moved", jint moved), ("invites", Json.arr links)])
+  | "POST", ["budgets", name, "claims"] => do
+    needs .write
+    let j ← bodyJson r.body
+    let some b ← Budgets.get? ctx name | notFound "budget"
+    let txn := ((j.getObjValAs? String "txn").toOption.getD "").trimAscii.toString
+    if txn.isEmpty then throw <| IO.userError "say which cost was yours"
+    let bs ← Budgets.claimCost ctx b ⟨txn⟩ caller.actor
+    ok (Wire.budgetClaimsJson (← ctx.state.get) bs)
+  | "POST", ["budgets", name, "releases"] => do
+    needs .write
+    let j ← bodyJson r.body
+    let some b ← Budgets.get? ctx name | notFound "budget"
+    let txn := ((j.getObjValAs? String "txn").toOption.getD "").trimAscii.toString
+    if txn.isEmpty then throw <| IO.userError "say which cost to give back"
+    let whose := ((j.getObjValAs? String "member").toOption).getD ctx.member.val
+    let bs ← Budgets.releaseCost ctx b ⟨txn⟩ ⟨whose⟩ caller.actor
+    ok (Wire.budgetClaimsJson (← ctx.state.get) bs)
   | "POST", ["budgets", name, "reopen"] => do
     needs .write
     let some b ← Budgets.get? ctx name | notFound "budget"

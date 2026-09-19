@@ -431,6 +431,10 @@ private def budgetFunded : Except String State := after budgetShared
   [ .contribute ⟨"b-hut"⟩ (cost "t-hut1" "acc-bank" "acc-hut" 10000 "the hut")
   , .contribute ⟨"b-hut"⟩ (cost "t-hut2" "acc-anna" "acc-hut" 6000 "groceries") ]
 
+/-- One of the two costs taken by the person who was there. -/
+private def budgetTaken : Except String State := after budgetFunded
+  [.claimCost ⟨"b-hut"⟩ ⟨"t-hut2"⟩]
+
 /-- Both of them, divided, and the claim that squares them up raised. -/
 private def budgetDivided : Except String State := after budgetFunded
   [.allocate ⟨"b-hut"⟩ among eur day none ⟨"t-alloc1"⟩ [⟨"t-claim1"⟩] ⟨"lbl-hut"⟩]
@@ -665,6 +669,7 @@ private def fixtures : List (String × Except String State) :=
   , ("blobbed", blobbed), ("receipted", receipted), ("divided", divided)
   , ("budgetOpened", budgetOpened)
   , ("budgetShared", budgetShared), ("budgetFunded", budgetFunded)
+  , ("budgetTaken", budgetTaken)
   , ("budgetDivided", budgetDivided), ("budgetLate", budgetLate), ("budgetClosed", budgetClosed)
   , ("cabinShared", cabinShared), ("cabinFunded", cabinFunded), ("cabinDivided", cabinDivided)
   , ("invoiced", invoiced), ("invoiceSent", invoiceSent), ("batched", batched)
@@ -807,6 +812,10 @@ private def transactionScenarios : List Scenario :=
       "Two of the six units a line covers go to her; the rest stays behind." receipted
       (.divideByItems ⟨"t-shop"⟩ [{ items := [{ line := 2, qty := some 2 }], into := "acc-anna" }]
         [⟨"t-d1"⟩, ⟨"t-d2"⟩])
+  , one "claim-a-cost" "Says a cost of a budget was yours to bear, rather than everybody's."
+      budgetFunded (.claimCost ⟨"b-hut"⟩ ⟨"t-hut2"⟩)
+  , one "release-a-cost" "And gives it back." budgetTaken
+      (.releaseCost ⟨"b-hut"⟩ ⟨"t-hut2"⟩ Member.selfId)
   , one "divide-a-part-again"
       "A remainder is divided by the lines it was left with, numbered from one." divided
       (.divideByItems ⟨"t-d2"⟩ [{ items := [{ line := 1 }], into := "acc-anna" }]
@@ -1004,6 +1013,16 @@ private def perOpRefusalScenarios : List Scenario :=
       (.mergeTransactions [⟨"t-dinner"⟩] ⟨"t-m"⟩ none none [])
   , refuses "refuses-a-division-with-no-groups" "Dividing by lines that were never named."
       receipted (.divideByItems ⟨"t-shop"⟩ [] [⟨"t-d1"⟩])
+  , refuses "refuses-taking-a-cost-twice" "The same person, the same cost, a second time."
+      budgetTaken (.claimCost ⟨"b-hut"⟩ ⟨"t-hut2"⟩)
+  , refuses "refuses-taking-what-is-not-a-cost-of-the-budget"
+      "A transaction with no leg in the budget's account." budgetFunded
+      (.claimCost ⟨"b-hut"⟩ ⟨"t-dinner"⟩)
+  , refuses "refuses-giving-back-what-nobody-took" "A cost no claim was made on." budgetFunded
+      (.releaseCost ⟨"b-hut"⟩ ⟨"t-hut2"⟩ Member.selfId)
+  , asMember "refuses-giving-back-somebody-elses-cost"
+      "A member of the realm who is not an admin, undoing another's claim." ⟨"mara"⟩ budgetTaken
+      (.releaseCost ⟨"b-hut"⟩ ⟨"t-hut2"⟩ Member.selfId) true
   , refuses "refuses-a-line-that-went-to-a-sibling"
       "A part holds the two lines it was left with, and a third number is not one of them."
       divided (.divideByItems ⟨"t-d2"⟩ [{ items := [{ line := 3 }], into := "acc-anna" }]
@@ -1626,7 +1645,7 @@ def misfits : List String :=
 /-! ## The files -/
 
 /-- The version the format carries. Bumped by the rules the README states. -/
-def formatVersion : Nat := 7
+def formatVersion : Nat := 8
 
 /-- A string, escaped the way JSON escapes one. -/
 private def jsonStr (s : String) : String := (Lean.Json.str s).compress

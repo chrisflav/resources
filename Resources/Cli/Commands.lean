@@ -577,6 +577,59 @@ def runBudgetClose (p : Parsed) : IO UInt32 := withBackend fun b => do
   IO.println ""
   printDivision (jobj (← b.json (Call.get ["budgets", argStr p "name"])) "budget")
 
+/-- Prints what people have said was theirs. -/
+private def showClaims (j : Json) : IO Unit := do
+  let costs := jarr (jobj j "costs")
+  if costs.isEmpty then
+    IO.println "nobody has taken a cost yet"
+    return
+  printTable #["date", "cost", "taken by"]
+    (costs.map fun c => #[
+      jstr c "date", Str.clamp (jstr c "narration") 40,
+      String.intercalate ", " ((jarr (jobj c "who")).toList.map (·.getStr?.toOption.getD ""))])
+
+/--
+Handler for `budget share`: puts a budget's costs where other people can see
+them, and sends each of them a link.
+-/
+def runBudgetShare (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let mut body := Json.mkObj []
+  let guests := flagList p "with"
+  unless guests.isEmpty do
+    body := body.setObjVal! "with" (Json.arr (guests.map Json.str).toArray)
+  match flagStr? p "realm" with
+  | some n => body := body.setObjVal! "realm" (Json.str n)
+  | none => pure ()
+  let j ← b.json (Call.post ["budgets", argStr p "name", "share"] body)
+  IO.println s!"{jstr j "budget"} is in realm {jstr j "realm"}; {jstr j "moved"} cost(s) moved"
+  let invites := jarr (jobj j "invites")
+  if invites.isEmpty then
+    IO.println "no links yet; 'resources realm invite' makes one"
+  else
+    IO.println ""
+    for i in invites do
+      IO.println s!"{Str.padRight (jstr i "for") 16} {jstr i "link"}"
+
+/-- Handler for `budget claim`: says a cost was yours. -/
+def runBudgetClaim (p : Parsed) : IO UInt32 := withBackend fun b => do
+  for txn in (p.variableArgsAs! String) do
+    let j ← b.json (Call.post ["budgets", argStr p "name", "claims"]
+      (Json.mkObj [("txn", Json.str txn)]))
+    if txn == (p.variableArgsAs! String).back! then showClaims j
+
+/-- Handler for `budget release`: takes one back. -/
+def runBudgetRelease (p : Parsed) : IO UInt32 := withBackend fun b => do
+  let mut last : Option Json := none
+  for txn in (p.variableArgsAs! String) do
+    let mut body := Json.mkObj [("txn", Json.str txn)]
+    match flagStr? p "member" with
+    | some m => body := body.setObjVal! "member" (Json.str m)
+    | none => pure ()
+    last := some (← b.json (Call.post ["budgets", argStr p "name", "releases"] body))
+  match last with
+  | some j => showClaims j
+  | none => throw <| IO.userError "say which cost to give back"
+
 /-- Handler for `budget reopen`. -/
 def runBudgetReopen (p : Parsed) : IO UInt32 := withBackend fun b => do
   let j ← b.json (Call.post ["budgets", argStr p "name", "reopen"] (Json.mkObj []))

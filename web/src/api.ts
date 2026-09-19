@@ -15,6 +15,7 @@ import type {
   Revision,
   Round,
   Rule,
+  TakenCost,
   Budget,
   Claim,
   Participant,
@@ -269,6 +270,21 @@ export const api = {
       standings: Standing[]
       claims: Claim[]
     }>('POST', `budgets/${name}/close`, { body: opts }),
+  /** Puts a budget's costs where the people who were there can see them. */
+  shareBudget: (name: string, body: { with?: string[]; realm?: string; expires?: string }) =>
+    request<{ budget: string; realm: string; moved: number; invites: Invite[] }>(
+      'POST',
+      `budgets/${name}/share`,
+      { body },
+    ),
+  claimCost: (name: string, txn: string) =>
+    request<{ budget: string; costs: TakenCost[] }>('POST', `budgets/${name}/claims`, {
+      body: { txn },
+    }),
+  releaseCost: (name: string, txn: string, member?: string) =>
+    request<{ budget: string; costs: TakenCost[] }>('POST', `budgets/${name}/releases`, {
+      body: member === undefined ? { txn } : { txn, member },
+    }),
   reopenBudget: (name: string) =>
     request<{ budget: string; closed: boolean }>('POST', `budgets/${name}/reopen`, { body: {} }),
   lendToBudget: (name: string, transactions: string[]) =>

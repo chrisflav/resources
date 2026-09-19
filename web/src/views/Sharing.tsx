@@ -140,6 +140,163 @@ type Bearer = { name: string; account: string; weight: string }
 const ME: Bearer = { name: '', account: '', weight: '1' }
 
 /**
+ * Putting a budget in front of the people who were there.
+ *
+ * The costs move into a realm of the budget's own -- an account stays in the
+ * realm it was written in, so they are re-entered through a purse rather than
+ * relabelled -- and everybody with a link can then say which of them were
+ * theirs. What they say is here: a cost several people take is split equally
+ * between them when the budget is divided, and what nobody takes is divided by
+ * the shares above, which is what a budget did before anybody could take
+ * anything.
+ */
+function Share({ budget, onChanged }: { budget: Budget; onChanged: () => void }) {
+  const [guests, setGuests] = useState('')
+  const [invites, setInvites] = useState<{ for: string; link: string }[]>([])
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  // The costs themselves, so that the person running the budget can take one
+  // too, and can take one back off somebody who has gone quiet.
+  const detail = useAsync(() => api.budget(budget.shortName), [budget.shortName, budget.taken])
+  const costs = detail.data?.items ?? []
+  const takenBy = (id: string) => budget.taken.find((t) => t.txn === id)
+
+  const named = () =>
+    guests
+      .split(',')
+      .map((g) => g.trim())
+      .filter((g) => g !== '')
+
+  const run = async (what: () => Promise<unknown>) => {
+    setBusy(true)
+    setError(null)
+    try {
+      await what()
+      onChanged()
+      detail.reload()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const mine = (txn: string, already: boolean) =>
+    run(() =>
+      already
+        ? api.releaseCost(budget.shortName, txn)
+        : api.claimCost(budget.shortName, txn),
+    )
+
+  const release = (txn: string, member: string) =>
+    run(() => api.releaseCost(budget.shortName, txn, member))
+
+  const share = async () => {
+    setBusy(true)
+    setError(null)
+    try {
+      const made = await api.shareBudget(budget.shortName, { with: named() })
+      setInvites(made.invites.map((i) => ({ for: i.for, link: i.link })))
+      setGuests('')
+      onChanged()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="card-body">
+      <div className="row">
+        <input
+          type="text"
+          style={{ minWidth: 240 }}
+          value={guests}
+          placeholder="names to send a link to, comma separated"
+          aria-label="who to share this budget with"
+          onChange={(e) => setGuests(e.target.value)}
+        />
+        <button className="btn quiet" disabled={busy || budget.closed} onClick={() => void share()}>
+          Share this budget
+        </button>
+      </div>
+      {costs.length > 0 && (
+        <div className="table-wrap" style={{ marginTop: 8 }}>
+          <table>
+            <thead>
+              <tr>
+                <th>date</th>
+                <th>cost</th>
+                <th className="num">amount</th>
+                <th>taken by</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {costs.map((t) => {
+                const taken = takenBy(t.id)
+                const who = taken?.who ?? []
+                return (
+                  <tr key={t.id}>
+                    <td className="mono">{t.date}</td>
+                    <td>{t.payee ?? t.narration}</td>
+                    <td className="num">{t.headline?.amount.text ?? ''}</td>
+                    <td className="muted">{who.join(', ')}</td>
+                    <td>
+                      {!budget.closed && (
+                        <>
+                          <button
+                            className="btn quiet"
+                            style={{ padding: '2px 8px', marginRight: 6 }}
+                            disabled={busy}
+                            onClick={() => void mine(t.id, who.includes('me'))}
+                            title="A cost several people take is split equally between them"
+                          >
+                            {who.includes('me') ? 'not mine' : 'mine'}
+                          </button>
+                          {(taken?.members ?? []).map((m, i) => (
+                            <button
+                              key={m}
+                              className="btn quiet"
+                              style={{ padding: '2px 8px', marginRight: 4 }}
+                              disabled={busy}
+                              onClick={() => void release(t.id, m)}
+                              title={`Take this off ${who[i] ?? m}`}
+                            >
+                              × {who[i] ?? m}
+                            </button>
+                          ))}
+                        </>
+                      )}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {invites.length > 0 && (
+        <div className="table-wrap" style={{ marginTop: 8 }}>
+          <table>
+            <tbody>
+              {invites.map((i) => (
+                <tr key={i.link}>
+                  <td>{i.for}</td>
+                  <td className="mono">{i.link}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {error && <div className="error">{error}</div>}
+    </div>
+  )
+}
+
+/**
  * Sharing: budgets, where everybody stands, and the documents that say so.
  *
  * These used to be two screens because they looked like two workflows. They are
@@ -521,6 +678,8 @@ export default function Sharing({
                 </table>
                 {budget.standings.length === 0 && <div className="empty">Not divided yet.</div>}
               </div>
+
+              <Share budget={budget} onChanged={() => budgets.reload()} />
 
               {budget.claims.length > 0 && (
                 <div className="table-wrap">

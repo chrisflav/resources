@@ -122,6 +122,7 @@ function realm(): State {
   s.budgets.set('bud', {
     budget: { id: 'bud', name: 'Budget.Hut', note: null, closed: false },
     participants: [],
+    claims: [],
     realm: REALM,
     account: 'acc-budget',
     label: 'lab',

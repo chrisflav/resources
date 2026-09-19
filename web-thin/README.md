@@ -11,13 +11,13 @@ open the receipt behind a cost that carries one.
 It is *thin* in one specific sense: the sequencer is a dumb, blind ordering
 service, so every fact on the screen is one this client worked out for itself
 from bytes it decrypted and checked. It speaks protocol version 2 (`/seq/v2`)
-and format version 7.
+and format version 8.
 
 ```
 npm ci
 npm run dev      # Vite, proxying /seq to a sequencer on 127.0.0.1:8088
 npm run build    # tsc --strict, then a production bundle
-npx vitest run   # 483 tests: byte format, arithmetic, crypto, blobs, sync, conformance
+npx vitest run   # 489 tests: byte format, arithmetic, crypto, blobs, sync, conformance
 ```
 
 `npx vitest run` reads `../conformance/vectors.json` and
@@ -312,7 +312,7 @@ is no export and no way back, so it takes a deliberate confirmation, and the
 
 ## What it agrees with Lean about
 
-- **217 conformance vectors**, at format version 7. `src/conformance.test.ts`
+- **223 conformance vectors**, at format version 8. `src/conformance.test.ts`
   reads `conformance/vectors.json` — emitted by `resources gen-vectors` from the
   Lean core's own `step` — and for every vector decodes `stateHex` and
   `eventHex`, re-encodes them to check the codec both ways, applies `step`, and
@@ -324,7 +324,7 @@ is no export and no way back, so it takes a deliberate confirmation, and the
   byte string and the decoder that has to refuse it — `nat`, `int`, `string`,
   `date`, `state` or `event` — and the same test file runs every one of them
   through this port's own `decode`. Every vector above is well-formed, so a port
-  could reproduce all 217 while accepting bytes no writer produces; and a
+  could reproduce all 223 while accepting bytes no writer produces; and a
   checkpoint is the hash of a state's canonical encoding, so a reader that takes
   a second spelling of one state re-encodes it to something the sender never
   committed to, and two honest peers then disagree about whether a checkpoint
@@ -378,6 +378,21 @@ is no export and no way back, so it takes a deliberate confirmation, and the
   therefore a real answer, said by a remainder whose siblings claimed every
   printed line and which keeps only a service charge no line covers. The receipt
   is untouched by all of it: what it says is a fact about the paper.
+- **The costs people say were theirs.** Format version 8 gives `BudgetState` a
+  trailing `claims` list and adds `claimCost` and `releaseCost`, and it gives
+  `LineItem` a leading `id` so that anything pointing at a receipt's line points
+  at the line rather than at its position. A claim is not money and moves none:
+  it is one person saying that one cost of a budget was theirs to bear. What it
+  is for is the division — a cost somebody took is borne by whoever took it,
+  split equally when several did, and only what nobody took is divided among
+  everybody by weight, which is what a budget did before anybody could take
+  anything. Both are a member's right and are checked against the claimant
+  themselves: a guest takes costs for nobody but themselves and gives back only
+  their own, while an admin of the budget's realm can free anybody's, because
+  somebody has to be able to correct a list the people in it filled in
+  themselves. The budget is what the people with links are let into; the costs
+  are in it because they were re-entered there through a purse, since an account
+  stays in the realm it was written in.
 - **Every authorisation rule.** `Op.rights` is a total table here as it is in
   `Core/Event.lean`, consulted once at the top of `applyOp` before any state is
   read for effect; `checkBounds` runs next; and what a rule cannot decide is
@@ -574,7 +589,7 @@ would need revisiting if the package were ever hoisted differently.
 | `src/sync.ts` | where an order begins, choosing a checkpoint, verifying the tail, compose-and-submit, the joiner's introduction |
 | `src/store.ts` | where the identity lives, what the invite pinned, the entry the order begins with, and the key generations seen |
 | `src/App.tsx` | opening a session, the join flow, the realm view and the receipt a cost carries |
-| `src/conformance.test.ts` | the 217 vectors and the 17 rejections, run against the codecs and `step` |
+| `src/conformance.test.ts` | the 223 vectors and the 17 rejections, run against the codecs and `step` |
 | `src/codec.test.ts` | the byte strings of `Test/Encode.lean`, and every spelling the decoder refuses |
 | `src/crypto.test.ts` | the byte strings of `Test/Sync.lean`, and the identity file's shape |
 | `src/sync.test.ts` | what stops the fold, what it writes down about where the order begins, and which checkpoints are worth anything |

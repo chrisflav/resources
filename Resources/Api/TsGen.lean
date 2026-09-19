@@ -174,7 +174,7 @@ def module : String :=
     interfaceOf "ImportBatch" (Wire.batchJson sampleBatch),
     interfaceOf "Attachment" (Wire.attachmentJson sampleAttachment),
     interfaceOf "LineItem"
-      (Wire.lineItemJson { description := "Haslikuchen", qty := some 2
+      (Wire.lineItemJson { id := "lin", description := "Haslikuchen", qty := some 2
                            amount := ⟨sampleCommodity, 1200⟩ }) [("amount", "Amount")],
     interfaceOf "Rule" (Wire.ruleJson sampleRule),
     interfaceOf "ApiToken" (Wire.tokenJson sampleToken),
@@ -189,7 +189,11 @@ def module : String :=
       (Wire.budgetJson sampleEnv sampleBudget ⟨sampleCommodity, 0⟩ ⟨sampleCommodity, 13583⟩ 2
         #[sampleParticipant] #[sampleStanding] #[sampleClaim])
       [("outstanding", "Amount"), ("allocated", "Amount"), ("among", "Participant[]"),
-       ("standings", "Standing[]"), ("claims", "Claim[]")],
+       ("standings", "Standing[]"), ("claims", "Claim[]"), ("taken", "TakenCost[]")],
+    interfaceOf "TakenCost"
+      (Json.mkObj [("txn", "txn"), ("narration", "the taxi"), ("date", "2026-01-01"),
+                   ("who", Json.arr #[Json.str "anna"]), ("members", Json.arr #[Json.str "a0"])])
+      [("who", "string[]"), ("members", "string[]")],
     interfaceOf "RealmMember"
       (Wire.realmMemberJson { id := Member.selfId, name := "me" } .admin true),
     interfaceOf "Realm" (Wire.realmJson sampleRealmState Member.selfId sampleRealm true false)

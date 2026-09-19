@@ -413,12 +413,17 @@ def encodeTests (r : Report) : Report := Id.run do
   r := bytesAre r "Filter not label" (Filter.not (.label "x")) "0f060178"
   r := checkEq r "the empty state's hash" (Encode.hashState {})
     "5322fecfc92a5e3248a297a3df3eddfb9bd9049504272e4f572b87fa36d4b3bd"
-  -- The two records that grew at format-version 4. Their new fields are written
-  -- last, so a port that reads the old shape stops exactly where the new one
-  -- carries on; these pin where "last" is.
+  -- The two records that grew at format-version 4, and the claims a budget grew
+  -- at 8. New fields are written last, so a port that reads the old shape stops
+  -- exactly where the new one carries on; these pin where "last" is.
   r := bytesAre r "BudgetState bare"
     ({ budget := { id := ⟨"b"⟩, name := "n", note := none, closed := false } } : BudgetState)
-    ("0162016e000000" ++ "1a3030303030303030303030303030303030303030303053454c4600" ++ "00")
+    ("0162016e000000" ++ "1a3030303030303030303030303030303030303030303053454c4600" ++ "0000")
+  r := bytesAre r "BudgetState with a cost somebody took"
+    ({ budget := { id := ⟨"b"⟩, name := "n", note := none, closed := false }
+       claims := [{ txn := ⟨"t"⟩, member := ⟨"m"⟩ }] } : BudgetState)
+    ("0162016e000000" ++ "1a3030303030303030303030303030303030303030303053454c4600" ++
+      "00" ++ "01" ++ "0174" ++ "016d")
   -- And the record that grew at format-version 6: an invoice knows the realm it
   -- was issued in, and it is written last, after the outlays it bills for.
   r := bytesAre r "InvoiceState bare"

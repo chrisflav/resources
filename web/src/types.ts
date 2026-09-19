@@ -125,6 +125,7 @@ export interface Attachment {
 export interface LineItem {
   amount: Amount
   description: string
+  id: string
   qty: number
 }
 
@@ -229,6 +230,15 @@ export interface Budget {
   outstanding: Amount
   shortName: string
   standings: Standing[]
+  taken: TakenCost[]
+}
+
+export interface TakenCost {
+  date: string
+  members: string[]
+  narration: string
+  txn: string
+  who: string[]
 }
 
 export interface RealmMember {

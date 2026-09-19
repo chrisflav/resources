@@ -306,8 +306,18 @@ One priced line printed on a receipt.
 
 Amounts are signed: a till prints a correction as a negative line, and dropping
 the sign would make the lines add up to something that was never charged.
+
+The id is what anything else points at a line *by*. Position will not do: lines
+are read off paper in the order they were printed, and removing one renumbers
+every line after it, so a claim on "line 4" would quietly become a claim on
+something else. An id is minted when the line is written down and never reused,
+and a part of a division keeps the id of the line it was carved from -- two
+parts can therefore carry the same id, which is the truth about them: they are
+two halves of one printed line. `""` is a line written before ids existed.
 -/
 structure LineItem where
+  /-- What points at this line: fresh when it is written, kept when it is split. -/
+  id : String := ""
   description : String
   /-- How many, when the line opens with a count. -/
   qty : Option Int := none

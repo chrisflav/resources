@@ -274,12 +274,13 @@ instance : Wellformed TxnState := Wellformed.ofIso TxnState.tag
 -- a transaction carries the lines it paid for and so has to be able to reach it.
 instance : Codec LineItem :=
   Codec.ofIso
-    (fun l => (l.description, l.qty, l.amount))
-    (fun (description, qty, amount) => { description, qty, amount })
+    (fun l => (l.id, l.description, l.qty, l.amount))
+    (fun (id, description, qty, amount) => { id, description, qty, amount })
 
 instance : LawfulCodec LineItem := Codec.lawful_ofIso (fun _ => rfl)
 
-instance : Wellformed LineItem := Wellformed.ofIso (fun l => (l.description, l.qty, l.amount))
+instance : Wellformed LineItem :=
+  Wellformed.ofIso (fun l => (l.id, l.description, l.qty, l.amount))
 
 instance : Codec Transaction :=
   Codec.ofIso
@@ -683,16 +684,24 @@ instance : LawfulCodec Realm := Codec.lawful_ofIso (fun _ => rfl)
 instance : Wellformed Realm :=
   Wellformed.ofIso (fun r => (r.id, r.name, r.members, r.generation))
 
+instance : Codec CostClaim :=
+  Codec.ofIso (fun c => (c.txn, c.member)) (fun (txn, member) => { txn, member })
+
+instance : LawfulCodec CostClaim := Codec.lawful_ofIso (fun _ => rfl)
+
+instance : Wellformed CostClaim := Wellformed.ofIso (fun c => (c.txn, c.member))
+
 instance : Codec BudgetState :=
   Codec.ofIso
-    (fun b => (b.budget, b.participants, b.realm, b.account, b.label))
-    (fun (budget, participants, realm, account, label) =>
-      { budget, participants, realm, account, label })
+    (fun b => (b.budget, b.participants, b.realm, b.account, b.label, b.claims))
+    (fun (budget, participants, realm, account, label, claims) =>
+      { budget, participants, realm, account, label, claims })
 
 instance : LawfulCodec BudgetState := Codec.lawful_ofIso (fun _ => rfl)
 
 instance : Wellformed BudgetState :=
-  Wellformed.ofIso (fun b => (b.budget, b.participants, b.realm, b.account, b.label))
+  Wellformed.ofIso
+    (fun b => (b.budget, b.participants, b.realm, b.account, b.label, b.claims))
 
 instance : Codec InvoiceState :=
   Codec.ofIso
@@ -977,6 +986,8 @@ def encOp : Op → List UInt8
   | .closeBudget b a c h d t cs l => tagged 30 (Codec.toBytes (b, a, c, h, d, t, cs, l))
   | .reopenBudget b => tagged 31 (Codec.toBytes b)
   | .deleteBudget b => tagged 32 (Codec.toBytes b)
+  | .claimCost b t => tagged 52 (Codec.toBytes (b, t))
+  | .releaseCost b t m => tagged 53 (Codec.toBytes (b, t, m))
   | .issueInvoice i s => tagged 33 (Codec.toBytes (i, s))
   | .setInvoiceStatus i s => tagged 34 (Codec.toBytes (i, s))
   | .settleInvoice i t => tagged 35 (Codec.toBytes (i, t))
@@ -1040,6 +1051,8 @@ def decOpTag : Nat → List UInt8 → Option (Op × List UInt8)
       (fun (b, a, c, h, d, t, cs, l) => .closeBudget b a c h d t cs l)
   | 31, bs => readAs BudgetId bs .reopenBudget
   | 32, bs => readAs BudgetId bs .deleteBudget
+  | 52, bs => readAs (BudgetId × TxId) bs (fun (b, t) => .claimCost b t)
+  | 53, bs => readAs (BudgetId × TxId × MemberId) bs (fun (b, t, m) => .releaseCost b t m)
   | 33, bs => readAs (Invoice × List TxId) bs (fun (i, s) => .issueInvoice i s)
   | 34, bs => readAs (InvoiceId × InvoiceStatus) bs (fun (i, s) => .setInvoiceStatus i s)
   | 35, bs => readAs (InvoiceId × TxId) bs (fun (i, t) => .settleInvoice i t)

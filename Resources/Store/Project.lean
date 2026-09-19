@@ -63,8 +63,9 @@ def writeTxn (db : SQLite) (t : Transaction) : IO Unit := do
     Db.exec db s!"INSERT OR IGNORE INTO txn_attachment (txn_id, sha256, idx)
                   VALUES ({Db.lit t.id.val}, {Db.lit a}, {i})"
   for (it, i) in (t.items.getD []).zipIdx do
-    Db.exec db s!"INSERT INTO txn_item (txn_id, idx, description, qty, minor, commodity)
-                  VALUES ({Db.lit t.id.val}, {i}, {Db.lit it.description},
+    Db.exec db s!"INSERT INTO txn_item
+                  (txn_id, idx, line_id, description, qty, minor, commodity)
+                  VALUES ({Db.lit t.id.val}, {i}, {Db.lit it.id}, {Db.lit it.description},
                           {(it.qty.map toString).getD "NULL"}, {it.amount.minor},
                           {Db.lit it.amount.commodity.code})"
 
@@ -83,16 +84,19 @@ private def writeRealm (db : SQLite) (r : Realm) : IO Unit := do
 /-- Writes an account, rights included. -/
 private def writeAccount (db : SQLite) (a : Account) : IO Unit :=
   Db.exec db s!"INSERT INTO account
-    (id, name, kind, owner_id, commodity, iban, note, closed_on, realm_id, bridge_of, posters)
+    (id, name, kind, owner_id, commodity, iban, note, closed_on, realm_id, bridge_of,
+     mirror_of, posters)
     VALUES ({Db.lit a.id.val}, {Db.lit a.name}, {Db.lit a.kind.toString},
             {Db.lit a.owner.val}, {Db.litOpt (a.commodity.map (·.code))}, {Db.litOpt a.iban},
             {Db.litOpt a.note}, {Db.litOpt (a.closedOn.map (·.toIso))},
             {Db.lit a.realm.val}, {Db.litOpt (a.bridgeOf.map (·.val))},
+            {Db.litOpt (a.mirrorOf.map (·.val))},
             {Db.lit (String.intercalate "," (a.posters.map (·.val)))})
     ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind,
       owner_id = excluded.owner_id, commodity = excluded.commodity, iban = excluded.iban,
       note = excluded.note, closed_on = excluded.closed_on, realm_id = excluded.realm_id,
-      bridge_of = excluded.bridge_of, posters = excluded.posters"
+      bridge_of = excluded.bridge_of, mirror_of = excluded.mirror_of,
+      posters = excluded.posters"
 
 /-- Writes a budget and the people it is divided among. -/
 private def writeBudget (db : SQLite) (b : BudgetState) : IO Unit := do
@@ -110,6 +114,10 @@ private def writeBudget (db : SQLite) (b : BudgetState) : IO Unit := do
     Db.exec db s!"INSERT INTO budget_participant (budget_id, idx, owner_id, account, weight)
       VALUES ({Db.lit b.budget.id.val}, {i}, {Db.lit p.owner.val}, {Db.lit p.account},
               {max p.weight 1})"
+  Db.exec db s!"DELETE FROM budget_claim WHERE budget_id = {Db.lit b.budget.id.val}"
+  for (c, i) in b.claims.zipIdx do
+    Db.exec db s!"INSERT INTO budget_claim (budget_id, idx, txn_id, member_id)
+      VALUES ({Db.lit b.budget.id.val}, {i}, {Db.lit c.txn.val}, {Db.lit c.member.val})"
 
 /-- Writes an invoice, its lines and the outlays it bills for. -/
 private def writeInvoice (db : SQLite) (i : InvoiceState) : IO Unit := do
@@ -168,8 +176,8 @@ private def writeBlob (db : SQLite) (b : BlobState) : IO Unit := do
   Db.exec db s!"DELETE FROM attachment_item WHERE sha256 = {Db.lit b.file.sha256}"
   for (item, i) in b.items.zipIdx do
     Db.exec db s!"INSERT INTO attachment_item
-      (sha256, idx, description, qty, minor, commodity)
-      VALUES ({Db.lit b.file.sha256}, {i}, {Db.lit item.description},
+      (sha256, idx, line_id, description, qty, minor, commodity)
+      VALUES ({Db.lit b.file.sha256}, {i}, {Db.lit item.id}, {Db.lit item.description},
               {(item.qty.map toString).getD "NULL"}, {item.amount.minor},
               {Db.lit item.amount.commodity.code})"
 
@@ -289,8 +297,9 @@ which throws the projection away and computes it again, and the pull path, which
 does the same thing when an event carries a whole state.
 -/
 def projected : List String :=
-  ["txn_label", "txn_attachment", "txn_item", "posting_all", "txn", "invoice_line", "invoice_source",
-   "invoice", "budget_participant", "budget", "attachment_item", "attachment",
+  ["txn_label", "txn_attachment", "txn_item", "posting_all", "txn", "invoice_line",
+   "invoice_source", "invoice", "budget_claim", "budget_participant", "budget",
+   "attachment_item", "attachment",
    "realm_member", "member", "rule", "trip", "party_group", "label", "account", "party",
    "realm", "counter"]
 

@@ -621,6 +621,45 @@ def budgetCloseCmd := `[Cli|
     ...among : String;  "Divide among these instead of the recorded participants."
 ]
 
+def budgetShareCmd := `[Cli|
+  share VIA runBudgetShare;
+  "Puts a budget's costs where the people who were there can see them: a realm \
+   of its own, holding that budget and nothing else. The costs are re-entered \
+   rather than relabelled -- an account stays in the realm it was written in -- \
+   so your books keep the payments and the shared realm sees what they bought."
+
+  FLAGS:
+    w, "with" : Array String; "Who to send a link to, comma separated."
+    r, realm : String;        "What to call the realm (default Shared.<budget>)."
+    e, expires : String;      "ISO date the links stop working (default a fortnight)."
+
+  ARGS:
+    name : String; "Budget name."
+]
+
+def budgetClaimCmd := `[Cli|
+  claim VIA runBudgetClaim;
+  "Says a cost of a budget was yours to bear. A cost several people take is \
+   split equally between them; one nobody takes is divided by the weights, the \
+   way every cost is until somebody says otherwise."
+
+  ARGS:
+    name : String;    "Budget name."
+    ...txns : String; "Transaction ids."
+]
+
+def budgetReleaseCmd := `[Cli|
+  release VIA runBudgetRelease;
+  "Gives a cost back: your own, or anybody's if you administer the realm."
+
+  FLAGS:
+    m, member : String; "Whose claim to give back (yours by default)."
+
+  ARGS:
+    name : String;    "Budget name."
+    ...txns : String; "Transaction ids."
+]
+
 def budgetReopenCmd := `[Cli|
   reopen VIA runBudgetReopen;
   "Reopens a closed budget so more costs can go in. Every division already made \
@@ -679,6 +718,7 @@ def budgetCmd := `[Cli|
 
   SUBCOMMANDS:
     budgetNewCmd; budgetListCmd; budgetShowCmd; budgetAmongCmd; budgetLendCmd;
+    budgetShareCmd; budgetClaimCmd; budgetReleaseCmd;
     budgetContributeCmd; budgetCloseCmd; budgetReopenCmd; budgetAllocateCmd;
     budgetSettleCmd
 ]

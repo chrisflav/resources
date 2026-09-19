@@ -246,6 +246,7 @@ def boundedList {α : Type} (what : String) (xs : List α) (limit : Nat := maxPa
 def boundedItems (items : List LineItem) : Except String Unit := do
   boundedList "a receipt's lines" items maxLines
   for i in items do
+    boundedName "a line id" i.id
     boundedText "a line's description" i.description
     boundedAmount i.amount
     match i.qty with
@@ -431,6 +432,13 @@ def checkBounds : Op → Except String Unit
     boundedList "a close's claim ids" cs
     boundedName "a label id" l.val
   | .reopenBudget b | .deleteBudget b => boundedName "a budget id" b.val
+  | .claimCost b t => do
+    boundedName "a budget id" b.val
+    boundedName "a transaction id" t.val
+  | .releaseCost b t m => do
+    boundedName "a budget id" b.val
+    boundedName "a transaction id" t.val
+    boundedName "a member id" m.val
   | .issueInvoice inv sources => do
     boundedName "an invoice id" inv.id.val
     boundedName "an invoice number" inv.number
@@ -1577,6 +1585,43 @@ def applyChecked (s : State) (author : MemberId) (realm : RealmId) (op : Op) :
     checkBudget s author realm bs
     -- The transactions it touched are left alone: what was decided stays decided.
     return ({ s with budgets := s.budgets.erase id.val }, [.budgetDeleted bs.budget.id])
+  | .claimCost id txn =>
+    let bs ← budgetOf s id
+    ofThisRealm "that budget" realm bs.realm
+    -- Membership rather than `checkBudget`: taking a cost is what everybody in
+    -- the realm is there to do, and it is the one thing about a budget that is
+    -- not an admin's.
+    if !s.isMemberOf author realm then
+      throw "only somebody in that realm may take a cost of its budget"
+    if bs.budget.closed then
+      throw s!"{bs.budget.shortName} is closed; what everybody bore is decided"
+    let t ← txnOf s txn
+    -- A cost *of this budget*: something with a leg on its account. Anything
+    -- else is a transaction somebody happens to be able to see.
+    if !(t.postings.any (fun p => p.account == bs.account)) then
+      throw "that is not a cost in this budget"
+    if bs.claims.contains { txn, member := author } then
+      throw "you have taken that one already"
+    if bs.claims.length ≥ maxClaims then
+      throw s!"a budget carries at most {maxClaims} claims"
+    let taken : BudgetState := { bs with claims := bs.claims ++ [{ txn, member := author }] }
+    return ({ s with budgets := s.budgets.insert id.val taken }, [.budget taken])
+  | .releaseCost id txn member =>
+    let bs ← budgetOf s id
+    ofThisRealm "that budget" realm bs.realm
+    if !s.isMemberOf author realm then
+      throw "only somebody in that realm may give back a cost of its budget"
+    if bs.budget.closed then
+      throw s!"{bs.budget.shortName} is closed; what everybody bore is decided"
+    -- Your own, or anybody's if you run the budget: somebody has to be able to
+    -- correct a list the people in it filled in themselves.
+    if member != author && !s.canAdminister author realm then
+      throw "only the person who took a cost, or an admin of that realm, may give it back"
+    if !(bs.claims.contains { txn, member }) then
+      throw "there is nothing of theirs on that cost to give back"
+    let given : BudgetState :=
+      { bs with claims := bs.claims.filter (fun c => !(c.txn == txn && c.member == member)) }
+    return ({ s with budgets := s.budgets.insert id.val given }, [.budget given])
   | .issueInvoice inv sources =>
     if (s.invoice? inv.id).isSome then
       throw s!"an invoice with that id already exists: {inv.id.val}"

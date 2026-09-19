@@ -1445,6 +1445,101 @@ private def divideTests (ctx : Ctx) (r : Report) : IO Report := do
   return r
 
 /--
+Sharing a budget, and the people in it saying which costs were theirs.
+
+Three properties. A budget moved into a realm of its own leaves your books
+saying exactly what they said before -- the payment is untouched and the mirror
+holds what it bought, so nothing is created or destroyed by moving it. A cost
+somebody takes is borne by whoever took it, split equally when several do. And
+what nobody takes is divided by the weights, which is what a budget did before
+anybody could take anything.
+-/
+private def sharedBudgetTests (ctx : Ctx) (r : Report) : IO Report := do
+  let mut r := r
+  let eur := Commodity.eur
+  let cash ← Accounts.ensure ctx "Assets.Cash.Trip" (kind := some .asset)
+  let spent ← Accounts.ensure ctx "Expenses.Trip.Things" (kind := some .expense)
+  -- Three costs, paid by you, lent into a pot.
+  let mut ids : Array TxId := #[]
+  for (what, minor) in [("hut", 6420), ("taxi", 3000), ("breakfast", 1200)] do
+    let id ← freshId
+    let t : Transaction :=
+      { id := ⟨id⟩, date := (Date.ofIso? "2026-08-06").get!, payee := some what
+        narration := what
+        postings := [{ account := cash.id, amount := ⟨eur, -minor⟩ },
+                     { account := spent.id, amount := ⟨eur, minor⟩ }] }
+    match t.validate with
+    | .error e => return check r s!"the {what} fixture balances ({e})" false
+    | .ok bt => Txns.put ctx bt "test" "fixture"
+    ids := ids.push ⟨id⟩
+  let b ← Budgets.open ctx "Trip" "test"
+  discard <| Budgets.lend ctx b ids "test"
+  let worthBefore ← Balances.netWorth ctx "EUR"
+  -- Into a realm of its own, with a purse there to fund it from.
+  let realm : RealmId := ⟨← freshId⟩
+  let bridge : Account :=
+    { id := ⟨← freshId⟩, name := "Assets.Purse.me.Trip", kind := .asset, realm
+      bridgeOf := some ctx.member }
+  discard <| ctx.commit "test"
+    [.addMember { id := ctx.member, name := "me", party := Party.selfId },
+     .createRealm { id := realm, name := "Shared.Trip", members := [(ctx.member, .admin)] },
+     .grant realm ctx.member .admin bridge] "realm" (fun _ => none) realm
+  let (shared, moved) ← Budgets.shareInto ctx b realm bridge "test"
+  r := checkEq r "every cost moved into the shared realm" moved 3
+  r := checkEq r "and the pot there holds what they came to"
+    ((← Budgets.balance ctx shared eur).minor) 10620
+  r := checkEq r "moving a budget leaves your net worth exactly where it was"
+    (← Balances.netWorth ctx "EUR") worthBefore
+  let st ← ctx.state.get
+  let some mirror := (sortedValues st.accounts).find? (fun a => a.mirrorOf == some bridge.id)
+    | return check r "a mirror account was written" false
+  r := checkEq r "the mirror holds what the payments bought"
+    (st.txnsSorted.foldl (fun n t => n + t.netIn mirror.id "EUR") 0) 10620
+  r := checkEq r "and the bridge holds the same, the other way about"
+    (st.txnsSorted.foldl (fun n t => n + t.netIn bridge.id "EUR") 0) (-10620)
+  -- What was a cost of the old budget is a cost of the shared one now.
+  let costs := (Budget.remaining shared st eur).map (fun (t, _) => t.narration)
+  r := checkEq r "the shared budget holds the three costs" costs.length 3
+  let some taxi := (Budget.remaining shared st eur).find? (fun (t, _) => t.narration == "taxi")
+    | return check r "the taxi is in the shared budget" false
+  -- Taking one, giving it back, taking it again.
+  let took ← Budgets.claimCost ctx shared taxi.1.id "test"
+  r := checkEq r "taking a cost records who took it" took.claims.length 1
+  let twice ← try
+    let _ ← Budgets.claimCost ctx shared taxi.1.id "test"
+    pure false
+  catch _ => pure true
+  r := check r "the same person cannot take one twice" twice
+  let gave ← Budgets.releaseCost ctx shared taxi.1.id ctx.member "test"
+  r := checkEq r "giving it back takes it off the list" gave.claims.length 0
+  let back ← Budgets.claimCost ctx shared taxi.1.id "test"
+  r := checkEq r "and it can be taken again" back.claims.length 1
+  let notACost ← try
+    let _ ← Budgets.claimCost ctx shared (ids[0]!) "test"
+    pure false
+  catch _ => pure true
+  r := check r "a transaction that is not a cost of the budget is refused" notACost
+  -- Closing: the taxi is yours alone, the rest divides between the two of you.
+  let anna ← Parties.ensure ctx "Anna" "contact"
+  let annaPurse ← Accounts.ensure ctx "Assets.Purse.Anna" (kind := some .asset)
+    (owner := some anna.id) (realm := realm)
+  let among : List Participant :=
+    [{ owner := Party.selfId, name := "me", account := "Expenses.Trip.Mine" },
+     { owner := anna.id, name := "Anna", account := annaPurse.name }]
+  discard <| Budgets.close ctx shared "test" eur (some among)
+  let after ← ctx.state.get
+  -- 106.20 in all, of which the taxi's 30.00 is yours alone because you took it;
+  -- the 76.20 nobody took halves, so Anna bears 38.10 and owes it.
+  let standings ← Budgets.standings ctx shared eur
+  r := checkEq r "what nobody took divides by the weights"
+    ((standings.find? (·.name == "Anna")).map (·.amount.minor)) (some 3810)
+  r := checkEq r "and you bear the rest: your half, and all of what you took"
+    ((standings.find? (·.name == "me")).map (·.amount.minor)) (some (-3810))
+  r := checkEq r "a cost somebody took leaves the pot entirely"
+    (Budget.remaining shared after eur).length 0
+  return r
+
+/--
 The workflow, end to end: lend costs into a budget, let somebody else pay for
 part of it, divide it, write the claims up as invoices, and let the money
 arrive.
@@ -2902,6 +2997,8 @@ def main : IO UInt32 := do
     r ← agree ctx r
     r := receiptTests r
     r ← divideTests ctx r
+    r ← agree ctx r
+    r ← sharedBudgetTests ctx r
     r ← agree ctx r
     r ← workflowTests ctx r
     r ← agree ctx r

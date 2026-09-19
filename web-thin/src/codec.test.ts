@@ -173,7 +173,14 @@ const txn: Transaction = {
   labels: ['lab-trip'],
   source: { kind: 'imported', batch: 'batch-7', fingerprint: 'fp-abc' },
   attachments: ['sha-1', 'sha-2'],
-  items: [{ description: 'half of dinner', qty: 1n, amount: { commodity: eur, minor: 4990n } }],
+  items: [
+    {
+      id: 'ln-1',
+      description: 'half of dinner',
+      qty: 1n,
+      amount: { commodity: eur, minor: 4990n },
+    },
+  ],
 }
 
 const filter: Filter = {
@@ -257,6 +264,7 @@ const uploaded: Attachment = {
 }
 
 const lineItem: LineItem = {
+  id: 'line-1',
   description: '18 FORFAIT 1/2 PENSION',
   qty: 18n,
   amount: { commodity: eur, minor: 122400n },
@@ -331,6 +339,7 @@ const budgetState = {
   realm: 'realm-1',
   account: 'acc-budget',
   label: 'lab-trip',
+  claims: [{ txn: 'tx-0001', member: 'anna' }],
 }
 
 /** A state with something in most of its maps. */
@@ -776,7 +785,7 @@ describe('fixed bytes, copied from Test/Encode.lean', () => {
     )
   })
 
-  it('the records that grew at format-version 4 and 5', () => {
+  it('the records that grew at format-version 4, 5 and 8', () => {
     // Their new fields are written last, so a port that reads the old shape
     // stops exactly where the new one carries on; these pin where "last" is.
     bytesAre(
@@ -784,11 +793,29 @@ describe('fixed bytes, copied from Test/Encode.lean', () => {
       {
         budget: { id: 'b', name: 'n', note: null, closed: false },
         participants: [],
+        claims: [],
         realm: selfRealmId,
         account: '',
         label: '',
       },
-      '0162016e000000' + '1a3030303030303030303030303030303030303030303053454c4600' + '00',
+      '0162016e000000' + '1a3030303030303030303030303030303030303030303053454c4600' + '0000',
+    )
+    bytesAre(
+      budgetStateCodec,
+      {
+        budget: { id: 'b', name: 'n', note: null, closed: false },
+        participants: [],
+        claims: [{ txn: 't', member: 'm' }],
+        realm: selfRealmId,
+        account: '',
+        label: '',
+      },
+      '0162016e000000' +
+        '1a3030303030303030303030303030303030303030303053454c4600' +
+        '00' +
+        '01' +
+        '0174' +
+        '016d',
     )
     bytesAre(
       blobStateCodec,

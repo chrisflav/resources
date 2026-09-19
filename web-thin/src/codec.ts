@@ -51,6 +51,7 @@ import type {
   ItemShare,
   Label,
   LedgerEvent,
+  CostClaim,
   LineItem,
   Member,
   Op,
@@ -946,12 +947,14 @@ export const attachmentCodec: Codec<Attachment> = {
 
 export const lineItemCodec: Codec<LineItem> = {
   write(w, l) {
+    w.str(l.id)
     w.str(l.description)
     w.option(l.qty, (w2, q) => w2.int(q))
     amountCodec.write(w, l.amount)
   },
   read(r) {
     return {
+      id: r.str(),
       description: r.str(),
       qty: r.option((r2) => r2.int()),
       amount: amountCodec.read(r),
@@ -1142,6 +1145,17 @@ export const realmCodec: Codec<Realm> = {
   },
 }
 
+export const costClaimCodec: Codec<CostClaim> = {
+  write(w, c) {
+    w.str(c.txn)
+    w.str(c.member)
+  },
+  read(r) {
+    return { txn: r.str(), member: r.str() }
+  },
+  wf: () => true,
+}
+
 export const budgetStateCodec: Codec<BudgetState> = {
   write(w, b) {
     budgetCodec.write(w, b.budget)
@@ -1149,6 +1163,7 @@ export const budgetStateCodec: Codec<BudgetState> = {
     w.str(b.realm)
     w.str(b.account)
     w.str(b.label)
+    w.list(b.claims, (w2, c) => costClaimCodec.write(w2, c))
   },
   read(r) {
     return {
@@ -1157,6 +1172,7 @@ export const budgetStateCodec: Codec<BudgetState> = {
       realm: r.str(),
       account: r.str(),
       label: r.str(),
+      claims: r.list((r2) => costClaimCodec.read(r2)),
     }
   },
 }
@@ -1482,6 +1498,13 @@ export const opCodec: Codec<Op> = {
         return w.str(op.budget)
       case 'deleteBudget':
         return w.str(op.budget)
+      case 'claimCost':
+        w.str(op.budget)
+        return w.str(op.txn)
+      case 'releaseCost':
+        w.str(op.budget)
+        w.str(op.txn)
+        return w.str(op.member)
       case 'issueInvoice':
         invoiceCodec.write(w, op.invoice)
         return strList.write(w, op.sources)
@@ -1677,6 +1700,16 @@ export const opCodec: Codec<Op> = {
         return { tag: 31, kind: 'reopenBudget', budget: r.str() }
       case 32:
         return { tag: 32, kind: 'deleteBudget', budget: r.str() }
+      case 52:
+        return { tag: 52, kind: 'claimCost', budget: r.str(), txn: r.str() }
+      case 53:
+        return {
+          tag: 53,
+          kind: 'releaseCost',
+          budget: r.str(),
+          txn: r.str(),
+          member: r.str(),
+        }
       case 33:
         return { tag: 33, kind: 'issueInvoice', invoice: invoiceCodec.read(r), sources: strList.read(r) }
       case 34:

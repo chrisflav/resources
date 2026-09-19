@@ -62,6 +62,7 @@ private structure AccountRow where
   closedOn : Option String
   realmId : Option String
   bridgeOf : Option String
+  mirrorOf : Option String
   posters : Option String
   deriving Row
 
@@ -192,6 +193,8 @@ private structure AttachmentRow where
 private structure ItemRow where
   /-- What the line hangs off: a receipt's hash, or a transaction's id. -/
   key : String
+  /-- The line's own id, which is what a claim on it names. -/
+  lineId : String
   description : String
   qty : Option Int64
   minor : Int64
@@ -249,7 +252,7 @@ private def members (db : SQLite) : IO (Std.HashMap String Member) := do
 private def accounts (db : SQLite) : IO (Std.HashMap String Account) := do
   let rows ← Db.rows AccountRow db
     "SELECT id, name, kind, owner_id, commodity, iban, note, closed_on,
-            realm_id, bridge_of, posters FROM account"
+            realm_id, bridge_of, mirror_of, posters FROM account"
   return rows.foldl (fun m r =>
     m.insert r.id
       { id := ⟨r.id⟩, name := r.name
@@ -260,6 +263,7 @@ private def accounts (db : SQLite) : IO (Std.HashMap String Account) := do
         closedOn := r.closedOn.bind Date.ofIso?
         realm := ⟨r.realmId.getD Realm.selfId.val⟩
         bridgeOf := r.bridgeOf.map (⟨·⟩)
+        mirrorOf := r.mirrorOf.map (⟨·⟩)
         posters := (splitList r.posters).map (⟨·⟩) }) {}
 
 /-- Every transaction, in every state, with its postings, labels and receipts. -/
@@ -277,7 +281,8 @@ private def txns (db : SQLite) : IO (Std.HashMap String Transaction) := do
   let attachments ← Db.rows PairRow db
     "SELECT txn_id, sha256 FROM txn_attachment ORDER BY txn_id, idx"
   let items ← Db.rows ItemRow db
-    "SELECT txn_id, description, qty, minor, commodity FROM txn_item ORDER BY txn_id, idx"
+    "SELECT txn_id, line_id, description, qty, minor, commodity FROM txn_item
+     ORDER BY txn_id, idx"
   let byTxn := groupBy postings (·.txnId)
   let labelsByTxn := groupBy labels (·.a)
   let filesByTxn := groupBy attachments (·.a)
@@ -300,24 +305,29 @@ private def txns (db : SQLite) : IO (Std.HashMap String Transaction) := do
         items :=
           if h.itemsKnown == (0 : Int64) then none
           else some ((itemsByTxn.getD h.id #[]).toList.map fun i =>
-            { description := i.description, qty := i.qty.map (·.toInt)
+            { id := i.lineId, description := i.description, qty := i.qty.map (·.toInt)
               amount := ⟨Commodity.ofCode i.commodity, i.minor.toInt⟩ }) }) {}
 
 /-- The budgets and who each is divided among. -/
 private def budgets (db : SQLite) : IO (Std.HashMap String BudgetState) := do
   let rows ← Db.rows BudgetRow db
     "SELECT id, name, note, closed_at, realm_id, account_id, label_id FROM budget"
+  let claimRows ← Db.rows TripleRow db
+    "SELECT budget_id, txn_id, member_id FROM budget_claim ORDER BY budget_id, idx"
   let people ← Db.rows ParticipantRow db
     "SELECT p.budget_id, p.owner_id, pa.name, p.account, p.weight
      FROM budget_participant p JOIN party pa ON pa.id = p.owner_id
      ORDER BY p.budget_id, p.idx"
   let byBudget := groupBy people (·.budgetId)
+  let claimsByBudget := groupBy claimRows (·.a)
   return rows.foldl (fun m r =>
     m.insert r.id
       { budget := { id := ⟨r.id⟩, name := r.name, note := r.note, closed := r.closedAt.isSome }
         participants := (byBudget.getD r.id #[]).toList.map fun p =>
           { owner := ⟨p.ownerId⟩, name := p.ownerName, account := p.account
             weight := p.weight.toInt.toNat }
+        claims := (claimsByBudget.getD r.id #[]).toList.map fun c =>
+          { txn := ⟨c.b⟩, member := ⟨c.c⟩ }
         realm := ⟨r.realmId⟩, account := ⟨r.accountId⟩, label := ⟨r.labelId⟩ }) {}
 
 /-- The invoices, their lines and the outlays they bill for. -/
@@ -361,7 +371,7 @@ private def blobs (db : SQLite) : IO (Std.HashMap String BlobState) := do
             commodity, raw_text, extractor, cipher_hash, wrapped_key, realm_id, registered_by
      FROM attachment"
   let items ← Db.rows ItemRow db
-    "SELECT sha256, description, qty, minor, commodity FROM attachment_item
+    "SELECT sha256, line_id, description, qty, minor, commodity FROM attachment_item
      ORDER BY sha256, idx"
   let bySha := groupBy items (·.key)
   return rows.foldl (fun m r =>
@@ -378,7 +388,7 @@ private def blobs (db : SQLite) : IO (Std.HashMap String BlobState) := do
             rawText := r.rawText.getD ""
             extractor := r.extractor.getD "" }
         items := (bySha.getD r.sha256 #[]).toList.map fun i =>
-          { description := i.description, qty := i.qty.map (·.toInt)
+          { id := i.lineId, description := i.description, qty := i.qty.map (·.toInt)
             amount := ⟨Commodity.ofCode i.commodity, i.minor.toInt⟩ }
         registeredBy := ⟨r.registeredBy⟩
         realm := ⟨r.realmId⟩ }) {}

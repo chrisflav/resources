@@ -58,13 +58,13 @@ records its sources as `merged-away` while the entry that absorbed them is a
 revision log records — the member the operations are applied on behalf of is
 `ctx.member`.
 -/
-def commit (ctx : Ctx) (actor : String) (ops : List Op) (kind : String := "write")
-    (kinds : TxId → Option String := fun _ => none)
-    (realm : RealmId := Realm.selfId) : IO (List Change) := do
+def commitParts (ctx : Ctx) (actor : String) (parts : List (RealmId × Op))
+    (kind : String := "write") (kinds : TxId → Option String := fun _ => none) :
+    IO (List Change) := do
   let before ← ctx.state.get
   let mut st := before
   let mut changes : List Change := []
-  for op in ops do
+  for (realm, op) in parts do
     match applyOp st ctx.member realm op with
     | .error e => throw <| IO.userError e
     | .ok (st', cs) =>
@@ -73,11 +73,11 @@ def commit (ctx : Ctx) (actor : String) (ops : List Op) (kind : String := "write
   let eventId ← freshId
   let composedAt ← nowStamp
   ctx.atomically do
-    unless ops.isEmpty do
+    unless parts.isEmpty do
       let (seq, _) ← EventLog.head ctx.db
       discard <| EventLog.append ctx.db
         { id := eventId, author := ctx.member, composedAt, basedOn := seq
-          parts := ops.map fun op => { realm, op } }
+          parts := parts.map fun (realm, op) => { realm, op } }
     for c in changes do
       Project.apply ctx.db c
     for c in changes do
@@ -91,6 +91,18 @@ def commit (ctx : Ctx) (actor : String) (ops : List Op) (kind : String := "write
       | _ => pure ()
   ctx.state.set st
   return changes
+
+/--
+The same, for operations that all speak about one realm.
+
+Which is nearly all of them: a part names one realm, and only the handful of
+things that are true in two rooms at once -- a purse and the bridge it mirrors,
+a cost moved into a realm somebody else can read -- are written any other way.
+-/
+def commit (ctx : Ctx) (actor : String) (ops : List Op) (kind : String := "write")
+    (kinds : TxId → Option String := fun _ => none)
+    (realm : RealmId := Realm.selfId) : IO (List Change) :=
+  ctx.commitParts actor (ops.map fun op => (realm, op)) kind kinds
 
 end Ctx
 

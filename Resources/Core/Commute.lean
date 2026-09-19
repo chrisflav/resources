@@ -374,6 +374,10 @@ def touchesEntities : Op → List Key
   | .openBudget b _ => [.budget b.id]
   | .setParticipants budget _ | .reopenBudget budget | .deleteBudget budget => [.budget budget]
   | .allocate budget .. | .settle budget .. | .closeBudget budget .. => [.budget budget]
+  -- A claim is about one budget, and two claims on one budget are emphatically
+  -- not independent: the list they both write is one entry. Neither is
+  -- `Rebasable`, so nothing reorders them either.
+  | .claimCost budget _ | .releaseCost budget _ _ => [.budget budget]
   | .issueInvoice inv _ => [.invoice inv.id]
   | .setInvoiceStatus id _ | .settleInvoice id _ | .deleteInvoice id => [.invoice id]
   | .addMember m => [.member m.id]

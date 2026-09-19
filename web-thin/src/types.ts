@@ -241,6 +241,15 @@ export interface Attachment {
 
 /** `Resources.LineItem`. */
 export interface LineItem {
+  /**
+   * What points at this line: fresh when it is written, kept when it is split.
+   *
+   * Position will not do. Lines are read off paper in the order they were
+   * printed, and removing one renumbers every line after it, so a claim on
+   * "line 4" would quietly become a claim on something else. `''` is a line
+   * written before ids existed.
+   */
+  id: string
   description: string
   qty: bigint | null
   amount: Amount
@@ -335,6 +344,19 @@ export interface Realm {
  * its claims by the name of its label, and a name is something anybody who may
  * write an account or a label can take. An id cannot be squatted.
  */
+/**
+ * `Resources.CostClaim`: one cost of a budget, taken by one member.
+ *
+ * Not money and moving none: a statement, in the shared order, by the person it
+ * is about. What it is for is the moment the budget is divided — a cost
+ * somebody has taken is borne by whoever took it, and only what nobody took is
+ * divided among everybody by weight.
+ */
+export interface CostClaim {
+  txn: string
+  member: string
+}
+
 export interface BudgetState {
   budget: Budget
   participants: Participant[]
@@ -344,6 +366,8 @@ export interface BudgetState {
   account: string
   /** The label the claims raised for it carry, when one has been pinned. */
   label: string
+  /** The costs people have said were theirs, in the order they said so. */
+  claims: CostClaim[]
 }
 
 /** `Resources.InvoiceState`. */
@@ -489,6 +513,8 @@ export type Op =
     }
   | { tag: 31; kind: 'reopenBudget'; budget: string }
   | { tag: 32; kind: 'deleteBudget'; budget: string }
+  | { tag: 52; kind: 'claimCost'; budget: string; txn: string }
+  | { tag: 53; kind: 'releaseCost'; budget: string; txn: string; member: string }
   | { tag: 33; kind: 'issueInvoice'; invoice: Invoice; sources: string[] }
   | { tag: 34; kind: 'setInvoiceStatus'; id: string; status: InvoiceStatus }
   | { tag: 35; kind: 'settleInvoice'; id: string; txn: string }
@@ -588,6 +614,14 @@ export const maxQty = 100000
 
 /** The largest weight a participant's share may carry. `Resources.maxWeight`. */
 export const maxWeight = 10000
+
+/**
+ * The most claims one budget may carry. `Resources.maxClaims`.
+ *
+ * One per person per cost, and a budget holds costs and people in numbers a
+ * person chose; this is what a long trip between a large group comes to.
+ */
+export const maxClaims = 2000
 
 /** The longest an identifier or a name may be. `Resources.maxIdLength`. */
 export const maxIdLength = 200

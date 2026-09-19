@@ -1046,8 +1046,8 @@ function RealmScreen({ identity, realmRef }: { identity: Identity; realmRef: Rea
           <div className="card-head">nothing shared here yet</div>
           <div className="card-body">
             <div className="muted">
-              This realm has no budget in the part of it you can read. Once somebody opens one and
-              adds a cost it appears here.
+              This realm has no budget in the part of it you can read. Once somebody opens one
+              and adds a cost it appears here.
             </div>
           </div>
         </div>
@@ -1104,6 +1104,19 @@ function BudgetView({
   const bridge =
     accountsSorted(state).find((a) => a.bridgeOf === identity.id && a.realm === realm) ?? null
   const costs = budgetCosts(budget, state)
+  // What people have said was theirs. A cost several of them take is split
+  // equally between them when the budget is divided; one nobody takes is
+  // divided by the weights, the way every cost is until somebody says otherwise.
+  const record = state.budgets.get(budget.id) ?? null
+  const takers = (t: Transaction): string[] =>
+    (record?.claims ?? []).filter((c) => c.txn === t.id).map((c) => c.member)
+  const took = (t: Transaction): boolean => takers(t).includes(identity.id)
+  const nameOfMember = (m: string): string =>
+    state.members.get(m)?.name ?? `${m.slice(0, 8)}…`
+  const take = (t: Transaction) =>
+    act([{ tag: 52, kind: 'claimCost', budget: budget.id, txn: t.id }])
+  const giveBack = (t: Transaction) =>
+    act([{ tag: 53, kind: 'releaseCost', budget: budget.id, txn: t.id, member: identity.id }])
   const stand = standings(budget, state, eur)
   const claims = budgetClaims(budget, state).filter((c) => c.state === 'pending')
   const undivided = remaining(budget, state, eur)
@@ -1299,6 +1312,11 @@ function BudgetView({
               What you paid goes in beside everyone else's and is set against your own share when
               the costs are divided up. The figures above only move once somebody divides it up.
             </div>
+            <div className="muted">
+              Marking a cost <em>mine</em> says you bear it rather than everybody: several people
+              marking one split it equally between them, and a cost nobody marks is divided by
+              the shares. Nothing moves until it is divided, so you can change your mind.
+            </div>
           </div>
         </div>
       )}
@@ -1313,6 +1331,7 @@ function BudgetView({
                 <th>what</th>
                 <th>paid by</th>
                 <th className="num">amount</th>
+                <th>whose</th>
                 <th />
               </tr>
             </thead>
@@ -1323,7 +1342,28 @@ function BudgetView({
                   <td>{t.payee ?? t.narration}</td>
                   <td>{paidBy(t) === 'you' ? <strong>you</strong> : paidBy(t)}</td>
                   <td className="num">{total(t)}</td>
+                  <td className="muted">
+                    {takers(t)
+                      .map((m) => (m === identity.id ? 'you' : nameOfMember(m)))
+                      .join(', ')}
+                  </td>
                   <td>
+                    {!budget.closed && (
+                      <button
+                        className="btn quiet"
+                        style={{ padding: '2px 9px', marginRight: 6 }}
+                        disabled={busy}
+                        onClick={() => void (took(t) ? giveBack(t) : take(t))}
+                        title={
+                          took(t)
+                            ? 'Take it off your share'
+                            : 'Say this one was yours: a cost several people take is split ' +
+                              'equally between them'
+                        }
+                      >
+                        {took(t) ? 'not mine' : 'mine'}
+                      </button>
+                    )}
                     {t.attachments.map((sha, i) => (
                       <button
                         key={sha}

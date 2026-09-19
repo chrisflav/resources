@@ -110,6 +110,23 @@ end Realm
 /-! ## What a budget, an invoice and a receipt look like in state -/
 
 /--
+One cost of a budget, taken by one member: "that one was mine".
+
+A claim is not money and moves none: it is a statement, in the shared order, by
+the person it is about. What it is *for* is the moment the budget is divided --
+a cost somebody has taken is borne by whoever took it, and only what nobody took
+is divided among everybody by weight.
+
+It says nothing about who paid, which the postings already say. A cost you paid
+for and claim is one you bore yourself; a cost somebody else paid for and you
+claim is one you owe them.
+-/
+structure CostClaim where
+  txn : TxId
+  member : MemberId
+  deriving Repr, Inhabited, DecidableEq
+
+/--
 A budget, the people it is divided among, and the three entries it is keyed to.
 
 `realm`, `account` and `label` are written once, by `openBudget`, and every
@@ -127,6 +144,14 @@ structure BudgetState where
   budget : Budget
   /-- Who it is divided among, in the order they were named. -/
   participants : List Participant := []
+  /--
+  The costs people have said were theirs, in the order they said so.
+
+  One entry per person per cost: several people on one cost is that cost split
+  equally between them, which is the whole of the arithmetic. A cost nobody has
+  taken is not here at all.
+  -/
+  claims : List CostClaim := []
   /-- The realm the budget lives in: the one whose admins decide about it. -/
   realm : RealmId := Realm.selfId
   /-- The equity account that holds it. -/
@@ -134,6 +159,21 @@ structure BudgetState where
   /-- The label the claims raised for it carry, when one has been pinned. -/
   label : LabelId := ⟨""⟩
   deriving Repr, Inhabited
+
+namespace BudgetState
+
+/-- Who has taken a cost, in the order they took it. -/
+def claimantsOf (b : BudgetState) (txn : TxId) : List MemberId :=
+  (b.claims.filter (·.txn == txn)).map (·.member)
+
+/-- The costs anybody has taken, in the order they were first taken. -/
+def claimed (b : BudgetState) : List TxId := Id.run do
+  let mut seen : List TxId := []
+  for c in b.claims do
+    if !seen.contains c.txn then seen := seen ++ [c.txn]
+  return seen
+
+end BudgetState
 
 /-- An invoice and the outlays it bills for. -/
 structure InvoiceState where

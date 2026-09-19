@@ -1046,6 +1046,50 @@ CREATE TABLE txn_item (
   PRIMARY KEY (txn_id, idx));
 
 ALTER TABLE txn ADD COLUMN items_known INTEGER NOT NULL DEFAULT 0;
+"),
+  (32, "
+-- A line's own id.
+--
+-- Anything that points at a line has to point at the line rather than at its
+-- *position*: lines are read off paper in the order they were printed, and
+-- removing one renumbers every line after it, so a reference written on Monday
+-- would be describing something else by Tuesday. Every line therefore gets an
+-- id, minted when it is written down; a part of a division keeps the id of the
+-- line it was carved from. The ones already stored get theirs here, from the
+-- receipt's hash and the position they currently hold -- which is a real id for
+-- a line that exists, and not a promise about a position.
+ALTER TABLE attachment_item ADD COLUMN line_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE txn_item ADD COLUMN line_id TEXT NOT NULL DEFAULT '';
+
+UPDATE attachment_item SET line_id = substr(sha256, 1, 16) || '-' || idx WHERE line_id = '';
+UPDATE txn_item SET line_id = txn_id || '-' || idx WHERE line_id = '';
+
+-- Who said a cost of a budget was theirs.
+--
+-- A budget divided by weights says what everybody bears in proportion; this is
+-- how the people in it say which costs were *theirs* instead, one row per
+-- person per cost. Several rows on one cost is that cost split equally between
+-- them, and a cost with no row is divided by weights the way every cost used to
+-- be. Nothing here is money: it is what the division reads to decide whose a
+-- cost was.
+CREATE TABLE budget_claim (
+  budget_id TEXT NOT NULL REFERENCES budget(id) ON DELETE CASCADE,
+  idx INTEGER NOT NULL,
+  txn_id TEXT NOT NULL,
+  member_id TEXT NOT NULL,
+  PRIMARY KEY (budget_id, idx));
+
+CREATE INDEX budget_claim_txn ON budget_claim(txn_id);
+
+-- The bridge a private account mirrors.
+--
+-- `Account.mirrorOf` has been in the state since realms arrived and has never
+-- been in the tables, which nothing noticed while nothing set it: a replay and
+-- a projection agreed because the field was always empty. Sharing a budget sets
+-- it -- it is the only thing saying that the purse in your books and the bridge
+-- in the shared realm are the same money -- so the tables have to be able to
+-- say it too, or `rebuild` finds a difference every time.
+ALTER TABLE account ADD COLUMN mirror_of TEXT;
 ")
 ]
 
