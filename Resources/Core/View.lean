@@ -74,6 +74,15 @@ def purse (v : View) (p : PartyId) : AccountId := ⟨v.pursePrefix ++ p.val⟩
 def isPurse (v : View) (a : AccountId) : Bool := a.val.startsWith v.pursePrefix
 
 /--
+Whose purse an id names, if it names one of this view's.
+
+The inverse of `purse`, and it is one: a realm id has no dot in it, so the
+prefix ends where the party begins whatever the party is called.
+-/
+def partyOfPurse (v : View) (a : AccountId) : Option PartyId :=
+  if v.isPurse a then some ⟨(a.val.drop v.pursePrefix.length).toString⟩ else none
+
+/--
 Whether this view sees an account as itself.
 
 Its own purses count, and that is not a special case: a purse is where this

@@ -136,7 +136,7 @@ from inside `ofBytes`, and only one of them is somebody's fault.
 `conformance/format-version` is this number, and the README beside it says when
 to move it.
 -/
-def formatVersion : Nat := 8
+def formatVersion : Nat := 9
 
 end Encode
 
@@ -695,13 +695,14 @@ instance : Wellformed Member := Wellformed.ofIso (fun m => (m.id, m.name, m.part
 
 instance : Codec Realm :=
   Codec.ofIso
-    (fun r => (r.id, r.name, r.members, r.generation))
-    (fun (id, name, members, generation) => { id, name, members, generation })
+    (fun r => (r.id, r.name, r.members, r.generation, r.accounts))
+    (fun (id, name, members, generation, accounts) =>
+      { id, name, members, generation, accounts })
 
 instance : LawfulCodec Realm := Codec.lawful_ofIso (fun _ => rfl)
 
 instance : Wellformed Realm :=
-  Wellformed.ofIso (fun r => (r.id, r.name, r.members, r.generation))
+  Wellformed.ofIso (fun r => (r.id, r.name, r.members, r.generation, r.accounts))
 
 instance : Codec CostClaim :=
   Codec.ofIso (fun c => (c.txn, c.member)) (fun (txn, member) => { txn, member })
@@ -1005,6 +1006,8 @@ def encOp : Op → List UInt8
   | .closeBudget b a c h d t cs l => tagged 30 (Codec.toBytes (b, a, c, h, d, t, cs, l))
   | .reopenBudget b => tagged 31 (Codec.toBytes b)
   | .deleteBudget b => tagged 32 (Codec.toBytes b)
+  | .showAccount r a => tagged 54 (Codec.toBytes (r, a))
+  | .hideAccount r a => tagged 55 (Codec.toBytes (r, a))
   | .claimCost b t => tagged 52 (Codec.toBytes (b, t))
   | .releaseCost b t m => tagged 53 (Codec.toBytes (b, t, m))
   | .issueInvoice i s => tagged 33 (Codec.toBytes (i, s))
@@ -1070,6 +1073,8 @@ def decOpTag : Nat → List UInt8 → Option (Op × List UInt8)
       (fun (b, a, c, h, d, t, cs, l) => .closeBudget b a c h d t cs l)
   | 31, bs => readAs BudgetId bs .reopenBudget
   | 32, bs => readAs BudgetId bs .deleteBudget
+  | 54, bs => readAs (RealmId × Account) bs (fun (r, a) => .showAccount r a)
+  | 55, bs => readAs (RealmId × AccountId) bs (fun (r, a) => .hideAccount r a)
   | 52, bs => readAs (BudgetId × TxId) bs (fun (b, t) => .claimCost b t)
   | 53, bs => readAs (BudgetId × TxId × MemberId) bs (fun (b, t, m) => .releaseCost b t m)
   | 33, bs => readAs (Invoice × List TxId) bs (fun (i, s) => .issueInvoice i s)

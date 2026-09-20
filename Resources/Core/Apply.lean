@@ -139,7 +139,8 @@ def checkRights (s : State) (author : MemberId) (realm : RealmId) (op : Op) :
   -- sequencer holds for them on the realm the *part* names, so that is the only
   -- realm they may speak about: a viewer of one realm writing themselves into
   -- somebody else's was a door with nothing behind it.
-  | .grant target .. | .revoke target _ | .setRole target .. | .rotateRealmKey target =>
+  | .grant target .. | .revoke target _ | .setRole target .. | .rotateRealmKey target
+  | .showAccount target _ | .hideAccount target _ =>
     if target != realm then
       throw "a part can only change the realm it names"
   | _ => pure ()
@@ -499,6 +500,12 @@ def checkBounds : Op → Except String Unit
     boundedName "a realm id" r.val
     boundedName "a member id" m.val
   | .rotateRealmKey r => boundedName "a realm id" r.val
+  | .showAccount r a => do
+    boundedName "a realm id" r.val
+    boundedAccount a
+  | .hideAccount r a => do
+    boundedName "a realm id" r.val
+    boundedName "an account id" a.val
   | .snapshot _ => .ok ()
   | .payClaim c p d => do
     boundedName "a transaction id" c.val
@@ -540,26 +547,66 @@ def ofThisRealm? {α : Type} (name : α → String) (of : α → RealmId) (realm
 /-! ## Writing -/
 
 /--
+Whether a part of this realm may name this account at all.
+
+Two ways, and the second is what a view adds. The account was written in this
+realm, which is how it has always been; or this realm was *shown* it, which is
+one budget kept in somebody's own books being readable by the people it is
+shared with. Nothing else reaches a part: a leg on an account a realm neither
+owns nor was shown is refused here, and that refusal is the whole of what stops
+a reader being told about money that is not theirs to see.
+-/
+def visible (s : State) (realm : RealmId) (a : Account) : Bool :=
+  a.realm == realm || ((s.realm? realm).map (fun r => r.accounts.contains a.id)).getD false
+
+/--
+The purses a part names, written into the state if they are not there yet.
+
+A purse is *derived*: `Core.View.purse` says what one is called, and the name is
+all anybody needs to post to it or to fold its balance. But an account no record
+describes is one a reader can only print as an id, and every check below asks
+the state for the account it is about — so the first leg written on a purse is
+what brings it into being, owned by the person it stands for and living in the
+room that named it. Nothing decides any of it but the id, so every reader of
+that part writes exactly the same record.
+-/
+def withPurses (s : State) (realm : RealmId) (ps : List Posting) : State × List Change := Id.run do
+  let some r := s.realm? realm | return (s, [])
+  let mut st := s
+  let mut changes : List Change := []
+  for p in ps do
+    if (st.account? p.account).isSome then continue
+    let some party := r.view.partyOfPurse p.account | continue
+    let name := "Purse." ++ ((st.party? party).map (·.name)).getD party.val
+    let held := (sortedValues st.members).find? (fun m => m.party == party)
+    let a : Account :=
+      { id := p.account, name, kind := .asset, owner := party, realm
+        bridgeOf := held.map (·.id) }
+    st := { st with accounts := st.accounts.insert a.id.val a }
+    changes := changes ++ [.account a]
+  return (st, changes)
+
+/--
 Checks that these postings may be written here.
 
 Three things have to hold of every leg, and they are the reason a part can be
-applied on its own: the account exists and belongs to this realm, it is open,
-and the author may post to it.
+applied on its own: the account is one this realm can see, it is open, and the
+author may post to it here.
 
 `allowed` names the accounts the caller has already established a right to,
 which is how `payClaim` writes the two legs of a claim between purses neither of
 which is the author's alone. It never excuses the other two checks: an account
-named there still has to exist, be open, and be in this realm.
+named there still has to exist, be open, and be visible here.
 -/
 def checkPostings (s : State) (author : MemberId) (realm : RealmId)
     (ps : List Posting) (allowed : List AccountId := []) : Except String Unit := do
   for p in ps do
     let a ← accountOf s p.account
-    if a.realm != realm then
+    if !visible s realm a then
       throw s!"{a.name} is not in this realm"
     if a.closedOn.isSome then
       throw s!"{a.name} is closed; it cannot take new postings"
-    if !(allowed.contains p.account || s.canPostLeg author a p.amount.minor) then
+    if !(allowed.contains p.account || s.canPostLegIn author realm a p.amount.minor) then
       throw s!"you may not post to {a.name}"
 
 /--
@@ -576,9 +623,9 @@ def checkOwnLegs (s : State) (author : MemberId) (realm : RealmId) (ps : List Po
     Except String Unit := do
   for p in ps do
     let a ← accountOf s p.account
-    if a.realm != realm then
+    if !visible s realm a then
       throw s!"{a.name} is not in this realm"
-    if !s.canPostLeg author a p.amount.minor then
+    if !s.canPostLegIn author realm a p.amount.minor then
       throw s!"you may not post to {a.name}"
 
 /--
@@ -1948,6 +1995,40 @@ def applyChecked (s : State) (author : MemberId) (realm : RealmId) (op : Op) :
     let some r := s.realm? target | throw s!"no such realm: {target.val}"
     let rotated := { r with generation := r.generation + 1 }
     return ({ s with realms := s.realms.insert target.val rotated }, [.realm rotated])
+  | .showAccount target a =>
+    -- What a realm may see is settled by its own admin, which `checkRights`
+    -- has already established. Whether the account was this author's to show
+    -- is the other half of it, and it is a question only somebody who can see
+    -- where the account lives is in a position to ask: the people in the room
+    -- have never heard of that realm, and never will. So a reader who knows
+    -- the account checks that the author may administer the realm it was
+    -- written in, and a reader who does not takes the record as the room's
+    -- account of itself. Nothing is lost by the asymmetry, because the node
+    -- whose account it is *is* a reader who knows it — and it is that node
+    -- that later decides what to write into this room.
+    let some r := s.realm? target | throw s!"no such realm: {target.val}"
+    match s.account? a.id with
+    | some existing =>
+      if !s.canAdminister author existing.realm then
+        throw s!"{existing.name} is not yours to show"
+      if existing.realm == target then
+        throw s!"{existing.name} is already this realm's own"
+      let shown := r.withAccount a.id
+      return ({ s with realms := s.realms.insert target.val shown }, [.realm shown])
+    | none =>
+      -- The room learns what the account is, which is the only way a leg on it
+      -- can ever be read as anything but an id. It stays in the realm it says
+      -- it is in: showing an account does not move it, and a record claiming
+      -- this room's own realm would be a room writing itself an account.
+      if a.realm == target then
+        throw "an account shown to a realm is one that lives somewhere else"
+      let shown := r.withAccount a.id
+      return ({ s with realms := s.realms.insert target.val shown
+                       accounts := s.accounts.insert a.id.val a }, [.account a, .realm shown])
+  | .hideAccount target id =>
+    let some r := s.realm? target | throw s!"no such realm: {target.val}"
+    let hidden := r.withoutAccount id
+    return ({ s with realms := s.realms.insert target.val hidden }, [.realm hidden])
   | .snapshot _ =>
     -- Unreachable: `checkRights` refuses a snapshot before `applyChecked` is
     -- called at all. It is refused here too so that the two doors say the same

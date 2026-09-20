@@ -156,6 +156,19 @@ inductive Op
   | setRole (realm : RealmId) (member : MemberId) (role : RealmRole)
   /-- Bumps a realm's key generation. -/
   | rotateRealmKey (realm : RealmId)
+  /--
+  Shows a realm an account that is not its own, so legs on it can be written in
+  parts of that realm.
+
+  The account travels with it because the realm being shown it has never heard
+  of it: a reader folding this realm's history has to come away knowing what the
+  account is called, what kind it is and whose it is, or the legs that follow
+  name an id and nothing more. Nothing about the account moves — it stays
+  written in the realm it was written in, and its owner stays its owner.
+  -/
+  | showAccount (realm : RealmId) (account : Account)
+  /-- Stops showing one. Sight is taken away forwards: what was read stays read. -/
+  | hideAccount (realm : RealmId) (account : AccountId)
   -- Genesis
   /--
   The whole state a log starts from.
@@ -268,6 +281,10 @@ def Op.rights : Op → Rights
   -- Members and realms
   | .addMember _ | .grant .. => .attest
   | .removeMember _ | .revoke .. | .setRole .. | .rotateRealmKey _ => .admin
+  -- What a realm may see is the realm's own business, so an admin of it decides.
+  -- Whether the account was the author's to show is a second question, asked in
+  -- `applyOp` by whoever is in a position to answer it.
+  | .showAccount .. | .hideAccount .. => .admin
   -- Genesis. Never consulted: `checkRights` refuses a snapshot before it reads
   -- this table, because where a snapshot may be applied is a fact about the
   -- reader's position in the log rather than about who wrote it. The strictest

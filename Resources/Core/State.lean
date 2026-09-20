@@ -1,4 +1,5 @@
 import Resources.Core.Entities
+import Resources.Core.View
 import Resources.Core.Receipt
 import Resources.Core.Invoice
 
@@ -82,6 +83,17 @@ structure Realm where
   members : List (MemberId × RealmRole) := []
   /-- The key generation, bumped whenever a revoke or a rotation invalidates it. -/
   generation : Nat := 0
+  /--
+  Accounts this realm may see that are not its own, sorted by id.
+
+  A realm owns the accounts written in it, and those it sees anyway. This is
+  everything *else* it was shown: one budget kept in somebody's own books, say,
+  which is what makes a budget shareable without being moved. A leg on one of
+  these may be written in a part of this realm, which is what `Apply.visible`
+  decides, and nothing else about the account changes — it stays where it was
+  written, and its owner stays its owner.
+  -/
+  accounts : List AccountId := []
   deriving Repr, Inhabited
 
 namespace Realm
@@ -104,6 +116,18 @@ def withMember (r : Realm) (m : MemberId) (role : RealmRole) : Realm :=
 /-- Drops a member from this realm. -/
 def withoutMember (r : Realm) (m : MemberId) : Realm :=
   { r with members := r.members.filter (fun x => x.1 != m) }
+
+/-- What this realm can see, as `Core.View` reads it. -/
+def view (r : Realm) : View := { realm := r.id, accounts := r.accounts }
+
+/-- Shows an account to this realm, keeping the list sorted and free of repeats. -/
+def withAccount (r : Realm) (a : AccountId) : Realm :=
+  if r.accounts.contains a then r
+  else { r with accounts := (r.accounts ++ [a]).mergeSort (fun x y => x.val ≤ y.val) }
+
+/-- Stops showing one. What was already read stays read: sight is taken away forwards. -/
+def withoutAccount (r : Realm) (a : AccountId) : Realm :=
+  { r with accounts := r.accounts.filter (· != a) }
 
 end Realm
 
@@ -401,6 +425,22 @@ Whether a member may write into an account at all.
 that move a whole account rather than a posting — a merge, a deletion — ask.
 -/
 def canPost (s : State) (m : MemberId) (a : Account) : Bool := s.canPostLeg m a 1
+
+/--
+Whether a member may write this leg in a part of *this* realm.
+
+`canPostLeg` asks the realm the account was written in, which is the same
+question whenever an account can only be named by its own realm. An account a
+realm was *shown* is named in parts of a realm that is not the one it lives in,
+and the people who may write there are that realm's — so the room the part
+speaks in is the one asked. For every part naming only its own realm's accounts
+the two are the same question with the same answer.
+-/
+def canPostLegIn (s : State) (m : MemberId) (realm : RealmId) (a : Account) (minor : Int) : Bool :=
+  a.bridgeOf == some m || a.posters.contains m ||
+    (match s.realm? realm with
+     | some r => r.isAdmin m || (r.isMember m && s.openBudgetAccount a.id && minor > 0)
+     | none => false)
 
 /-- Whether a member administers a realm. -/
 def canAdminister (s : State) (m : MemberId) (realm : RealmId) : Bool :=
