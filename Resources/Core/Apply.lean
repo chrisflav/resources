@@ -91,7 +91,7 @@ namespace Resources
 
 /-- The account with this id, or the error naming what is missing. -/
 def accountOf (s : State) (id : AccountId) : Except String Account :=
-  match s.account? id with
+  match s.knows? id with
   | some a => .ok a
   | none => .error s!"no such account: {id.val}"
 
@@ -140,7 +140,7 @@ def checkRights (s : State) (author : MemberId) (realm : RealmId) (op : Op) :
   -- realm they may speak about: a viewer of one realm writing themselves into
   -- somebody else's was a door with nothing behind it.
   | .grant target .. | .revoke target _ | .setRole target .. | .rotateRealmKey target
-  | .showAccount target _ | .hideAccount target _ =>
+  | .showAccount target _ | .hideAccount target _ | .showBudget target _ =>
     if target != realm then
       throw "a part can only change the realm it names"
   | _ => pure ()
@@ -506,6 +506,12 @@ def checkBounds : Op → Except String Unit
   | .hideAccount r a => do
     boundedName "a realm id" r.val
     boundedName "an account id" a.val
+  | .showBudget r b => do
+    boundedName "a realm id" r.val
+    boundedName "a budget id" b.budget.id.val
+    boundedName "a budget name" b.budget.name
+    boundedList "a budget's participants" b.participants
+    boundedList "a budget's claims" b.claims
   | .snapshot _ => .ok ()
   | .payClaim c p d => do
     boundedName "a transaction id" c.val
@@ -547,6 +553,17 @@ def ofThisRealm? {α : Type} (name : α → String) (of : α → RealmId) (realm
 /-! ## Writing -/
 
 /--
+Whether a part of this realm may speak about this budget.
+
+The budget is this realm's own, or this realm was shown it — and being shown a
+budget means being shown the account that holds it, because a pot whose costs
+are legs you cannot read is not a pot you can say anything about.
+-/
+def budgetVisible (s : State) (realm : RealmId) (bs : BudgetState) : Bool :=
+  bs.realm == realm ||
+    ((s.realm? realm).map (fun r => (r.shown? bs.account).isSome)).getD false
+
+/--
 Whether a part of this realm may name this account at all.
 
 Two ways, and the second is what a view adds. The account was written in this
@@ -557,34 +574,7 @@ owns nor was shown is refused here, and that refusal is the whole of what stops
 a reader being told about money that is not theirs to see.
 -/
 def visible (s : State) (realm : RealmId) (a : Account) : Bool :=
-  a.realm == realm || ((s.realm? realm).map (fun r => r.accounts.contains a.id)).getD false
-
-/--
-The purses a part names, written into the state if they are not there yet.
-
-A purse is *derived*: `Core.View.purse` says what one is called, and the name is
-all anybody needs to post to it or to fold its balance. But an account no record
-describes is one a reader can only print as an id, and every check below asks
-the state for the account it is about — so the first leg written on a purse is
-what brings it into being, owned by the person it stands for and living in the
-room that named it. Nothing decides any of it but the id, so every reader of
-that part writes exactly the same record.
--/
-def withPurses (s : State) (realm : RealmId) (ps : List Posting) : State × List Change := Id.run do
-  let some r := s.realm? realm | return (s, [])
-  let mut st := s
-  let mut changes : List Change := []
-  for p in ps do
-    if (st.account? p.account).isSome then continue
-    let some party := r.view.partyOfPurse p.account | continue
-    let name := "Purse." ++ ((st.party? party).map (·.name)).getD party.val
-    let held := (sortedValues st.members).find? (fun m => m.party == party)
-    let a : Account :=
-      { id := p.account, name, kind := .asset, owner := party, realm
-        bridgeOf := held.map (·.id) }
-    st := { st with accounts := st.accounts.insert a.id.val a }
-    changes := changes ++ [.account a]
-  return (st, changes)
+  a.realm == realm || ((s.realm? realm).map (fun r => (r.shown? a.id).isSome)).getD false
 
 /--
 Checks that these postings may be written here.
@@ -629,6 +619,34 @@ def checkOwnLegs (s : State) (author : MemberId) (realm : RealmId) (ps : List Po
       throw s!"you may not post to {a.name}"
 
 /--
+Whether a reading of an entry is a *redaction*: one in which somebody's purse
+stands in for legs its room was not shown.
+
+Read off the legs, because that is where it shows. A part carrying a purse of
+the realm it names is a part written for a room that could not see everything
+the entry did, and the purse is what it was shown instead.
+-/
+def isRedaction (realm : RealmId) (t : Transaction) : Bool :=
+  t.postings.any (fun p => (purseId? p.account).map (·.1) == some realm)
+
+/--
+Whether a reading already held supersedes the one arriving.
+
+One entry, two readings: the full one, and a room's, in which a purse stands
+for what that room may not see. A reader holding both keys receives both, and
+they are not two entries to be merged — merging them would count the shared
+leg twice. So the fuller one wins, whichever arrives first: a redaction is
+taken only when nothing is there or when what is there is a redaction too, and
+a reading with no purse in it replaces whatever was.
+
+Two rooms each showing a different part of one entry is the case this does not
+settle: the reader keeps whichever they were told first, which is a reading
+short of what they are entitled to rather than a wrong one, and never two.
+-/
+def supersedes (realm : RealmId) (old t : Transaction) : Bool :=
+  isRedaction realm t && !old.postings.any (fun p => (purseId? p.account).isSome)
+
+/--
 The guard a rewrite makes about the transaction it is replacing.
 
 A `putTransaction` that names an id the ledger already has is a rewrite, and the
@@ -642,6 +660,10 @@ def putGuard (s : State) (author : MemberId) (realm : RealmId) (t : Transaction)
     Except String Unit := do
   match s.txn? t.id with
   | some old =>
+    -- A redaction of an entry this reader already has in fuller form says
+    -- nothing they do not know, and taking it would lose what they can see.
+    if supersedes realm old t then
+      throw s!"{t.id.val} is already here in fuller form than this reading of it"
     -- A claim is changed by a claim verb. `resolveClaim` and `voidClaim` both ask
     -- who the claim is owed to; plain `putTransaction` asked nothing about what
     -- it was replacing, so an author who could post both legs of a stored claim
@@ -688,9 +710,12 @@ def putTxn (s : State) (author : MemberId) (realm : RealmId) (t : Transaction)
   if t.state == .pending && t.postings.length != 2 then
     throw "a claim is exactly two legs"
   let old := s.txn? t.id
-  -- Other realms' legs are none of this part's business, so they stay.
+  -- Other realms' legs are none of this part's business, so they stay. A leg on
+  -- a purse is not one of them: a purse is how *this* reading of an entry shows
+  -- what it could not see, so it belongs to the reading rather than to another
+  -- room, and a rewrite replaces it along with everything else this part says.
   let kept := ((old.map (·.postings)).getD []).filter
-    (fun p => s.realmOf p.account != some realm)
+    (fun p => (s.account? p.account).isSome && s.realmOf p.account != some realm)
   -- The bound again, on what is about to be written rather than on what the
   -- operation carried. `checkBounds` refuses a *submitted* transaction of more
   -- than `maxPostings` legs; it says nothing about one an intent *computed*, and
@@ -1213,7 +1238,10 @@ def applyChecked (s : State) (author : MemberId) (realm : RealmId) (op : Op) :
       throw s!"account still has {n} postings; move them first"
     return ({ s with accounts := s.accounts.erase id.val }, [.accountDeleted id])
   | .setAccountRights id posters =>
-    let a ← accountOf s id
+    -- The account itself, not a purse: a purse is read off its id and belongs
+    -- to the room that named it, so there is nothing here to hand over or to
+    -- open to anybody.
+    let some a := s.account? id | throw s!"no such account: {id.val}"
     if a.realm != realm then
       throw s!"{a.name} is not in this realm"
     if !s.canAdminister author a.realm then
@@ -1221,7 +1249,7 @@ def applyChecked (s : State) (author : MemberId) (realm : RealmId) (op : Op) :
     let opened := { a with posters }
     return ({ s with accounts := s.accounts.insert id.val opened }, [.account opened])
   | .setAccountOwner id owner =>
-    let a ← accountOf s id
+    let some a := s.account? id | throw s!"no such account: {id.val}"
     if a.realm != realm then
       throw s!"{a.name} is not in this realm"
     if !s.canAdminister author a.realm then
@@ -1634,7 +1662,8 @@ def applyChecked (s : State) (author : MemberId) (realm : RealmId) (op : Op) :
     return ({ s with budgets := s.budgets.erase id.val }, [.budgetDeleted bs.budget.id])
   | .claimCost id txn =>
     let bs ← budgetOf s id
-    ofThisRealm "that budget" realm bs.realm
+    if !budgetVisible s realm bs then
+      throw s!"{bs.budget.shortName} is not in this realm"
     -- Membership rather than `checkBudget`: taking a cost is what everybody in
     -- the realm is there to do, and it is the one thing about a budget that is
     -- not an admin's.
@@ -1655,7 +1684,8 @@ def applyChecked (s : State) (author : MemberId) (realm : RealmId) (op : Op) :
     return ({ s with budgets := s.budgets.insert id.val taken }, [.budget taken])
   | .releaseCost id txn member =>
     let bs ← budgetOf s id
-    ofThisRealm "that budget" realm bs.realm
+    if !budgetVisible s realm bs then
+      throw s!"{bs.budget.shortName} is not in this realm"
     if !s.isMemberOf author realm then
       throw "only somebody in that realm may give back a cost of its budget"
     if bs.budget.closed then
@@ -2007,28 +2037,43 @@ def applyChecked (s : State) (author : MemberId) (realm : RealmId) (op : Op) :
     -- whose account it is *is* a reader who knows it — and it is that node
     -- that later decides what to write into this room.
     let some r := s.realm? target | throw s!"no such realm: {target.val}"
+    -- Showing an account does not move it and does not make it this ledger's:
+    -- the record is the room's copy of somebody else's account, and it is kept
+    -- with the room. A record claiming the room's own realm would be a room
+    -- writing itself an account, which `putAccount` is for.
+    if a.realm == target then
+      throw "an account shown to a realm is one that lives somewhere else"
+    if (purseId? a.id).isSome then
+      throw "a purse is a room's own reading of somebody's money, not a thing to show"
     match s.account? a.id with
     | some existing =>
       if !s.canAdminister author existing.realm then
         throw s!"{existing.name} is not yours to show"
-      if existing.realm == target then
-        throw s!"{existing.name} is already this realm's own"
-      let shown := r.withAccount a.id
+      let shown := r.withAccount existing
       return ({ s with realms := s.realms.insert target.val shown }, [.realm shown])
     | none =>
       -- The room learns what the account is, which is the only way a leg on it
-      -- can ever be read as anything but an id. It stays in the realm it says
-      -- it is in: showing an account does not move it, and a record claiming
-      -- this room's own realm would be a room writing itself an account.
-      if a.realm == target then
-        throw "an account shown to a realm is one that lives somewhere else"
-      let shown := r.withAccount a.id
+      -- can ever be read as anything but an id. It is written down as well as
+      -- kept with the room: a reader that cannot look the account up cannot
+      -- check that a leg on it is open, or say whose it is.
+      let shown := r.withAccount a
       return ({ s with realms := s.realms.insert target.val shown
                        accounts := s.accounts.insert a.id.val a }, [.account a, .realm shown])
   | .hideAccount target id =>
     let some r := s.realm? target | throw s!"no such realm: {target.val}"
     let hidden := r.withoutAccount id
     return ({ s with realms := s.realms.insert target.val hidden }, [.realm hidden])
+  | .showBudget target bs =>
+    let some r := s.realm? target | throw s!"no such realm: {target.val}"
+    if bs.realm == target then
+      throw "a budget shown to a realm is one that lives somewhere else"
+    -- The pot has to be readable here, or its costs are legs this room cannot
+    -- see and everything it could say about them would be about nothing.
+    if (r.shown? bs.account).isNone then
+      throw s!"show this realm {bs.budget.shortName}'s account first"
+    -- The budget itself, under its own id: the room reads the one that exists
+    -- rather than opening a second of the same name.
+    return ({ s with budgets := s.budgets.insert bs.budget.id.val bs }, [.budget bs])
   | .snapshot _ =>
     -- Unreachable: `checkRights` refuses a snapshot before `applyChecked` is
     -- called at all. It is refused here too so that the two doors say the same

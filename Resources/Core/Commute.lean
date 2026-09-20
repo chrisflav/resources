@@ -406,6 +406,16 @@ def Rebasable : Op → Bool
   | .attach _ _ | .detach _ _ | .forgetBlob _ | .recordImportBatch _ => true
   | _ => false
 
+/--
+A rebasable operation never shows a realm an account.
+
+Showing one changes who may write where, which is the reason the table above
+leaves every realm operation out. So the invariant carries through a rebase
+without anybody having to say so again.
+-/
+theorem shows_of_rebasable {o : Op} (h : o.Rebasable = true) : o.shows = false := by
+  cases o <;> simp_all [Op.Rebasable, Op.shows]
+
 /-- Whether two lists of keys have nothing in common. -/
 def disjointKeys (xs ys : List Key) : Bool :=
   xs.all (fun k => ys.all (fun k' => decide (k ≠ k')))
@@ -736,10 +746,10 @@ theorem symm {o : Op} {s t : State} (h : Agree o s t) : Agree o t s :=
 
 end Agree
 
-/-- Two states with the same accounts read an account the same way. -/
-theorem accountOf_congr {s t : State} (ha : s.accounts = t.accounts) (id : AccountId) :
-    accountOf s id = accountOf t id := by
-  simp only [accountOf, State.account?, ha]
+/-- Two states with the same accounts and members read an account the same way. -/
+theorem accountOf_congr {s t : State} (ha : s.accounts = t.accounts)
+    (hm : s.members = t.members) (id : AccountId) : accountOf s id = accountOf t id := by
+  simp only [accountOf, State.knows?, State.account?, State.purse?, ha, hm]
 
 /-- Two states with the same realms and budgets agree on who may write which leg. -/
 theorem canPostLeg_congr {s t : State} (hr : s.realms = t.realms) (hb : s.budgets = t.budgets)
@@ -751,26 +761,41 @@ theorem canPost_congr {s t : State} (hr : s.realms = t.realms) (hb : s.budgets =
     (m : MemberId) (a : Account) : s.canPost m a = t.canPost m a :=
   canPostLeg_congr hr hb m a 1
 
+/-- The same, for the right read against the room a part speaks in. -/
+theorem canPostLegIn_congr {s t : State} (hr : s.realms = t.realms) (hb : s.budgets = t.budgets)
+    (m : MemberId) (r : RealmId) (a : Account) (n : Int) :
+    s.canPostLegIn m r a n = t.canPostLegIn m r a n := by
+  simp only [State.canPostLegIn, State.realm?, State.openBudgetAccount, hr, hb]
+
+/-- Two states with the same realms see the same accounts from a part. -/
+theorem visible_congr {s t : State} (hr : s.realms = t.realms) (r : RealmId) (a : Account) :
+    visible s r a = visible t r a := by
+  simp only [visible, State.realm?, hr]
+
 /-- Checking a part's postings reads nothing but the accounts, the realms and the budgets. -/
 theorem checkPostings_congr {s t : State} (ha : s.accounts = t.accounts)
-    (hr : s.realms = t.realms) (hb : s.budgets = t.budgets) (au : MemberId) (r : RealmId)
+    (hr : s.realms = t.realms) (hb : s.budgets = t.budgets) (hm : s.members = t.members)
+    (au : MemberId) (r : RealmId)
     (allowed : List AccountId) (ps : List Posting) :
     checkPostings s au r ps allowed = checkPostings t au r ps allowed := by
   induction ps with
   | nil => rfl
   | cons p ps ih =>
     simp only [checkPostings, List.forIn_cons, bind, Except.bind, throw, throwThe,
-      MonadExceptOf.throw, pure, Except.pure, accountOf_congr ha, canPostLeg_congr hr hb] at ih ⊢
+      MonadExceptOf.throw, pure, Except.pure, accountOf_congr ha hm, canPostLegIn_congr hr hb,
+      visible_congr hr] at ih ⊢
 
 /-- Checking legs that are already there reads the same three maps. -/
 theorem checkOwnLegs_congr {s t : State} (ha : s.accounts = t.accounts)
-    (hr : s.realms = t.realms) (hb : s.budgets = t.budgets) (au : MemberId) (r : RealmId)
+    (hr : s.realms = t.realms) (hb : s.budgets = t.budgets) (hm : s.members = t.members)
+    (au : MemberId) (r : RealmId)
     (ps : List Posting) : checkOwnLegs s au r ps = checkOwnLegs t au r ps := by
   induction ps with
   | nil => rfl
   | cons p ps ih =>
     simp only [checkOwnLegs, List.forIn_cons, bind, Except.bind, throw, throwThe,
-      MonadExceptOf.throw, pure, Except.pure, accountOf_congr ha, canPostLeg_congr hr hb] at ih ⊢
+      MonadExceptOf.throw, pure, Except.pure, accountOf_congr ha hm, canPostLegIn_congr hr hb,
+      visible_congr hr] at ih ⊢
 
 /-- Two states with the same realms agree about who administers one. -/
 theorem canAdminister_congr {s t : State} (hr : s.realms = t.realms) (m : MemberId)
@@ -799,17 +824,29 @@ theorem checkRights_congr {s t : State} {o : Op} (hreb : o.Rebasable = true)
   cases o <;> simp_all [checkRights, Op.rights, Op.Rebasable]
 
 /-- Two states with the same accounts agree on which realm a posting lands in. -/
-theorem realmOf_congr {s t : State} (ha : s.accounts = t.accounts) :
-    s.realmOf = t.realmOf := by
+theorem realmOf_congr {s t : State} (ha : s.accounts = t.accounts)
+    (hm : s.members = t.members) : s.realmOf = t.realmOf := by
   funext id
-  simp only [State.realmOf, State.account?, ha]
+  simp only [State.realmOf, State.knows?, State.account?, State.purse?, ha, hm]
+
+/--
+The legs a rewrite keeps are the same in two states holding the same accounts:
+which ones are another realm's, and which are purses of this reading.
+-/
+theorem keptPred_congr {s t : State} (ha : s.accounts = t.accounts) (hm : s.members = t.members)
+    (r : RealmId) :
+    (fun p : Posting => (s.account? p.account).isSome && s.realmOf p.account != some r)
+      = (fun p : Posting => (t.account? p.account).isSome && t.realmOf p.account != some r) := by
+  funext p
+  simp only [State.account?, ha, realmOf_congr ha hm]
 
 /-- The guard a rewrite makes reads the accounts, the realms, the budgets and its own entry. -/
 theorem putGuard_congr {s t : State} (ha : s.accounts = t.accounts) (hr : s.realms = t.realms)
-    (hb : s.budgets = t.budgets) {au : MemberId} {r : RealmId} {tx : Transaction}
+    (hb : s.budgets = t.budgets) (hm : s.members = t.members) {au : MemberId} {r : RealmId}
+    {tx : Transaction}
     (htx : s.txn? tx.id = t.txn? tx.id) : putGuard s au r tx = putGuard t au r tx := by
   simp only [putGuard, bind, Except.bind, throw, throwThe, MonadExceptOf.throw, pure,
-    Except.pure, htx, realmOf_congr ha, checkOwnLegs_congr ha hr hb]
+    Except.pure, htx, realmOf_congr ha hm, checkOwnLegs_congr ha hr hb hm]
 
 /-- The write a transaction put makes: the transaction, under its own id. -/
 def Delta.txnPut (k : String) (w : Transaction) (fp : Option String) : Delta :=
@@ -835,7 +872,7 @@ theorem putTxn_frame {s : State} {au : MemberId} {r : RealmId} {tx : Transaction
       (∀ f ∈ fp, fingerprintOf tx = some f) ∧
       s' = (Delta.txnPut tx.id.val w fp).run s ∧
       ∀ t : State, s.accounts = t.accounts → s.realms = t.realms → s.budgets = t.budgets →
-        s.txn? tx.id = t.txn? tx.id →
+        s.members = t.members → s.txn? tx.id = t.txn? tx.id →
         (∀ f, fingerprintOf tx = some f →
           s.fingerprints.contains f = t.fingerprints.contains f) →
         ∃ cs', putTxn t au r tx allowed = .ok ((Delta.txnPut tx.id.val w fp).run t, cs') := by
@@ -853,7 +890,8 @@ theorem putTxn_frame {s : State} {au : MemberId} {r : RealmId} {tx : Transaction
       · rw [if_pos hlegs] at hok; simp at hok
       · rw [if_neg hlegs] at hok
         by_cases hlen : ((((s.txn? tx.id).map (·.postings)).getD []).filter
-            (fun p => s.realmOf p.account != some r) ++ tx.postings).length > maxPostings
+            (fun p => (s.account? p.account).isSome && s.realmOf p.account != some r)
+            ++ tx.postings).length > maxPostings
         · rw [if_pos hlen] at hok; simp at hok
         rw [if_neg hlen] at hok
         cases hfing : fingerprintOf tx with
@@ -861,11 +899,11 @@ theorem putTxn_frame {s : State} {au : MemberId} {r : RealmId} {tx : Transaction
           simp only [hfing, Except.ok.injEq, Prod.mk.injEq] at hok
           obtain ⟨rfl, rfl⟩ := hok
           refine ⟨_, none, by simp, rfl, ?_⟩
-          intro t ha hr hb hid _
+          intro t ha hr hb hm hid _
           exact ⟨_, by
             simp only [putTxn, bind, Except.bind, throw, throwThe, MonadExceptOf.throw, pure,
-              Except.pure, ← checkPostings_congr ha hr hb, hchk, hval, hvv, if_neg hlegs,
-              hfing, ← hid, ← realmOf_congr ha, if_neg hlen] <;> rfl⟩
+              Except.pure, ← checkPostings_congr ha hr hb hm, hchk, hval, hvv, if_neg hlegs,
+              hfing, ← hid, ← keptPred_congr ha hm, if_neg hlen] <;> rfl⟩
         | some f =>
           simp only [hfing] at hok
           by_cases hdup : (s.fingerprints.contains f &&
@@ -877,21 +915,21 @@ theorem putTxn_frame {s : State} {au : MemberId} {r : RealmId} {tx : Transaction
               simp only [Except.ok.injEq, Prod.mk.injEq] at hok
               obtain ⟨rfl, rfl⟩ := hok
               refine ⟨_, some f, by simp, rfl, ?_⟩
-              intro t ha hr hb hid hfp
+              intro t ha hr hb hm hid hfp
               exact ⟨_, by
                 simp only [putTxn, bind, Except.bind, throw, throwThe, MonadExceptOf.throw, pure,
-                  Except.pure, ← checkPostings_congr ha hr hb, hchk, hval, hvv,
-                  if_neg hlegs, hfing, ← hid, ← hfp f rfl, ← realmOf_congr ha, if_neg hlen,
+                  Except.pure, ← checkPostings_congr ha hr hb hm, hchk, hval, hvv,
+                  if_neg hlegs, hfing, ← hid, ← hfp f rfl, ← keptPred_congr ha hm, if_neg hlen,
                   if_neg hdup, if_pos hnew] <;> rfl⟩
             · rw [if_neg hnew] at hok
               simp only [Except.ok.injEq, Prod.mk.injEq] at hok
               obtain ⟨rfl, rfl⟩ := hok
               refine ⟨_, none, by simp, rfl, ?_⟩
-              intro t ha hr hb hid hfp
+              intro t ha hr hb hm hid hfp
               exact ⟨_, by
                 simp only [putTxn, bind, Except.bind, throw, throwThe, MonadExceptOf.throw, pure,
-                  Except.pure, ← checkPostings_congr ha hr hb, hchk, hval, hvv,
-                  if_neg hlegs, hfing, ← hid, ← hfp f rfl, ← realmOf_congr ha, if_neg hlen,
+                  Except.pure, ← checkPostings_congr ha hr hb hm, hchk, hval, hvv,
+                  if_neg hlegs, hfing, ← hid, ← hfp f rfl, ← keptPred_congr ha hm, if_neg hlen,
                   if_neg hdup, if_neg hnew] <;> rfl⟩
 
 /-! ## Every rebasable operation is one write -/
@@ -967,12 +1005,12 @@ theorem applyOp_frame {o : Op} {au : MemberId} {r : RealmId} {s s' : State} {cs 
         simp
     · intro u hu
       have htx := hu.txns tx.id (mem_footprint_txn (by simp [Op.touchesTxns]))
-      obtain ⟨cs', hcs'⟩ := hall u hu.accounts hu.realms hu.budgets htx
+      obtain ⟨cs', hcs'⟩ := hall u hu.accounts hu.realms hu.budgets hu.members htx
         (fun f hf => hu.fingerprints f
           (mem_footprint_entity (by simp [Op.touchesEntities, hf])))
       refine ⟨cs', ?_⟩
       have hgu : putGuard u au r tx = .ok () := by
-        rw [← putGuard_congr hu.accounts hu.realms hu.budgets htx]; exact hg
+        rw [← putGuard_congr hu.accounts hu.realms hu.budgets hu.members htx]; exact hg
       simp only [applyChecked, bind, Except.bind, throw, throwThe, MonadExceptOf.throw,
         if_neg h1, if_neg h2, hgu]
       exact hcs'
@@ -998,7 +1036,8 @@ theorem applyOp_frame {o : Op} {au : MemberId} {r : RealmId} {s s' : State} {cs 
           exact ⟨_, by
             simp only [applyChecked, bind, Except.bind, pure, Except.pure,
               ← txnOf_congr (hu.txns id (mem_footprint_txn (by simp [Op.touchesTxns]))),
-              hget, ← checkOwnLegs_congr hu.accounts hu.realms hu.budgets, hlegs] <;> rfl⟩
+              hget, ← checkOwnLegs_congr hu.accounts hu.realms hu.budgets hu.members,
+              hlegs] <;> rfl⟩
   case raiseClaim tx =>
     simp only [applyChecked, bind, Except.bind, throw, throwThe, MonadExceptOf.throw] at hok
     by_cases h1 : (tx.state != TxnState.pending) = true
@@ -1035,7 +1074,7 @@ theorem applyOp_frame {o : Op} {au : MemberId} {r : RealmId} {s s' : State} {cs 
             rw [show fingerprintOf tx = some f from hf']
             simp
         · intro u hu
-          obtain ⟨cs', hcs'⟩ := hall u hu.accounts hu.realms hu.budgets
+          obtain ⟨cs', hcs'⟩ := hall u hu.accounts hu.realms hu.budgets hu.members
             (hu.txns tx.id (mem_footprint_txn (by simp [Op.touchesTxns])))
             (fun f hf => hu.fingerprints f (mem_footprint_entity (by
               show Key.fingerprint f ∈ (fingerprintOf tx).toList.map Key.fingerprint
@@ -1280,7 +1319,7 @@ theorem applyOp_frame {o : Op} {au : MemberId} {r : RealmId} {s s' : State} {cs 
             simp only [applyChecked, bind, Except.bind, pure,
               Except.pure, ← txnOf_congr (hu.txns txn (mem_footprint_txn
                 (by simp [Op.touchesTxns]))), hget,
-              ← checkOwnLegs_congr hu.accounts hu.realms hu.budgets, hlegs,
+              ← checkOwnLegs_congr hu.accounts hu.realms hu.budgets hu.members, hlegs,
               ← hu.blobs sha (mem_footprint_entity (by simp [Op.touchesEntities])), hblob,
               if_pos hhas] <;> rfl⟩
         · rw [if_neg hhas] at hok
@@ -1299,7 +1338,7 @@ theorem applyOp_frame {o : Op} {au : MemberId} {r : RealmId} {s s' : State} {cs 
               simp only [applyChecked, bind, Except.bind, pure,
                 Except.pure, ← txnOf_congr (hu.txns txn (mem_footprint_txn
                   (by simp [Op.touchesTxns]))), hget,
-                ← checkOwnLegs_congr hu.accounts hu.realms hu.budgets, hlegs,
+                ← checkOwnLegs_congr hu.accounts hu.realms hu.budgets hu.members, hlegs,
                 ← hu.blobs sha (mem_footprint_entity (by simp [Op.touchesEntities])), hblob,
                 if_neg hhas] <;> rfl⟩
   case forgetBlob sha =>
@@ -1353,7 +1392,8 @@ theorem applyOp_frame {o : Op} {au : MemberId} {r : RealmId} {s s' : State} {cs 
           exact ⟨_, by
             simp only [applyChecked, bind, Except.bind, pure, Except.pure,
               ← txnOf_congr (hu.txns txn (mem_footprint_txn (by simp [Op.touchesTxns]))),
-              hget, ← checkOwnLegs_congr hu.accounts hu.realms hu.budgets, hlegs] <;> rfl⟩
+              hget, ← checkOwnLegs_congr hu.accounts hu.realms hu.budgets hu.members,
+              hlegs] <;> rfl⟩
   all_goals simp [Op.Rebasable] at hreb
 
 /-! ## The theorems -/
@@ -1450,7 +1490,7 @@ theorem applyOp_comm {a b : Op} {au : MemberId} {r : RealmId} {s s₁ s₂ : Sta
   obtain ⟨h1r, h1b, h1c⟩ := applyOp_eq.mp h1
   obtain ⟨h2r, h2b, h2c⟩ := applyOp_eq.mp h2
   obtain ⟨da, hda, rfl, haall⟩ := applyOp_frame hinv hi.left h1c
-  have hinv1 : Inv r (da.run s) := inv_applyOp hinv h1
+  have hinv1 : Inv r (da.run s) := inv_applyOp hinv (Op.shows_of_rebasable hi.left) h1
   obtain ⟨db, hdb, hs₂, hball⟩ := applyOp_frame hinv1 hi.right h2c
   obtain ⟨ds₁, hb1⟩ := hball s (agree_run hi hda).symm
   obtain ⟨ds₂, ha2⟩ := haall (db.run s) (agree_run hi.symm hdb)
@@ -1523,7 +1563,7 @@ theorem rebase_sound {au : MemberId} {r : RealmId} {ops : List Op} {mine : Op} :
       rw [hstep] at hops
       obtain ⟨⟨t₁, ds₁⟩, hb⟩ := hmine
       refine ih (s := s₁) ?_ ?_ ?_ hops
-      · exact inv_applyOp hinv hstep
+      · exact inv_applyOp hinv (Op.shows_of_rebasable hor) hstep
       · simp only [Rebase.check, hmr, hrest, Bool.and_self]
       · obtain ⟨t, cs, hmine'⟩ := applyOp_success_comm hinv hind hstep hb
         exact ⟨(t, cs), hmine'⟩

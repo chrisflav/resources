@@ -169,6 +169,18 @@ inductive Op
   | showAccount (realm : RealmId) (account : Account)
   /-- Stops showing one. Sight is taken away forwards: what was read stays read. -/
   | hideAccount (realm : RealmId) (account : AccountId)
+  /--
+  Shows a realm a budget that is kept somewhere else, so the people there can
+  see what it holds and say which of its costs were theirs.
+
+  The budget travels rather than being opened again: same id, same account,
+  same realm. A second budget of the same name in the room would be a pot with
+  two answers to "what is in it" — the room reads this one.
+
+  The pot's account has to be one the room was shown, or the costs it is being
+  asked about are legs it cannot read.
+  -/
+  | showBudget (realm : RealmId) (budget : BudgetState)
   -- Genesis
   /--
   The whole state a log starts from.
@@ -284,7 +296,7 @@ def Op.rights : Op → Rights
   -- What a realm may see is the realm's own business, so an admin of it decides.
   -- Whether the account was the author's to show is a second question, asked in
   -- `applyOp` by whoever is in a position to answer it.
-  | .showAccount .. | .hideAccount .. => .admin
+  | .showAccount .. | .hideAccount .. | .showBudget .. => .admin
   -- Genesis. Never consulted: `checkRights` refuses a snapshot before it reads
   -- this table, because where a snapshot may be applied is a fact about the
   -- reader's position in the log rather than about who wrote it. The strictest

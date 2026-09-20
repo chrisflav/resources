@@ -220,9 +220,9 @@ Every transaction the state holds was written by `putTxn`, and `putTxn` writes
 only what `Transaction.validate` accepted. These are the lemmas that say so.
 -/
 
-/-- Reading an account succeeds only for an account the state has. -/
+/-- Reading an account succeeds only for one the state has, or derives. -/
 theorem accountOf_ok {s : State} {id : AccountId} {a : Account} (h : accountOf s id = .ok a) :
-    s.account? id = some a := by
+    s.knows? id = some a := by
   unfold accountOf at h
   split at h
   · rename_i x heq; simp only [Except.ok.injEq] at h; exact h ▸ heq
@@ -248,7 +248,7 @@ theorem validate_val {t : Transaction} {v : { u : Transaction // u.Balanced }}
 private theorem checkPostings_cons {s : State} {author : MemberId} {realm : RealmId}
     {allowed : List AccountId} {q : Posting} {qs : List Posting} {u : Unit}
     (h : checkPostings s author realm (q :: qs) allowed = .ok u) :
-    (∃ a, s.account? q.account = some a ∧ a.realm = realm) ∧
+    (∃ a, s.knows? q.account = some a ∧ visible s realm a = true) ∧
       checkPostings s author realm qs allowed = .ok () := by
   simp only [checkPostings, List.forIn_cons, bind, Except.bind, throw, throwThe,
     MonadExceptOf.throw, pure, Except.pure] at h ⊢
@@ -257,27 +257,33 @@ private theorem checkPostings_cons {s : State} {author : MemberId} {realm : Real
   | ok acc =>
     simp only [hacc] at h
     have hacc' := accountOf_ok hacc
-    by_cases h1 : (acc.realm != realm) = true
+    by_cases h1 : (!visible s realm acc) = true
     · rw [if_pos h1] at h; simp at h
     · rw [if_neg h1] at h
       by_cases h2 : acc.closedOn.isSome = true
       · rw [if_pos h2] at h; simp at h
       · rw [if_neg h2] at h
-        by_cases h3 : (!(allowed.contains q.account || s.canPostLeg author acc q.amount.minor))
+        by_cases h3 :
+            (!(allowed.contains q.account || s.canPostLegIn author realm acc q.amount.minor))
             = true
         · rw [if_pos h3] at h; simp at h
         · rw [if_neg h3] at h
-          simp only [bne_iff_ne, ne_eq, Decidable.not_not] at h1
+          simp only [Bool.not_eq_true', Bool.not_eq_false] at h1
           exact ⟨⟨acc, hacc', h1⟩, h⟩
 
 /--
 A part's postings are checked one by one, so every leg it writes lands in an
-account the state has, in the realm the part names.
+account the state can answer for, and one the part's realm may see.
+
+Visibility rather than ownership is the whole of what a view changed here: a
+part may name its realm's own accounts, the ones that realm was shown, and its
+own purses. For a ledger with one room those are the same accounts, which is
+why nothing below had to weaken.
 -/
 theorem account_of_checkPostings {s : State} {author : MemberId} {realm : RealmId}
     {allowed : List AccountId} :
     ∀ {ps : List Posting} {u : Unit}, checkPostings s author realm ps allowed = .ok u →
-      ∀ p ∈ ps, ∃ a, s.account? p.account = some a ∧ a.realm = realm
+      ∀ p ∈ ps, ∃ a, s.knows? p.account = some a ∧ visible s realm a = true
   | [], _, _, p, hp => by cases hp
   | q :: qs, u, h, p, hp => by
     obtain ⟨hq, hrest⟩ := checkPostings_cons h
@@ -307,9 +313,13 @@ structure Inv (r : RealmId) (s : State) : Prop where
   balanced : ∀ (k : String) (t : Transaction), s.txns[k]? = some t → t.Balanced
   /-- Every stored transaction is filed under its own id. -/
   keyed : ∀ (k : String) (t : Transaction), s.txns[k]? = some t → t.id.val = k
-  /-- Every posting of every stored transaction names an account the state has. -/
+  /--
+  Every posting of every stored transaction names an account this state can
+  answer for: one it holds, or a purse it reads off the id. Both are accounts
+  a reader can render and fold; only one of them is written down.
+  -/
   grounded : ∀ (k : String) (t : Transaction), s.txns[k]? = some t →
-    ∀ p ∈ t.postings, (s.account? p.account).isSome
+    ∀ p ∈ t.postings, (s.knows? p.account).isSome
   /-- Every account the state knows sits in realm `r`. -/
   oneRealm : ∀ (k : String) (a : Account), s.accounts[k]? = some a → a.realm = r
   /-- Every stored claim — every pending transaction — has exactly two legs. -/
@@ -319,6 +329,26 @@ structure Inv (r : RealmId) (s : State) : Prop where
 /-- The ledger starts with no transactions and no accounts, so it starts invariant. -/
 theorem inv_init : Inv Realm.selfId State.init := by
   constructor <;> intro k t h <;> simp [State.init] at h
+
+/--
+Whether a state can answer for an id depends on the accounts it holds and on
+the id, and on nothing else: a purse is read off the id.
+-/
+theorem knows?_isSome_iff {s : State} {id : AccountId} :
+    (s.knows? id).isSome = ((s.account? id).isSome || (purseId? id).isSome) := by
+  simp only [State.knows?, State.purse?]
+  cases s.account? id <;> simp [Option.isSome_map]
+
+/-- So two states holding the same accounts answer for the same ids. -/
+theorem knows?_isSome_congr {s s' : State} {id : AccountId}
+    (h : (s'.account? id).isSome = (s.account? id).isSome) :
+    (s'.knows? id).isSome = (s.knows? id).isSome := by
+  rw [knows?_isSome_iff, knows?_isSome_iff, h]
+
+/-- An account the state holds is one it can answer for. -/
+theorem knows?_isSome_of_account? {s : State} {id : AccountId}
+    (h : (s.account? id).isSome) : (s.knows? id).isSome := by
+  rw [knows?_isSome_iff, h]; rfl
 
 /-- Reading back what was just inserted: either the new value, or what was there before. -/
 theorem getElem?_insert_cases {α : Type} {m : Std.HashMap String α} {k k' : String} {v w : α}
@@ -341,32 +371,44 @@ theorem getElem?_erase_cases {α : Type} {m : Std.HashMap String α} {k k' : Str
   · simp at h
   · rename_i hk; simp only [beq_iff_eq] at hk; exact ⟨fun hc => hk (by rw [hc]), h⟩
 
-/-- Under the invariant, every leg of a stored transaction sits in the one realm. -/
+/--
+Under the invariant, a leg of a stored transaction that names an account the
+state *holds* names one of this realm.
+
+Not every leg does: a purse is read off its id rather than held, and which room
+it belongs to is a fact about the id. What the rewrite below needs is only this
+much, because a purse is never kept from an earlier reading.
+-/
 theorem realmOf_of_inv {s : State} {r : RealmId} {k : String} {t : Transaction} (h : Inv r s)
-    (hk : s.txns[k]? = some t) {p : Posting} (hp : p ∈ t.postings) :
-    s.realmOf p.account = some r := by
-  have hg := h.grounded k t hk p hp
-  simp only [State.realmOf, Option.isSome_iff_exists] at hg ⊢
-  obtain ⟨a, ha⟩ := hg
-  rw [ha]
-  simp only [Option.map_some, Option.some.injEq]
+    (hk : s.txns[k]? = some t) {p : Posting} {a : Account}
+    (ha : s.account? p.account = some a) : s.realmOf p.account = some r := by
+  have hk' : s.knows? p.account = some a := by simp [State.knows?, ha]
+  simp only [State.realmOf, hk', Option.map_some, Option.some.injEq]
   exact h.oneRealm p.account.val a ha
 
 /--
-The legs a write keeps from other realms: under the invariant there are none,
-because every leg of the transaction being replaced is in this realm already.
+The legs a write keeps from an earlier reading: under the invariant there are
+none.
+
+Two ways a leg fails to be kept, and between them they cover every leg there
+is. A leg on an account the state holds is a leg of this realm, because the
+invariant says every account it holds is; and a leg on one it does not hold is
+a purse, which belongs to the reading being replaced rather than to another
+room.
 -/
 theorem kept_nil {s : State} {r : RealmId} (h : Inv r s) (id : TxId) :
     ((Option.map (fun x : Transaction => x.postings) (s.txn? id)).getD []).filter
-      (fun p => s.realmOf p.account != some r) = [] := by
+      (fun p => (s.account? p.account).isSome && s.realmOf p.account != some r) = [] := by
   cases hold : s.txn? id with
   | none => simp
   | some t =>
     simp only [Option.map_some, Option.getD_some]
     refine List.filter_eq_nil_iff.mpr ?_
     intro p hp
-    simp only [bne_iff_ne, ne_eq, Decidable.not_not]
-    exact realmOf_of_inv h hold hp
+    simp only [Bool.and_eq_true, bne_iff_ne, ne_eq, not_and, Decidable.not_not]
+    intro hs
+    obtain ⟨a, ha⟩ := Option.isSome_iff_exists.mp hs
+    exact realmOf_of_inv h hold ha
 
 /-- A state that differs only in its import fingerprints reads accounts the same way. -/
 private theorem realmOf_fps (s : State) (fps : Std.HashSet String) :
@@ -380,7 +422,7 @@ no other transaction.
 theorem putTxn_spec {s s' : State} {author : MemberId} {r : RealmId} {t : Transaction}
     {allowed : List AccountId} {cs : List Change} (h : Inv r s)
     (hok : putTxn s author r t allowed = .ok (s', cs)) :
-    t.Balanced ∧ (∀ p ∈ t.postings, ∃ a, s.account? p.account = some a ∧ a.realm = r) ∧
+    t.Balanced ∧ (∀ p ∈ t.postings, (s.knows? p.account).isSome) ∧
       s'.txns = s.txns.insert t.id.val t ∧ s'.accounts = s.accounts ∧
       (∀ t', Change.txn t' ∈ cs → t' = t) ∧ (t.state = .pending → t.postings.length = 2) := by
   simp only [putTxn, bind, Except.bind, throw, throwThe, MonadExceptOf.throw, pure,
@@ -399,7 +441,9 @@ theorem putTxn_spec {s s' : State} {author : MemberId} {r : RealmId} {t : Transa
       rw [if_neg hlegs] at hok
       have htwo : t.state = .pending → t.postings.length = 2 := fun hst => by
         simpa [hst] using hlegs
-      refine ⟨hb, account_of_checkPostings hchk, ?_⟩
+      refine ⟨hb, fun p hp => by
+        obtain ⟨a, ha, -⟩ := account_of_checkPostings hchk p hp
+        simp [ha], ?_⟩
       by_cases hlen : t.postings.length > maxPostings
       · rw [if_pos hlen] at hok; simp at hok
       rw [if_neg hlen] at hok
@@ -434,13 +478,15 @@ theorem inv_of_eq {r : RealmId} {s s' : State} (h : Inv r s) (ht : s'.txns = s.t
   constructor
   · intro k t hk; exact h.balanced k t (ht ▸ hk)
   · intro k t hk; exact h.keyed k t (ht ▸ hk)
-  · intro k t hk p hp; rw [hacc]; exact h.grounded k t (ht ▸ hk) p hp
+  · intro k t hk p hp
+    rw [knows?_isSome_congr (s := s) (s' := s') (by rw [hacc])]
+    exact h.grounded k t (ht ▸ hk) p hp
   · intro k a hk; exact h.oneRealm k a (ha ▸ hk)
   · intro k t hk; exact h.twoLegs k t (ht ▸ hk)
 
 /-- Writing a balanced transaction whose accounts all exist keeps the invariant. -/
 theorem inv_written {r : RealmId} {s : State} {t : Transaction} (h : Inv r s) (hb : t.Balanced)
-    (hg : ∀ p ∈ t.postings, (s.account? p.account).isSome)
+    (hg : ∀ p ∈ t.postings, (s.knows? p.account).isSome)
     (hp : t.state = .pending → t.postings.length = 2) : Inv r (written s t).1 := by
   constructor
   · intro k t' hk
@@ -452,6 +498,9 @@ theorem inv_written {r : RealmId} {s : State} {t : Transaction} (h : Inv r s) (h
     · rfl
     · exact h.keyed k t' hk'
   · intro k t' hk p hp'
+    have hsame : ((written s t).1.knows? p.account).isSome = (s.knows? p.account).isSome :=
+      knows?_isSome_congr rfl
+    rw [hsame]
     rcases getElem?_insert_cases hk with ⟨_, rfl⟩ | ⟨-, hk'⟩
     · exact hg p hp'
     · exact h.grounded k t' hk' p hp'
@@ -479,7 +528,7 @@ theorem inv_putTxn {s s' : State} {author : MemberId} {r : RealmId} {t : Transac
   obtain ⟨hb, hacc, htxns, haccounts, -, htwo⟩ := putTxn_spec h hok
   refine ⟨?_, haccounts⟩
   refine inv_of_eq (s := (written s t).1) ?_ htxns haccounts
-  exact inv_written h hb (fun p hp => by obtain ⟨a, ha, -⟩ := hacc p hp; simp [ha]) htwo
+  exact inv_written h hb hacc htwo
 
 /-! ## Writing through the helpers
 
@@ -576,9 +625,15 @@ theorem inv_insert_account {r : RealmId} {s s' : State} {k : String} {a : Accoun
   · intro k' t hk; exact h.balanced k' t (ht ▸ hk)
   · intro k' t hk; exact h.keyed k' t (ht ▸ hk)
   · intro k' t hk p hp
-    show ((s'.accounts)[p.account.val]?).isSome
-    rw [hacc]
-    exact isSome_insert (h.grounded k' t (ht ▸ hk) p hp)
+    rw [knows?_isSome_iff]
+    have := h.grounded k' t (ht ▸ hk) p hp
+    rw [knows?_isSome_iff] at this
+    rcases Bool.or_eq_true _ _ |>.mp this with hx | hx
+    · refine Bool.or_eq_true _ _ |>.mpr (Or.inl ?_)
+      show ((s'.accounts)[p.account.val]?).isSome
+      rw [hacc]
+      exact isSome_insert hx
+    · exact Bool.or_eq_true _ _ |>.mpr (Or.inr hx)
   · intro k' a' hk'
     rw [hacc] at hk'
     rcases getElem?_insert_cases hk' with ⟨-, rfl⟩ | ⟨-, hk''⟩
@@ -629,11 +684,17 @@ theorem inv_erase_account {r : RealmId} {s s' : State} {id : AccountId} (h : Inv
   · intro k' t hk p hp
     have hne : p.account ≠ id := hfree k' t (ht ▸ hk) p hp
     have hval : p.account.val ≠ id.val := fun hc => hne (congrArg AccountId.mk hc)
-    show ((s'.accounts)[p.account.val]?).isSome
-    rw [hacc, Std.HashMap.getElem?_erase]
-    simp only [beq_iff_eq]
-    rw [if_neg (fun hc => hval hc.symm)]
-    exact h.grounded k' t (ht ▸ hk) p hp
+    rw [knows?_isSome_iff]
+    have := h.grounded k' t (ht ▸ hk) p hp
+    rw [knows?_isSome_iff] at this
+    rcases Bool.or_eq_true _ _ |>.mp this with hx | hx
+    · refine Bool.or_eq_true _ _ |>.mpr (Or.inl ?_)
+      show ((s'.accounts)[p.account.val]?).isSome
+      rw [hacc, Std.HashMap.getElem?_erase]
+      simp only [beq_iff_eq]
+      rw [if_neg (fun hc => hval hc.symm)]
+      exact hx
+    · exact Bool.or_eq_true _ _ |>.mpr (Or.inr hx)
   · intro k' a' hk'
     rw [hacc] at hk'
     exact h.oneRealm k' a' (getElem?_erase_cases hk').2
@@ -678,8 +739,8 @@ theorem inv_deleteLabel {s s' : State} {author : MemberId} {r : RealmId} {cs : L
         refine ⟨inv_written hinv ?_ ?_ ?_, hacc⟩
         · exact balanced_of_postings_eq rfl (h.balanced k t hk)
         · intro p hp
-          show ((b.1.accounts)[p.account.val]?).isSome
-          rw [hacc]
+          rw [knows?_isSome_congr (s := s) (s' := b.1)
+            (by simp only [State.account?, show b.1.accounts = s.accounts from hacc])]
           exact h.grounded k t hk p hp
         · exact h.twoLegs k t hk
       · simp only [Except.ok.injEq, ForInStep.yield.injEq] at hstp
@@ -761,13 +822,11 @@ theorem inv_mergeAccounts {s s' : State} {author : MemberId} {r : RealmId} {cs :
                       refine ⟨inv_written hinv (balanced_of_amounts_eq hamt (h.balanced k t hk)) ?_
                         (fun hst => by simpa using h.twoLegs k t hk hst), hacc, ?_⟩
                       · intro p hp
-                        show ((b.1.accounts)[p.account.val]?).isSome
-                        rw [hacc]
+                        rw [knows?_isSome_congr (s := s) (s' := b.1)
+                          (by simp only [State.account?, show b.1.accounts = s.accounts from hacc])]
                         rcases hmoved p hp with hinto | ⟨q, hq, hqp, -⟩
                         · rw [hinto]
-                          have hd2 : s.accounts[into.val]? = some dst := hdst'
-                          rw [hd2]
-                          rfl
+                          simp [hdst']
                         · rw [← hqp]; exact h.grounded k t hk q hq
                       · intro k' t'' hk' hany
                         rcases getElem?_insert_cases hk' with ⟨-, rfl⟩ | ⟨hkne, hk''⟩
@@ -986,6 +1045,20 @@ can matter.
 def Part.Domestic (r : RealmId) (p : Part) : Prop := p.realm = r
 
 /--
+Whether an operation shows a realm an account of another realm.
+
+The one operation that takes a ledger out of the world `Inv` describes. A state
+with a view holds accounts of two realms — the room keeps a copy of what it was
+shown, so that a leg on it can be checked and rendered — and `oneRealm` says a
+state does not do that. So the theorem below is about every operation but this
+one, and what holds on the other side of the line is `Core/View.lean`: a
+reading balances, and names only accounts its room may see.
+-/
+def Op.shows : Op → Bool
+  | .showAccount .. => true
+  | _ => false
+
+/--
 Every operation an invariant state accepts leaves an invariant state.
 
 This is the phase's theorem: whatever a log asks for, what it replays into is a
@@ -993,7 +1066,8 @@ ledger whose transactions balance, are filed under their own ids, and point only
 at accounts the state has.
 -/
 theorem inv_applyOp {s s' : State} {author : MemberId} {r : RealmId} {op : Op} {cs : List Change}
-    (h : Inv r s) (hok : applyOp s author r op = .ok (s', cs)) : Inv r s' := by
+    (h : Inv r s) (hop : op.shows = false) (hok : applyOp s author r op = .ok (s', cs)) :
+    Inv r s' := by
   obtain ⟨hrights, -, hok⟩ := applyOp_eq.mp hok
   cases op with
   | createRealm x => plain_op hok h
@@ -1031,9 +1105,11 @@ theorem inv_applyOp {s s' : State} {author : MemberId} {r : RealmId} {op : Op} {
   | setAccountRights id posters =>
     simp only [applyChecked, bind, Except.bind, pure, Except.pure, throw, throwThe,
       MonadExceptOf.throw] at hok
-    split at hok
-    · simp at hok
-    · rename_i a ha
+    cases ha : s.account? id with
+    | none => rw [ha] at hok; simp at hok
+    | some a =>
+      rw [ha] at hok
+      simp only at hok
       split at hok
       · simp at hok
       · split at hok
@@ -1041,13 +1117,15 @@ theorem inv_applyOp {s s' : State} {author : MemberId} {r : RealmId} {op : Op} {
         · simp only [Except.ok.injEq, Prod.mk.injEq] at hok
           obtain ⟨heq, -⟩ := hok
           subst heq
-          exact inv_insert_account h rfl rfl (h.oneRealm id.val a (accountOf_ok ha))
+          exact inv_insert_account h rfl rfl (h.oneRealm id.val a ha)
   | setAccountOwner id owner =>
     simp only [applyChecked, bind, Except.bind, pure, Except.pure, throw, throwThe,
       MonadExceptOf.throw] at hok
-    split at hok
-    · simp at hok
-    · rename_i a ha
+    cases ha : s.account? id with
+    | none => rw [ha] at hok; simp at hok
+    | some a =>
+      rw [ha] at hok
+      simp only at hok
       split at hok
       · simp at hok
       · split at hok
@@ -1055,7 +1133,7 @@ theorem inv_applyOp {s s' : State} {author : MemberId} {r : RealmId} {op : Op} {
         · simp only [Except.ok.injEq, Prod.mk.injEq] at hok
           obtain ⟨heq, -⟩ := hok
           subst heq
-          exact inv_insert_account h rfl rfl (h.oneRealm id.val a (accountOf_ok ha))
+          exact inv_insert_account h rfl rfl (h.oneRealm id.val a ha)
   | putLabel l => plain_op hok h
   | deleteLabel id => exact inv_deleteLabel h hok
   | putParty p => plain_op hok h
@@ -1313,6 +1391,9 @@ theorem inv_applyOp {s s' : State} {author : MemberId} {r : RealmId} {op : Op} {
   | revoke target member => plain_op hok h
   | setRole target member role => plain_op hok h
   | rotateRealmKey target => plain_op hok h
+  | showAccount target a => simp [Op.shows] at hop
+  | hideAccount target a => plain_op hok h
+  | showBudget target bs => plain_op hok h
   | snapshot genesis =>
     -- Refused, always: genesis is a position in the log, and `Core.replay` is
     -- what reads it. So there is nothing here to keep the invariant through.
@@ -1334,21 +1415,22 @@ theorem inv_applyOp {s s' : State} {author : MemberId} {r : RealmId} {op : Op} {
 /-- The fold `step` performs: an invariant state stays invariant, part by part. -/
 private theorem inv_foldl_parts {r : RealmId} (author : MemberId) :
     ∀ (ps : List Part) (acc : State × List Change), Inv r acc.1 →
-      (∀ p ∈ ps, Part.Domestic r p) →
+      (∀ p ∈ ps, Part.Domestic r p) → (∀ p ∈ ps, p.op.shows = false) →
       Inv r (ps.foldl (fun (acc : State × List Change) p =>
           match applyPart acc.1 author p with
           | .ok (s', cs) => (s', acc.2 ++ cs)
           | .error _ => acc) acc).1
-  | [], _, h, _ => h
-  | p :: ps, acc, h, hd => by
+  | [], _, h, _, _ => h
+  | p :: ps, acc, h, hd, hs => by
     simp only [List.foldl_cons]
     refine inv_foldl_parts author ps _ ?_ (fun q hq => hd q (by simp [hq]))
+      (fun q hq => hs q (by simp [hq]))
     have hrealm := hd p (by simp)
     cases hp : applyPart acc.1 author p with
     | error e => exact h
     | ok v =>
-      exact inv_applyOp h (show applyOp acc.1 author r p.op = .ok (v.1, v.2) by
-        rw [← hrealm]; exact hp)
+      exact inv_applyOp h (hs p (by simp))
+        (show applyOp acc.1 author r p.op = .ok (v.1, v.2) by rw [← hrealm]; exact hp)
 
 /--
 Applying an event keeps the invariant.
@@ -1357,18 +1439,20 @@ A part that is refused leaves the state where it was, and a part that is applied
 is an operation this state accepts, so every part of the fold is covered.
 -/
 theorem inv_step {r : RealmId} {s : State} {e : Event} (h : Inv r s)
-    (hd : ∀ p ∈ e.parts, Part.Domestic r p) : Inv r (step s e).1 :=
-  inv_foldl_parts e.author e.parts (s, []) h hd
+    (hd : ∀ p ∈ e.parts, Part.Domestic r p) (hs : ∀ p ∈ e.parts, p.op.shows = false) :
+    Inv r (step s e).1 :=
+  inv_foldl_parts e.author e.parts (s, []) h hd hs
 
 /-- The fold `state` performs: an invariant state stays invariant, event by event. -/
 private theorem inv_foldl_events {r : RealmId} :
     ∀ (log : List Event) (s : State), Inv r s →
       (∀ e ∈ log, ∀ p ∈ e.parts, Part.Domestic r p) →
+      (∀ e ∈ log, ∀ p ∈ e.parts, p.op.shows = false) →
       Inv r (log.foldl (fun s e => (step s e).1) s)
-  | [], _, h, _ => h
-  | e :: es, s, h, hd =>
-    inv_foldl_events es (step s e).1 (inv_step h (hd e (by simp)))
-      (fun x hx => hd x (by simp [hx]))
+  | [], _, h, _, _ => h
+  | e :: es, s, h, hd, hs =>
+    inv_foldl_events es (step s e).1 (inv_step h (hd e (by simp)) (hs e (by simp)))
+      (fun x hx => hd x (by simp [hx])) (fun x hx => hs x (by simp [hx]))
 
 /--
 Replaying a domestic log gives a ledger that keeps the invariant.
@@ -1380,7 +1464,8 @@ names only accounts the state has.
 -/
 theorem inv_state (log : List Event)
     (hg : ∀ e ∈ log.head?, ∀ g ∈ e.genesis?, Inv Realm.selfId g)
-    (hd : ∀ e ∈ log, ∀ p ∈ e.parts, Part.Domestic Realm.selfId p) :
+    (hd : ∀ e ∈ log, ∀ p ∈ e.parts, Part.Domestic Realm.selfId p)
+    (hs : ∀ e ∈ log, ∀ p ∈ e.parts, p.op.shows = false) :
     Inv Realm.selfId (state log) := by
   match log with
   | [] => exact inv_init
@@ -1393,9 +1478,9 @@ theorem inv_state (log : List Event)
       -- that it is read at position 1 and nowhere else, which is `replay`'s
       -- shape rather than a theorem.
       exact inv_foldl_events rest g (hg e (by simp) g (by simp [hge]))
-        (fun x hx => hd x (by simp [hx]))
+        (fun x hx => hd x (by simp [hx])) (fun x hx => hs x (by simp [hx]))
     | none =>
-      exact inv_foldl_events (e :: rest) State.init inv_init hd
+      exact inv_foldl_events (e :: rest) State.init inv_init hd hs
 
 /-! ## Conservation
 
@@ -1421,10 +1506,10 @@ theorem totalNet_eq_zero_of_inv {r : RealmId} {s : State} (h : Inv r s) (c : Str
 
 /-- Every transaction an accepted operation leaves in the ledger nets to zero, per commodity. -/
 theorem net_eq_zero_of_applyOp {s s' : State} {author : MemberId} {r : RealmId} {op : Op}
-    {cs : List Change} (h : Inv r s)
+    {cs : List Change} (h : Inv r s) (hop : op.shows = false)
     (hok : applyOp s author r op = .ok (s', cs)) (k : String) (t : Transaction)
     (hk : s'.txns[k]? = some t) (c : String) : t.net c = 0 :=
-  Transaction.net_of_balanced ((inv_applyOp h hok).balanced k t hk) c
+  Transaction.net_of_balanced ((inv_applyOp h hop hok).balanced k t hk) c
 
 /--
 Conservation, per part: every transaction a write reports balances.
@@ -1443,9 +1528,10 @@ theorem net_eq_zero_of_changes {s s' : State} {author : MemberId} {r : RealmId} 
 /-- The trial balance of any replayed ledger is zero. -/
 theorem totalNet_state (log : List Event)
     (hg : ∀ e ∈ log.head?, ∀ g ∈ e.genesis?, Inv Realm.selfId g)
-    (hd : ∀ e ∈ log, ∀ p ∈ e.parts, Part.Domestic Realm.selfId p) (c : String) :
+    (hd : ∀ e ∈ log, ∀ p ∈ e.parts, Part.Domestic Realm.selfId p)
+    (hs : ∀ e ∈ log, ∀ p ∈ e.parts, p.op.shows = false) (c : String) :
     (state log).ledger.totalNet c = 0 :=
-  totalNet_eq_zero_of_inv (inv_state log hg hd) c
+  totalNet_eq_zero_of_inv (inv_state log hg hd hs) c
 
 /-! ## Purses
 

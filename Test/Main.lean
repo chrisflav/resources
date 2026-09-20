@@ -1924,6 +1924,13 @@ private def coreAmong : List Participant :=
 /-- Applies a list of operations in order, skipping any that fails. -/
 private def coreSteps (s : State) (ops : List Op) : State := ops.foldl coreStep s
 
+/-- The same, by somebody else, in a realm of their own. -/
+private def coreStepsAs (who : MemberId) (realm : RealmId) (s : State) (ops : List Op) : State :=
+  ops.foldl (fun st op =>
+    match applyOp st who realm op with
+    | .ok (st', _) => st'
+    | .error _ => st) s
+
 /-- A cost somebody paid for, straight into the budget. -/
 private def coreCost (id from_ : String) (minor : Int) (narration : String) : Transaction :=
   coreTxn id [cents from_ (-minor), cents "acc-hut" minor] narration
@@ -2172,6 +2179,86 @@ private def viewTests (r : Report) : Report := Id.run do
     (shownCosts.foldl (fun n t => n + t.netIn ⟨"acc-hut"⟩ "EUR") 0) 64200
   r := checkEq r "with the same total standing against the person who paid"
     (shownCosts.foldl (fun n t => n + t.netIn (room.purse me) "EUR") 0) (-64200)
+  return r
+
+/--
+A room that is shown an account, and reads a budget kept somewhere else.
+
+The shape the view model is for: the pot stays in the books that paid for it,
+the room is shown the account and the budget, and what reaches the room about
+each cost is a reading in which a purse stands for the money it came out of.
+Four things have to hold. A leg on an account nobody showed the room is
+refused. A leg on one that was shown is taken. A purse of the room needs no
+opening — it is read off its own id. And a reading already held in fuller form
+is not overwritten by a thinner one, whichever order the two arrive in.
+-/
+private def roomTests (r : Report) : Report := Id.run do
+  let mut r := r
+  let room : RealmId := ⟨"realm-hut"⟩
+  let host : MemberId := ⟨"host"⟩
+  let pot : Account :=
+    { id := ⟨"acc-hut"⟩, name := "Budget.Hut", kind := .equity, realm := Realm.selfId }
+  -- The host's own books, with the pot in them, and a room the host opened.
+  let books := coreSteps coreBase
+    [ .putAccount pot
+    , .addMember { id := host, name := "me", party := ⟨"party-host"⟩ }
+    , .grant Realm.selfId host .admin
+        { id := ⟨"acc-host"⟩, name := "Assets.Purse.me", kind := .asset } ]
+  let mine := coreStepsAs host room books
+    [ .createRealm { id := room, name := "Hut", members := [(host, .admin)], generation := 0 } ]
+  -- Before anything is shown, the room may not name the pot.
+  r := check r "a room cannot name an account nobody showed it"
+    (Str.containsCI
+      (coreErrorAs "host" room mine
+        (.putTransaction (coreTxn "t-cost"
+          [{ account := ⟨"purse.realm-hut.party-host"⟩, amount := ⟨Commodity.eur, -5600⟩ },
+           cents "acc-hut" 5600] "hut")))
+      "not in this realm")
+  -- Showing it is one operation, and it moves nothing.
+  let shown := coreStepsAs host room mine [.showAccount room pot]
+  r := check r "showing an account leaves it where it was written"
+    (((shown.account? ⟨"acc-hut"⟩).map (·.realm)) == some Realm.selfId)
+  r := check r "and the room can see it"
+    (((shown.realm? room).map (fun x => (x.shown? ⟨"acc-hut"⟩).isSome)) == some true)
+  r := check r "a realm is not shown an account of its own"
+    (Str.containsCI
+      (coreErrorAs "host" room shown
+        (.showAccount room { id := ⟨"acc-there"⟩, name := "There", kind := .asset, realm := room }))
+      "lives somewhere else")
+  -- Now the cost, as the room reads it: a purse for the money, the pot for
+  -- what it bought. Neither account had to be opened in the room.
+  let cost := coreTxn "t-cost"
+    [{ account := ⟨"purse.realm-hut.party-host"⟩, amount := ⟨Commodity.eur, -5600⟩ },
+     cents "acc-hut" 5600] "hut"
+  let withCost := coreStepsAs host room shown [.putTransaction cost]
+  r := check r "a cost reaches the room once its pot is shown"
+    ((withCost.txn? ⟨"t-cost"⟩).isSome)
+  r := check r "and the purse it names is an account without being opened"
+    (((withCost.knows? ⟨"purse.realm-hut.party-host"⟩).map (·.owner)) == some ⟨"party-host"⟩)
+  r := check r "which belongs to the room that named it"
+    (((withCost.knows? ⟨"purse.realm-hut.party-host"⟩).map (·.realm)) == some room)
+  -- The budget itself: the room reads the one that exists.
+  let bs : BudgetState :=
+    { budget := { id := ⟨"b-hut"⟩, name := "Budget.Hut", note := none, closed := false }
+      realm := Realm.selfId, account := ⟨"acc-hut"⟩ }
+  let withBudget := coreStepsAs host room withCost [.showBudget room bs]
+  r := check r "a room shown the pot can be shown the budget"
+    (((withBudget.budget? ⟨"b-hut"⟩).map (·.realm)) == some Realm.selfId)
+  r := check r "and somebody in the room may take one of its costs"
+    (match applyOp withBudget host room (.claimCost ⟨"b-hut"⟩ ⟨"t-cost"⟩) with
+     | .ok (st, _) => ((st.budget? ⟨"b-hut"⟩).map (fun b => b.claims.length)) == some 1
+     | .error _ => false)
+  -- Supersession, both ways round.
+  let full := coreTxn "t-cost" [cents "acc-bank" (-5600), cents "acc-hut" 5600] "hut"
+  r := check r "a redaction does not overwrite a reading that shows more"
+    (Str.containsCI
+      (coreErrorAs "host" room (coreSteps withCost [.putTransaction full])
+        (.putTransaction cost))
+      "fuller form")
+  r := check r "and a fuller reading replaces the redaction it finds"
+    (match applyOp withCost Member.selfId Realm.selfId (.putTransaction full) with
+     | .ok (st, _) => ((st.txn? ⟨"t-cost"⟩).map (fun t => t.postings.length)) == some 2
+     | .error _ => false)
   return r
 
 /--
@@ -3081,6 +3168,7 @@ def main : IO UInt32 := do
     r := ledgerTests r
     r := coreTests r
     r := viewTests r
+    r := roomTests r
     r := encodeTests r
     r := vectorTests r
     let corpus ← seedCorpus ctx 200

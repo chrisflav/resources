@@ -86,14 +86,19 @@ structure Realm where
   /--
   Accounts this realm may see that are not its own, sorted by id.
 
-  A realm owns the accounts written in it, and those it sees anyway. This is
+  A realm owns the accounts written in it, and sees those anyway. This is
   everything *else* it was shown: one budget kept in somebody's own books, say,
-  which is what makes a budget shareable without being moved. A leg on one of
-  these may be written in a part of this realm, which is what `Apply.visible`
-  decides, and nothing else about the account changes — it stays where it was
-  written, and its owner stays its owner.
+  which is what makes a budget shareable without being moved.
+
+  The records live here rather than among the ledger's own accounts, and that
+  is the whole of why a view costs the rest of this file nothing. An account a
+  room was shown is the room's copy of somebody else's account — it stays
+  written in the realm it was written in, it keeps its owner, and the ledger's
+  own account table goes on holding only the ledger's own accounts. A leg on
+  one of these may be written in a part of this realm, which is what
+  `Apply.visible` decides.
   -/
-  accounts : List AccountId := []
+  accounts : List Account := []
   deriving Repr, Inhabited
 
 namespace Realm
@@ -118,16 +123,19 @@ def withoutMember (r : Realm) (m : MemberId) : Realm :=
   { r with members := r.members.filter (fun x => x.1 != m) }
 
 /-- What this realm can see, as `Core.View` reads it. -/
-def view (r : Realm) : View := { realm := r.id, accounts := r.accounts }
+def view (r : Realm) : View := { realm := r.id, accounts := r.accounts.map (·.id) }
 
-/-- Shows an account to this realm, keeping the list sorted and free of repeats. -/
-def withAccount (r : Realm) (a : AccountId) : Realm :=
-  if r.accounts.contains a then r
-  else { r with accounts := (r.accounts ++ [a]).mergeSort (fun x y => x.val ≤ y.val) }
+/-- The record this realm holds for an account it was shown. -/
+def shown? (r : Realm) (id : AccountId) : Option Account := r.accounts.find? (·.id == id)
+
+/-- Shows an account to this realm, replacing what it held for that id. -/
+def withAccount (r : Realm) (a : Account) : Realm :=
+  let rest := r.accounts.filter (·.id != a.id)
+  { r with accounts := (rest ++ [a]).mergeSort (fun x y => x.id.val ≤ y.id.val) }
 
 /-- Stops showing one. What was already read stays read: sight is taken away forwards. -/
-def withoutAccount (r : Realm) (a : AccountId) : Realm :=
-  { r with accounts := r.accounts.filter (· != a) }
+def withoutAccount (r : Realm) (id : AccountId) : Realm :=
+  { r with accounts := r.accounts.filter (·.id != id) }
 
 end Realm
 
@@ -328,6 +336,38 @@ def label? (s : State) (id : LabelId) : Option Label := s.labels[id.val]?
 /-- A party by id. -/
 def party? (s : State) (id : PartyId) : Option Party := s.parties[id.val]?
 
+/--
+The purse an id names, derived rather than stored.
+
+A purse is what a room calls somebody's money when it may not see where that
+money actually is: `Core.purseId?` reads the room and the person straight off
+the id, and that is everything about it. So there is nothing to open and
+nothing to write down — an id that names a purse *is* an account, described
+here the same way by every reader, and whether it is one is a question about
+the id rather than about the state.
+
+It is an asset, because a purse holds a balance; it is owned by the party it
+stands for; and when the ledger happens to know which member that party is, it
+is bridged to them, which is what lets them post to it without anybody granting
+anything. Its name is the party's id rather than the party's name on purpose: a
+room that has never been told who somebody is should not be inventing a name
+for them, and every reader that holds the same members writes the same record.
+-/
+def purse? (s : State) (id : AccountId) : Option Account :=
+  (purseId? id).map fun (realm, party) =>
+    { id, name := "Purse." ++ party.val, kind := .asset, owner := party, realm
+      bridgeOf := ((sortedValues s.members).find? (fun m => m.party == party)).map (·.id) }
+
+/--
+The account an id names: everything a reader can say about an id that appears
+on a leg.
+
+Two ways to know one. An account this ledger holds — its own, or the copy a
+room here keeps of one it was shown — and a purse, which is written nowhere
+and read off the id.
+-/
+def knows? (s : State) (id : AccountId) : Option Account := s.account? id <|> s.purse? id
+
 /-- A rule by id. -/
 def rule? (s : State) (id : RuleId) : Option Rule := s.rules[id.val]?
 
@@ -385,7 +425,7 @@ def fundingAccounts (s : State) : List AccountId :=
   (s.accountsSorted.filter Account.holdsMoney).map (·.id)
 
 /-- Which realm an account sits in. -/
-def realmOf (s : State) (a : AccountId) : Option RealmId := (s.account? a).map (·.realm)
+def realmOf (s : State) (a : AccountId) : Option RealmId := (s.knows? a).map (·.realm)
 
 /-- How many postings, in any transaction, still land in this account. -/
 def postingCount (s : State) (a : AccountId) : Nat :=

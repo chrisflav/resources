@@ -82,6 +82,30 @@ prefix ends where the party begins whatever the party is called.
 def partyOfPurse (v : View) (a : AccountId) : Option PartyId :=
   if v.isPurse a then some ⟨(a.val.drop v.pursePrefix.length).toString⟩ else none
 
+end View
+
+/--
+The room and the person an id names, if it names a purse at all.
+
+`View.partyOfPurse` asks about one room; this asks the id itself, which is what
+a reader has when a leg arrives naming an account nothing describes. Whether an
+id is a purse is a fact about the id and about nothing else — no realm has to
+exist, no member and no party — which is what lets a purse be looked up without
+being opened, and what keeps every theorem about the accounts a state holds
+true of the ones it derives.
+-/
+def purseId? (a : AccountId) : Option (RealmId × PartyId) :=
+  if a.val.startsWith "purse." then
+    let rest := (a.val.drop 6).toString
+    match rest.splitOn "." with
+    | realm :: party :: more =>
+      if realm.isEmpty then none
+      else some (⟨realm⟩, ⟨String.intercalate "." (party :: more)⟩)
+    | _ => none
+  else none
+
+namespace View
+
 /--
 Whether this view sees an account as itself.
 
