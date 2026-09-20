@@ -1537,6 +1537,35 @@ private def sharedBudgetTests (ctx : Ctx) (r : Report) : IO Report := do
     ((standings.find? (·.name == "me")).map (·.amount.minor)) (some (-3810))
   r := checkEq r "a cost somebody took leaves the pot entirely"
     (Budget.remaining shared after eur).length 0
+  -- A receipt that turns up after the weekend, lent into a budget that is
+  -- already shared. The leg cannot simply be redirected into the pot -- the pot
+  -- is in another realm, and one entry cannot have legs in two -- so it is
+  -- re-entered the way the others were when the budget moved.
+  Budgets.reopen ctx shared "test"
+  let late : TxId := ⟨← freshId⟩
+  let lateTxn : Transaction :=
+    { id := late, date := (Date.ofIso? "2026-08-20").get!, payee := some "hut"
+      narration := "the bill that came later"
+      postings := [{ account := cash.id, amount := ⟨eur, -2500⟩ },
+                   { account := spent.id, amount := ⟨eur, 2500⟩ }] }
+  match lateTxn.validate with
+  | .error e => r := check r s!"the late fixture balances ({e})" false
+  | .ok bt => Txns.put ctx bt "test" "fixture"
+  let worthBeforeLate ← Balances.netWorth ctx "EUR"
+  let bridgeBefore := (← ctx.state.get).txnsSorted.foldl
+    (fun n t => n + t.netIn bridge.id "EUR") 0
+  discard <| Budgets.lend ctx shared #[late] "test"
+  let late' ← ctx.state.get
+  r := checkEq r "a cost lent into a shared budget lands in its realm"
+    (Budget.remaining shared late' eur).length 1
+  r := checkEq r "lending into one costs you nothing you had not already spent"
+    (← Balances.netWorth ctx "EUR") worthBeforeLate
+  r := checkEq r "the payment it was made with is left where it was"
+    ((late'.txn? late).map (fun t => t.netIn cash.id "EUR")) (some (-2500))
+  r := checkEq r "and what it bought is on the mirror now"
+    ((late'.txn? late).map (fun t => t.netIn mirror.id "EUR")) (some 2500)
+  r := checkEq r "the bridge funds the pot there, by the same amount"
+    (late'.txnsSorted.foldl (fun n t => n + t.netIn bridge.id "EUR") 0) (bridgeBefore - 2500)
   return r
 
 /--

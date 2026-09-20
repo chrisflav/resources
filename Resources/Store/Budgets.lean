@@ -396,6 +396,99 @@ def resettle (ctx : Ctx) (b : Budget) (actor : String)
   if (← balance ctx b commodity).minor != 0 then return #[]
   settle ctx b actor commodity
 
+/-! ## Two rooms at once
+
+An account cannot be in two realms, and the reason is arithmetic rather than
+policy: a realm is a key, a balance is a fold over the postings a reader can
+decrypt, and an account whose postings were spread across two realms would give
+everybody holding one key a number that is wrong and looks right. So a cost that
+belongs in a budget somebody else can read is *re-entered* rather than
+relabelled, in the shape the ledger already has for money that is true in two
+rooms at once: a purse and the bridge it mirrors.
+
+These three are what that takes. `shareInto` uses them for a budget moving into
+a realm, and `lend` for one cost joining a budget that is already there.
+-/
+
+/--
+The purse a member holds in a realm.
+
+There is one per member per realm and the `grant` that let them in opened it, so
+it is found by what it bridges rather than by its name.
+-/
+def purseIn (st : State) (realm : RealmId) (m : MemberId) : Option Account :=
+  (sortedValues st.accounts).find? (fun a => a.realm == realm && a.bridgeOf == some m)
+
+/--
+Your side of that purse, in your own books: what your ledger calls the money you
+have put into a room other people can read.
+
+Found by what it mirrors rather than by its name, because `mirrorOf` is only
+ever set when an account is made -- it is what says the two are the same money,
+and saying it later would be saying it about a different pair -- while a name is
+only unique, and something else may have taken it.
+-/
+def mirrorOfPurse (ctx : Ctx) (b : Budget) (bridge : Account) (actor : String) : IO Account := do
+  let st ← ctx.state.get
+  match (sortedValues st.accounts).find? (fun a => a.mirrorOf == some bridge.id) with
+  | some a => return a
+  | none =>
+    let base := s!"Assets.Shared.{Budget.shortName b}"
+    let taken (n : String) : Bool := (st.accountByNameIn? Realm.selfId n).isSome
+    let mut name := base
+    let mut n := 2
+    while taken name && n < 1000 do
+      name := s!"{base}{n}"
+      n := n + 1
+    let mirror : Account :=
+      { id := ⟨← freshId⟩, name, kind := .asset, realm := Realm.selfId
+        mirrorOf := some bridge.id }
+    discard <| ctx.commit actor [.putAccount mirror] (kind := "share")
+    return mirror
+
+/--
+One cost, entered in both rooms at once.
+
+`moves` picks the legs that are leaving your books -- what the money bought.
+Your realm keeps the payment and sends those legs to the mirror: `Assets.Cash
+-50, Assets.Shared.Trip +50`. The shared realm sees your purse funding the
+budget there: `Purse.you -50, Budget.Trip +50`. Each part balances on its own,
+which is what makes it readable by somebody holding one of the two keys, and the
+mirror and the bridge move by equal and opposite amounts, which is what makes
+the pair neither create money nor destroy it.
+
+Two entries rather than one in two parts, and the reason is the guard on
+rewriting a transaction: a part may only touch an entry that already has a leg
+in the realm it names, which is what stops anybody hanging legs of their own off
+somebody else's entry. So the shared realm gets an entry of its own, and the two
+point at each other.
+
+Both go in one event: the two have to be told at the same time, or the pair is a
+statement only one of them heard.
+-/
+def reenter (ctx : Ctx) (t : Transaction) (moves : Posting → Bool)
+    (mirror bridge into : Account) (realm : RealmId) (actor : String) :
+    IO (Option Transaction) := do
+  let held := (t.postings.filterMap fun p =>
+    if moves p then some p.amount.minor else none).sum
+  if held == 0 then return none
+  let commodity := ((t.postings.find? moves).map (·.amount.commodity)).getD Commodity.eur
+  let sharedId : TxId := ⟨← freshId⟩
+  let mine : Transaction :=
+    { t with postings := t.postings.map fun p =>
+        if moves p then
+          { p with account := mirror.id, origin := p.origin <|> some sharedId.val }
+        else p }
+  let theirs : Transaction :=
+    { t with
+      id := sharedId,
+      postings :=
+        [{ account := bridge.id, amount := ⟨commodity, -held⟩, origin := some t.id.val },
+         { account := into.id, amount := ⟨commodity, held⟩, origin := some t.id.val }] }
+  discard <| ctx.commitParts actor
+    [(Realm.selfId, .putTransaction mine), (realm, .putTransaction theirs)] "share"
+  return some mine
+
 /-! ## Adding to a budget -/
 
 /--
@@ -407,12 +500,41 @@ untouched and reconciliation against a statement still holds. It is
 `Txns.moveMany`, named for what it means here — and because "funding" is a
 question about the kind of account rather than whose it is, a cost a friend paid
 for is lent exactly the way one of yours is.
+
+Unless the budget lives in a realm of its own, and then redirecting the leg is
+not something that can be done at all: the leg would be in one realm and the
+payment beside it in another, which `Core` refuses because the two could never
+be read as one entry. So the cost is re-entered instead, exactly as `shareInto`
+re-enters the costs a budget already held when it moves — your books keep the
+payment and send what it bought to the mirror, the shared realm sees your purse
+funding the budget there. What you asked for is what happens either way: the
+cost is in the budget, and the budget is where everybody can see it.
 -/
 def lend (ctx : Ctx) (b : Budget) (ids : Array TxId) (actor : String) :
     IO (Array Transaction) := do
   if b.closed then
     throw <| IO.userError s!"{Budget.shortName b} is closed; reopen it to add costs"
-  Txns.moveMany ctx ids b.name actor
+  let realm ← realmOf ctx b
+  if realm == Realm.selfId then
+    return ← Txns.moveMany ctx ids b.name actor
+  let st ← ctx.state.get
+  let into ← account ctx b
+  let some bridge := purseIn st realm ctx.member
+    | throw <| IO.userError
+        s!"you hold no purse in the realm {Budget.shortName b} is shared in, so there is \
+           nothing for the cost to be funded from there"
+  let mirror ← mirrorOfPurse ctx b bridge actor
+  -- The same leg `moveMany` would have redirected: what the money bought, which
+  -- is deliberately a question about the kind of account rather than whose it
+  -- is — a cost a friend paid for is lent the way one of yours is.
+  let onSheet := ((sortedValues st.accounts).filter Account.holdsMoney).map (·.id)
+  let mut out : Array Transaction := #[]
+  for id in ids do
+    let some t := st.txn? id | continue
+    match ← reenter ctx t (fun p => !onSheet.contains p.account) mirror bridge into realm actor with
+    | some written => out := out.push written
+    | none => pure ()
+  return out
 
 /--
 Records a cost somebody else paid for, straight into the budget.
@@ -516,53 +638,12 @@ def shareInto (ctx : Ctx) (b : Budget) (realm : RealmId) (bridge : Account) (act
   let sharedAccount : Account :=
     { id := ⟨← freshId⟩, name := b.name, kind := .equity, realm }
   discard <| ctx.commit actor [.openBudget shared sharedAccount] (kind := "share") (realm := realm)
-  -- Your side of the bridge, in your own books. Written here rather than by
-  -- `Accounts.ensure` because `mirrorOf` is only ever set when the account is
-  -- made: it is what says the two are the same money, and changing it later
-  -- would be saying that about a different pair.
-  let st ← ctx.state.get
-  -- A name nothing else has taken, since a name is unique inside a realm.
-  let base := s!"Assets.Shared.{Budget.shortName b}"
-  let taken (n : String) : Bool := (st.accountByNameIn? Realm.selfId n).isSome
-  let mut name := base
-  let mut n := 2
-  while taken name && n < 1000 do
-    name := s!"{base}{n}"
-    n := n + 1
-  let mirror : Account :=
-    { id := ⟨← freshId⟩, name, kind := .asset, realm := Realm.selfId
-      mirrorOf := some bridge.id }
-  discard <| ctx.commit actor [.putAccount mirror] (kind := "share")
+  -- Your side of the bridge, in your own books.
+  let mirror ← mirrorOfPurse ctx b bridge actor
   let mut moved := 0
   for (t, _) in ← remaining ctx b Commodity.eur do
-    let held := (t.postings.filterMap fun p =>
-      if p.account == old.id then some p.amount.minor else none).sum
-    if held == 0 then continue
-    let commodity := ((t.postings.find? (·.account == old.id)).map (·.amount.commodity)).getD
-      Commodity.eur
-    -- Two entries rather than one in two parts, and the reason is the guard on
-    -- rewriting a transaction: a part may only touch an entry that already has a
-    -- leg in the realm it names, which is what stops anybody hanging legs of
-    -- their own off somebody else's entry. So the shared realm gets an entry of
-    -- its own, and the two point at each other.
-    let sharedId : TxId := ⟨← freshId⟩
-    let mine : Transaction :=
-      { t with postings := t.postings.map fun p =>
-          if p.account == old.id then
-            { p with account := mirror.id, origin := p.origin <|> some sharedId.val }
-          else p }
-    let theirs : Transaction :=
-      { t with
-        id := sharedId,
-        postings :=
-          [{ account := bridge.id, amount := ⟨commodity, -held⟩, origin := some t.id.val },
-           { account := sharedAccount.id, amount := ⟨commodity, held⟩,
-             origin := some t.id.val }] }
-    -- One event, both realms: the two have to be told at the same time, or the
-    -- pair is a statement only one of them heard.
-    discard <| ctx.commitParts actor
-      [(Realm.selfId, .putTransaction mine), (realm, .putTransaction theirs)] "share"
-    moved := moved + 1
+    if (← reenter ctx t (·.account == old.id) mirror bridge sharedAccount realm actor).isSome then
+      moved := moved + 1
   -- The old pot is empty now, and two budgets of one name would make "the Trip
   -- budget" a question with two answers. What it recorded has moved, so it goes.
   if (← remaining ctx b Commodity.eur).isEmpty then
