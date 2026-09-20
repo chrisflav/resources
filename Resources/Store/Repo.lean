@@ -170,9 +170,26 @@ Returns the account with this name, creating it (and its kind) if absent.
 A new account belongs to you unless told otherwise. An account that already
 exists keeps the owner it has: retagging somebody's account by mentioning its
 name in passing is exactly the confusion an owner exists to prevent.
+
+One name is refused rather than resolved: a budget's account, asked for from
+outside the realm that budget lives in. A name is only unique inside a realm, so
+there is nothing stopping a second account of that name being made here — and
+that is exactly what used to happen. It looks like success from every angle: the
+account is there, the costs move into it, the balance is right, and the budget
+stays empty because the budget is somewhere else. Nothing downstream can tell
+the two apart afterwards, so the confusion is refused here, with the sentence
+that says what to do instead.
 -/
 def ensure (ctx : Ctx) (name : String) (kind : Option AccountKind := none)
     (owner : Option PartyId := none) (realm : RealmId := Realm.selfId) : IO Account := do
+  let st ← ctx.state.get
+  for bs in sortedValues st.budgets do
+    if bs.realm != realm && (st.account? bs.account).map (·.name) == some name then
+      let where_ := ((st.realm? bs.realm).map (·.name)).getD bs.realm.val
+      throw <| IO.userError
+        s!"{name} is where {Budget.shortName bs.budget} keeps its costs, and that budget lives \
+           in the realm {where_}: a transaction cannot have one leg there and its payment here. \
+           Lend the cost into the budget instead, which enters it in both."
   match ← byName? ctx name realm with
   | some a => return a
   | none =>

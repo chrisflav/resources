@@ -1566,6 +1566,21 @@ private def sharedBudgetTests (ctx : Ctx) (r : Report) : IO Report := do
     ((late'.txn? late).map (fun t => t.netIn mirror.id "EUR")) (some 2500)
   r := checkEq r "the bridge funds the pot there, by the same amount"
     (late'.txnsSorted.foldl (fun n t => n + t.netIn bridge.id "EUR") 0) (bridgeBefore - 2500)
+  -- The other way somebody would try it: naming the budget's account on a
+  -- posting, or moving a cost into it by name. A name is only unique inside a
+  -- realm, so that used to make a second account of the same name here and put
+  -- the costs in it, which looks right from every angle and leaves the budget
+  -- empty.
+  let namesakes : IO Nat := do
+    return ((sortedValues (← ctx.state.get).accounts).filter (·.name == shared.name)).length
+  let before ← namesakes
+  let byName ← try
+    let _ ← Accounts.ensure ctx shared.name (kind := some .equity)
+    pure ""
+  catch e => pure (toString e)
+  r := check r "a budget's account cannot be conjured up outside its realm"
+    (Str.containsCI byName "lend the cost into the budget")
+  r := checkEq r "so no further account of that name is made" (← namesakes) before
   return r
 
 /--
