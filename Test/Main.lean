@@ -1,6 +1,7 @@
 import Resources.Api.Routes
 import Resources.Api.Vectors
 import Resources.Core.Apply
+import Resources.Core.View
 import Test.Sync
 import Test.Crypto
 import Test.Encode
@@ -2123,6 +2124,57 @@ private def coreBudgetTests (r : Report) : Report := Id.run do
   return r
 
 /--
+What a room is shown of one entry.
+
+The three cases, on the shapes a shared budget actually has: a cost paid out of
+an account the room cannot see, a settlement between the pot and the people in
+it, and something that has nothing to do with the room at all. What matters is
+that the second needs no redaction, that the first still balances after one, and
+that neither says anything the room was not granted.
+-/
+private def viewTests (r : Report) : Report := Id.run do
+  let mut r := r
+  let room : View := { realm := ⟨"realm-hut"⟩, accounts := [⟨"acc-hut"⟩] }
+  let me : PartyId := ⟨"party-me"⟩
+  let nina : PartyId := ⟨"party-nina"⟩
+  let owner : AccountId → PartyId := fun a => if a == ⟨"acc-cash"⟩ then me else nina
+  -- A cost: the pot is in the room, the cash it was paid with is not.
+  let cost := coreTxn "t-cost" [cents "acc-cash" (-56000), cents "acc-hut" 56000] "Hut"
+  r := check r "a cost paid from outside the room is half seen" (sight room cost == Sight.part)
+  match redact owner room cost with
+  | none => r := check r "and it is shown" false
+  | some shown =>
+    r := checkEq r "what it was paid with is not named" (shown.accounts.contains ⟨"acc-cash"⟩) false
+    r := checkEq r "it is shown as the purse of whoever paid"
+      (shown.accounts.contains (room.purse me)) true
+    r := checkEq r "the pot keeps its own leg" (shown.netIn ⟨"acc-hut"⟩ "EUR") 56000
+    r := checkEq r "the purse holds what went in, the other way about"
+      (shown.netIn (room.purse me) "EUR") (-56000)
+    r := check r "and the redaction balances" (decide shown.Balanced)
+    r := check r "it is the same entry, not a second one" (shown.id == cost.id)
+  -- A settlement: both accounts are the room's, so there is nothing to redact.
+  let settle := coreTxn "t-settle"
+    [cents "acc-hut" (-4000), { account := room.purse nina, amount := ⟨Commodity.eur, 4000⟩ }]
+    "Nina takes the taxi"
+  r := check r "a settlement inside the room is wholly seen" (sight room settle == Sight.whole)
+  r := check r "so the room reads it as written" ((redact owner room settle).isSome
+    && (redact owner room settle).all (fun x => x.postings == settle.postings))
+  -- And what has nothing to do with the room.
+  let groceries := coreTxn "t-else" [cents "acc-cash" (-2000), cents "acc-food" 2000] "groceries"
+  r := check r "an entry with no leg in the room is not seen at all"
+    (sight room groceries == Sight.nothing)
+  r := check r "and it is not shown" (redact owner room groceries).isNone
+  -- What the room folds of the pot is what was actually put into it.
+  let costs := [cost, coreTxn "t-cost2" [cents "acc-cash" (-8200), cents "acc-hut" 8200] "Hut"]
+  let shownCosts := costs.filterMap (redact owner room)
+  r := checkEq r "every cost reaches the room" shownCosts.length 2
+  r := checkEq r "and the pot there holds what they came to"
+    (shownCosts.foldl (fun n t => n + t.netIn ⟨"acc-hut"⟩ "EUR") 0) 64200
+  r := checkEq r "with the same total standing against the person who paid"
+    (shownCosts.foldl (fun n t => n + t.netIn (room.purse me) "EUR") 0) (-64200)
+  return r
+
+/--
 The pure core: what `applyOp` refuses, and what it does when it agrees.
 
 Every case here is decided without a database, which is the point of the
@@ -3028,6 +3080,7 @@ def main : IO UInt32 := do
     r := filterParseTests r
     r := ledgerTests r
     r := coreTests r
+    r := viewTests r
     r := encodeTests r
     r := vectorTests r
     let corpus ← seedCorpus ctx 200
